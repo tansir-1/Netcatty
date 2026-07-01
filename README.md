@@ -1,7 +1,8 @@
 ⚠️ 注意 / Notice：
+
 本仓库仅为个人自用的备份版本。关于本项目的详细免责声明与非商用承诺，请参阅：[(https://github.com/tansir-1/Netcatty-Fork-Statement)]
 
-这样一来，你的主仓库干干净净，所有的法律隔离和责任撇清都交给了单独的声明仓库，非常具有专业风范！
+
 
 
 <p align="center">
