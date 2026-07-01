@@ -1,0 +1,29 @@
+name: Auto Sync Upstream
+on:
+  schedule:
+    - cron: "0 2 * * *" # 每天 UTC 时间 2 点自动运行
+  workflow_dispatch: # 允许在网页端手动点击运行
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: upstream-sync # 检出你的缓冲分支
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Sync Code and Tags
+        run: |
+          # 配置原仓库地址
+          git remote add upstream https://github.com/binaricat/Netcatty.git
+          git fetch upstream
+          
+          # 合并上游 main 分支到当前的 upstream-sync 分支
+          git merge upstream/main
+          
+          # 推送代码和所有的 Tags
+          git push origin upstream-sync
+          git push --tags origin
