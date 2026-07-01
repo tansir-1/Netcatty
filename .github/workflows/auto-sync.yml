@@ -17,7 +17,7 @@ jobs:
 
       - name: Sync Code and Tags
         run: |
-          # 告诉 Git 机器人的身份
+          # 告诉 Git 机器人的身份 (就是这里修复了报错)
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
