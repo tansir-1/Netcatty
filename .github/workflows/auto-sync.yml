@@ -17,6 +17,10 @@ jobs:
 
       - name: Sync Code and Tags
         run: |
+          # 告诉 Git 机器人的身份
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
           # 配置原仓库地址
           git remote add upstream https://github.com/binaricat/Netcatty.git
           git fetch upstream
