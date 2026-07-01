@@ -1,3 +1,6 @@
+本人小白，为了更好的订阅原作者的此项目担心后期作者不再为爱发电，故此让ai教我如何fork/部署，拉库，全程没有商用也不会商用，仅限自用，感谢原作者https://github.com/binaricat/Netcatty
+
+
 <p align="center">
   <img src="public/icon.png" alt="Netcatty" width="128" height="128">
 </p>
