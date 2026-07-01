@@ -98,7 +98,11 @@ import { createConnectionLogBuffer } from "./terminal/connectionLogBuffer";
 import { createProgrammaticCommandLogRewriter, type ProgrammaticCommandLogRewrite } from "./terminal/programmaticCommandLog";
 import { getSessionLogInitialLine } from "./terminal/sessionLogInitialLine";
 import { useZmodemTransfer } from "./terminal/hooks/useZmodemTransfer";
-import { createTerminalSessionStarters, type PendingAuth } from "./terminal/runtime/createTerminalSessionStarters";
+import {
+  createTerminalSessionStarters,
+  type PendingAuth,
+  type TerminalSessionDataMeta,
+} from "./terminal/runtime/createTerminalSessionStarters";
 import { createXTermRuntime, type XTermRuntime } from "./terminal/runtime/createXTermRuntime";
 import { applyUserCursorPreference } from "./terminal/runtime/cursorPreference";
 import { terminalAltKeyOptions } from "./terminal/runtime/altKeyOptions";
@@ -207,6 +211,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   restoreTerminalCwd = false,
   startupCommand,
   noAutoRun,
+  multiLineRunMode,
   pendingScriptId,
   pendingScript,
   reuseConnectionFromSessionId,
@@ -1291,6 +1296,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     reuseConnectionFromSessionId,
     startupCommand,
     noAutoRun,
+    multiLineRunMode,
     shellType,
     suppressHostStartupCommandRef,
     terminalSettings,
@@ -1368,18 +1374,18 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     },
     onTerminalDataCapture: handleTerminalDataCaptureOnce,
     onTerminalOutput: onTerminalOutput
-      ? (chunk: string) => {
+      ? (chunk: string, meta?: TerminalSessionDataMeta) => {
           if (/password|passphrase|口令/i.test(chunk)) {
             passwordPromptActiveRef.current = true;
           }
-          appendOutputTriggerOutputRef.current(chunk);
+          appendOutputTriggerOutputRef.current(chunk, meta);
           onTerminalOutput(sessionId, chunk);
         }
-      : (chunk: string) => {
+      : (chunk: string, meta?: TerminalSessionDataMeta) => {
           if (/password|passphrase|口令/i.test(chunk)) {
             passwordPromptActiveRef.current = true;
           }
-          appendOutputTriggerOutputRef.current(chunk);
+          appendOutputTriggerOutputRef.current(chunk, meta);
         },
     onTerminalLogData: captureTerminalLogData,
     onProgrammaticCommandLogRewrite: queueProgrammaticCommandLogRewrite,
@@ -1745,14 +1751,17 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const executeSnippetCommand = useCallback((
     command: string,
     noAutoRun?: boolean,
-    options?: { broadcast?: boolean },
+    options?: { broadcast?: boolean; multiLineRunMode?: Snippet["multiLineRunMode"] },
   ) => {
     const term = termRef.current;
     const id = sessionRef.current;
     if (!term || !id) return;
 
     let data = normalizeLineEndings(command);
-    const lineDelayMs = shouldDelayAutoRunSnippetInput(data, { noAutoRun })
+    const lineDelayMs = shouldDelayAutoRunSnippetInput(data, {
+      noAutoRun,
+      multiLineRunMode: options?.multiLineRunMode,
+    })
       ? AUTO_RUN_SNIPPET_LINE_DELAY_MS
       : undefined;
     const isMultiLine = data.includes('\n');
@@ -1799,7 +1808,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     }
     const command = await resolveSnippetCommand(snippet);
     if (command === null) return;
-    executeSnippetCommand(command, snippet.noAutoRun);
+    executeSnippetCommand(command, snippet.noAutoRun, {
+      multiLineRunMode: snippet.multiLineRunMode,
+    });
   }, [executeSnippetCommand, sessionId, t]);
 
   const onSnippetShortkeyRef = useRef(executeSnippet);
