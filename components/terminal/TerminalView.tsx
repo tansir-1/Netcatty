@@ -72,6 +72,68 @@ export function shouldShowSelectionAIOverlay({
   );
 }
 
+export function shouldReconnectTerminalOnEnterKey({
+  key,
+  status,
+  hasRetryHandler,
+  isSearchOpen,
+  isComposeBarOpen,
+  needsAuth,
+  needsHostKeyVerification,
+  hasBlockingOverlay,
+  altKey,
+  ctrlKey,
+  metaKey,
+  shiftKey,
+  isComposing,
+}: {
+  key: string;
+  status?: string;
+  hasRetryHandler: boolean;
+  isSearchOpen: boolean;
+  isComposeBarOpen: boolean;
+  needsAuth: boolean;
+  needsHostKeyVerification: boolean;
+  hasBlockingOverlay: boolean;
+  altKey?: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  shiftKey?: boolean;
+  isComposing?: boolean;
+}): boolean {
+  return key === "Enter"
+    && status === "disconnected"
+    && hasRetryHandler
+    && !isSearchOpen
+    && !isComposeBarOpen
+    && !needsAuth
+    && !needsHostKeyVerification
+    && !hasBlockingOverlay
+    && !altKey
+    && !ctrlKey
+    && !metaKey
+    && !shiftKey
+    && !isComposing;
+}
+
+export function shouldBlockTerminalReconnectForTarget({
+  isWithinXterm,
+  hasInteractiveAncestor,
+}: {
+  isWithinXterm: boolean;
+  hasInteractiveAncestor: boolean;
+}): boolean {
+  return !isWithinXterm && hasInteractiveAncestor;
+}
+
+function isTerminalReconnectControlTarget(target: EventTarget | null): boolean {
+  if (typeof HTMLElement === "undefined" || !(target instanceof HTMLElement)) return false;
+  return shouldBlockTerminalReconnectForTarget({
+    isWithinXterm: target.classList.contains("xterm-helper-textarea") || Boolean(target.closest(".xterm")),
+    hasInteractiveAncestor: Boolean(target.closest("button, a, input, textarea, select, [contenteditable='true'], [role='button'], [role='menuitem'], [role='textbox']")),
+  });
+}
+
 type TerminalTitleAddressHost = {
   id?: string;
   protocol?: string;
@@ -142,6 +204,50 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
     ? t("terminal.toolbar.timestampsDisable")
     : t("terminal.toolbar.timestampsEnable");
   const titleConnectionAddress = formatTerminalTitleConnectionAddress(host);
+  const hasBlockingReconnectOverlay = Boolean(osc52ReadPromptVisible || osc7SetupOpen || scriptExecutionOverlay || zmodem.active || zmodem.overwriteRequest);
+  const showEnterReconnectHint = shouldReconnectTerminalOnEnterKey({
+    key: "Enter",
+    status,
+    hasRetryHandler: Boolean(handleRetry),
+    isSearchOpen,
+    isComposeBarOpen,
+    needsAuth: Boolean(auth.needsAuth),
+    needsHostKeyVerification: Boolean(needsHostKeyVerification),
+    hasBlockingOverlay: hasBlockingReconnectOverlay,
+  });
+  const handleTerminalKeyDownCapture = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!shouldReconnectTerminalOnEnterKey({
+      key: event.key,
+      status,
+      hasRetryHandler: Boolean(handleRetry),
+      isSearchOpen,
+      isComposeBarOpen,
+      needsAuth: Boolean(auth.needsAuth),
+      needsHostKeyVerification: Boolean(needsHostKeyVerification),
+      hasBlockingOverlay: hasBlockingReconnectOverlay,
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      shiftKey: event.shiftKey,
+      isComposing: event.nativeEvent.isComposing,
+    })) {
+      return;
+    }
+
+    if (isTerminalReconnectControlTarget(event.target)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    handleRetry();
+  }, [
+    auth.needsAuth,
+    handleRetry,
+    hasBlockingReconnectOverlay,
+    isComposeBarOpen,
+    isSearchOpen,
+    needsHostKeyVerification,
+    status,
+  ]);
   return (
     <TerminalContextMenu
       hasSelection={hasSelection}
@@ -180,6 +286,7 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
+        onKeyDownCapture={handleTerminalKeyDownCapture}
       >
         {/* Drag and drop overlay */}
         {isDraggingOver && (
@@ -564,6 +671,7 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
                 _setShowLogs={setShowLogs}
                 keys={keys}
                 onDismissDisconnected={handleDismissDisconnectedDialog}
+                showEnterReconnectHint={showEnterReconnectHint}
                 hostKeyVerification={needsHostKeyVerification && pendingHostKeyInfo ? {
                   hostKeyInfo: pendingHostKeyInfo,
                   onClose: handleHostKeyClose,

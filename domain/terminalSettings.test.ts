@@ -34,6 +34,15 @@ test("normalizeTerminalSettings enables font smoothing by default", () => {
   assert.equal(normalizeTerminalSettings().fontSmoothing, true);
 });
 
+test("normalizeTerminalSettings disables SSH auto reconnect by default", () => {
+  assert.equal(normalizeTerminalSettings().sshAutoReconnectEnabled, false);
+});
+
+test("normalizeTerminalSettings preserves explicit SSH auto reconnect settings", () => {
+  assert.equal(normalizeTerminalSettings({ sshAutoReconnectEnabled: true }).sshAutoReconnectEnabled, true);
+  assert.equal(normalizeTerminalSettings({ sshAutoReconnectEnabled: false }).sshAutoReconnectEnabled, false);
+});
+
 test("normalizeTerminalSettings disables hibernate for hidden tabs by default", () => {
   assert.equal(normalizeTerminalSettings().hibernateHiddenTabs, false);
   assert.equal(normalizeTerminalSettings().hibernateHiddenTabsDelaySec, 5);
