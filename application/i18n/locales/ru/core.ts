@@ -725,11 +725,20 @@ export const ruCoreMessages: Messages = {
   'vault.groups.errors.invalidChars': "Имя группы не может содержать '/' или '\\\\'.",
   'vault.groups.errors.duplicatePath': 'Группа с таким именем уже существует в этом расположении.',
 
+  'vault.deleteConfirm.title': 'Удалить "{name}"?',
+  'vault.deleteConfirm.desc': 'Это действие нельзя отменить.',
+  'vault.deleteConfirm.packageDesc': 'Пакет скриптов будет удалён. Скрипты внутри него сохранятся и будут вынесены из пакета.',
+  'vault.deleteConfirm.noteGroupDesc': 'Папка будет удалена. Заметки внутри неё сохранятся и будут вынесены из папки.',
+  'vault.deleteConfirm.portForwardingDesc': 'Правило проброса портов будет удалено.',
+
   'vault.managedSource.unmanage': 'Снять управление',
   'vault.managedSource.unmanageSuccess': 'Управление группой успешно снято',
 
   'vault.hosts.header.entries': 'Записей: {count}',
   'vault.hosts.header.live': 'Активных: {count}',
   'deepLink.ssh.invalid': 'Недопустимая ссылка ssh://',
+  'deepLink.telnet.invalid': 'Недопустимая ссылка telnet://',
+  'deepLink.jms.invalid': 'Недопустимая ссылка JumpServer',
+  'deepLink.jms.unsupported': 'Неподдерживаемый протокол JumpServer: {{protocol}}',
 
 };

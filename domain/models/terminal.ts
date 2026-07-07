@@ -439,6 +439,7 @@ export interface TerminalSession {
   localShellArgs?: string[]; // Shell args for local terminals (from discovery)
   localShellName?: string;   // Display name for local shell (e.g., "Zsh", "Ubuntu (WSL)")
   localShellIcon?: string;   // Icon identifier for local shell (e.g., "zsh", "ubuntu")
+  localStartDir?: string;    // Per-session starting directory for local terminals
   // For sessions created from an existing SSH session: the id of the source
   // session whose already-authenticated connection should be reused so the new
   // shell channel does not trigger a second MFA prompt (issue #1204). The
@@ -457,6 +458,14 @@ export interface TerminalSession {
   codingCliProviderId?: CodingCliProviderId;
   /** Runtime marker for sessions reconstructed from startup restore. */
   restoreState?: 'restored-disconnected';
+  /**
+   * Runtime marker for sessions backed by an in-memory-only host (e.g. a
+   * password deep link). Excluded from session restore persistence because
+   * the one-time credentials cannot survive a relaunch.
+   */
+  ephemeralHost?: boolean;
+  /** Runtime hint to auto-open a side panel once the session connects. */
+  autoOpenSidePanel?: 'sftp';
   /** Latest known working directory captured from terminal cwd tracking. */
   lastCwd?: string;
 }

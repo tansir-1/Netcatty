@@ -32,8 +32,13 @@ declare global {
     // Fired when an install was requested but blocked by unsaved editors (#1215).
     onUpdateNeedsSave?(cb: () => void): () => void;
     onSshDeepLink?(cb: (payload: { url?: string }) => void): () => void;
+    onTelnetDeepLink?(cb: (payload: { url?: string }) => void): () => void;
+    onOpenTerminalPath?(cb: (payload: { path?: string }) => void): () => void;
     setSshDeepLinkEnabled?(enabled: boolean): Promise<boolean | { success: boolean; enabled: boolean }>;
     getSshDeepLinkEnabled?(): Promise<boolean>;
+    onJmsDeepLink?(cb: (payload: { url?: string }) => void): () => void;
+    setJmsDeepLinkEnabled?(enabled: boolean): Promise<boolean | { success: boolean; enabled: boolean }>;
+    getJmsDeepLinkEnabled?(): Promise<boolean>;
 
     // Global Toggle Hotkey (Quake Mode)
     registerGlobalHotkey?(hotkey: string): Promise<{ success: boolean; enabled?: boolean; error?: string; accelerator?: string }>;

@@ -723,6 +723,12 @@ export const enCoreMessages: Messages = {
   'vault.groups.errors.invalidChars': "Group name cannot include '/' or '\\\\'.",
   'vault.groups.errors.duplicatePath': 'A group with this name already exists at this location.',
 
+  'vault.deleteConfirm.title': 'Delete "{name}"?',
+  'vault.deleteConfirm.desc': 'This action cannot be undone.',
+  'vault.deleteConfirm.packageDesc': 'This will remove the script package. Scripts inside it will stay saved and move out of the package.',
+  'vault.deleteConfirm.noteGroupDesc': 'This will remove the folder. Notes inside it will stay saved and move out of the folder.',
+  'vault.deleteConfirm.portForwardingDesc': 'This will delete the port forwarding rule.',
+
   'vault.managedSource.unmanage': 'Unmanage',
   'vault.managedSource.unmanageSuccess': 'Successfully unmanaged group',
 
@@ -765,5 +771,8 @@ export const enCoreMessages: Messages = {
   'vault.hosts.empty.title': 'Set up your hosts',
   'vault.hosts.empty.desc': 'Save hosts to quickly connect to your servers, VMs, and containers.',
   'deepLink.ssh.invalid': 'Invalid ssh:// link',
+  'deepLink.telnet.invalid': 'Invalid telnet:// link',
+  'deepLink.jms.invalid': 'Invalid JumpServer link',
+  'deepLink.jms.unsupported': 'Unsupported JumpServer protocol: {{protocol}}',
 
 };
