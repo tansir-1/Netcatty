@@ -374,9 +374,18 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.behavior.middleClick.menu': 'Показать меню',
   'settings.terminal.behavior.middleClick.paste': 'Вставить',
   'settings.terminal.behavior.middleClick.disabled': 'Ничего не делать',
+  'settings.terminal.behavior.wordSeparators': 'Разделители слов',
+  'settings.terminal.behavior.wordSeparators.desc':
+    'Символы, которые считаются границами слова при выделении двойным щелчком. Пробел тоже учитывается; добавьте =, запятую или : для строк вроде uid=name.',
   'settings.terminal.behavior.bracketedPaste': 'Режим bracketed paste',
   'settings.terminal.behavior.bracketedPaste.desc':
     'Оборачивать вставляемый текст escape-последовательностями, чтобы оболочка отличала вставку от обычного ввода. Отключите, если видите артефакты вида ^[[200~.',
+  'settings.terminal.behavior.shiftEnterNewline': 'Текст для Shift+Enter',
+  'settings.terminal.behavior.shiftEnterNewline.desc':
+    'Отправлять настроенный текст вместо обычного Enter при нажатии Shift+Enter в терминале.',
+  'settings.terminal.behavior.shiftEnterNewlineText': 'Отправляемый текст',
+  'settings.terminal.behavior.shiftEnterNewlineText.desc':
+    'Используйте \\n для перевода строки, \\t для табуляции и \\\\ для обратной косой черты.',
   'settings.terminal.behavior.clearWipesScrollback': '`clear` очищает буфер прокрутки',
   'settings.terminal.behavior.clearWipesScrollback.desc':
     'Команда `clear` также будет очищать буфер прокрутки (поведение POSIX по умолчанию). Отключите, чтобы история оставалась видимой после `clear`.',

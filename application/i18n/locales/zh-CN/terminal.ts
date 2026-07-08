@@ -253,9 +253,18 @@ export const zhCNTerminalMessages: Messages = {
   'settings.terminal.behavior.middleClick.menu': '显示菜单',
   'settings.terminal.behavior.middleClick.paste': '粘贴',
   'settings.terminal.behavior.middleClick.disabled': '无动作',
+  'settings.terminal.behavior.wordSeparators': '单词分隔符',
+  'settings.terminal.behavior.wordSeparators.desc':
+    '双击选择文本时作为边界的字符。空格也算；可添加 =、逗号或 :，方便选择 uid=name 里的部分内容。',
   'settings.terminal.behavior.bracketedPaste': '括号粘贴模式',
   'settings.terminal.behavior.bracketedPaste.desc':
     '粘贴文本时使用转义序列包裹，以便终端区分粘贴和键入。如果出现 ^[[200~ 字样请关闭此选项。',
+  'settings.terminal.behavior.shiftEnterNewline': 'Shift+Enter 发送文本',
+  'settings.terminal.behavior.shiftEnterNewline.desc':
+    '在终端中按 Shift+Enter 时发送配置的文本，而不是普通回车。',
+  'settings.terminal.behavior.shiftEnterNewlineText': '发送内容',
+  'settings.terminal.behavior.shiftEnterNewlineText.desc':
+    '使用 \\n 表示换行，\\t 表示 Tab，\\\\ 表示反斜杠。',
   'settings.terminal.behavior.clearWipesScrollback': '`clear` 同时清空回滚历史',
   'settings.terminal.behavior.clearWipesScrollback.desc':
     '`clear` 命令同时清空回滚历史（POSIX 默认行为）。关闭则保留历史。',
