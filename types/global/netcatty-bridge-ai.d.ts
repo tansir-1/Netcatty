@@ -106,6 +106,21 @@ declare global {
       hostChain?: Array<{ hostId: string; label?: string; hostname?: string }>;
       activePortForwards?: Array<{ ruleId: string; label?: string; type?: string; localPort?: number; status?: string }>;
     }>, chatSessionId?: string): Promise<{ ok: boolean }>;
+    /** Merge sessions into a chat scope without dropping existing entries. */
+    aiMcpMergeSessions?(sessions: Array<{
+      sessionId: string;
+      hostId?: string;
+      hostname: string;
+      label: string;
+      os?: string;
+      username?: string;
+      protocol?: string;
+      shellType?: string;
+      deviceType?: string;
+      connected: boolean;
+      hostChain?: Array<{ hostId: string; label?: string; hostname?: string }>;
+      activePortForwards?: Array<{ ruleId: string; label?: string; type?: string; localPort?: number; status?: string }>;
+    }>, chatSessionId: string): Promise<{ ok: boolean; count?: number; error?: string }>;
     onVaultAgentRequest?(cb: (payload: { requestId: string; op: string; params: Record<string, unknown> }) => void): () => void;
     respondVaultAgent?(requestId: string, result: Record<string, unknown>): Promise<{ ok: boolean; error?: string }>;
     aiMcpSetToolIntegrationMode?(mode: 'mcp' | 'skills'): Promise<{ ok: boolean; error?: string }>;
@@ -157,6 +172,35 @@ declare global {
     aiCattyCancelExec?(chatSessionId: string): Promise<unknown>;
     aiSetChatSessionCancelled?(chatSessionId: string, cancelled?: boolean): Promise<{ ok: boolean; error?: string }>;
     aiMcpSyncPermissionGrants?(grants: Array<Record<string, unknown>>): Promise<{ ok: boolean; count?: number; error?: string }>;
+    externalMcpGetStatus?(): Promise<{
+      ok: boolean;
+      enabled?: boolean;
+      state?: string;
+      host?: string;
+      port?: number | null;
+      discoveryPath?: string | null;
+      launcherPath?: string | null;
+      chatSessionId?: string;
+      exposedSessionCount?: number;
+      mode?: 'temporary' | 'persistent';
+      idleTimeoutMinutes?: number;
+      lastActivityAt?: number | null;
+      idleExpiresAt?: number | null;
+      permissionMode?: string;
+      hostRunning?: boolean;
+      error?: string | null;
+    }>;
+    externalMcpSetEnabled?(enabled: boolean): Promise<Record<string, unknown>>;
+    externalMcpSetConfig?(config: {
+      mode?: 'temporary' | 'persistent';
+      idleTimeoutMinutes?: number;
+    }): Promise<Record<string, unknown>>;
+    externalMcpCodexGetStatus?(): Promise<Record<string, unknown>>;
+    externalMcpCodexAdd?(): Promise<Record<string, unknown>>;
+    externalMcpClaudeGetStatus?(): Promise<Record<string, unknown>>;
+    externalMcpClaudeAdd?(): Promise<Record<string, unknown>>;
+    externalMcpGrokGetStatus?(): Promise<Record<string, unknown>>;
+    externalMcpGrokAdd?(): Promise<Record<string, unknown>>;
     aiSdkAgentCancel?(requestId: string, chatSessionId?: string): Promise<{ ok: boolean; error?: string }>;
     aiSdkAgentCleanup?(chatSessionId: string): Promise<{ ok: boolean }>;
     onAiSdkAgentEvent?(requestId: string, cb: (event: Record<string, unknown>) => void): () => void;

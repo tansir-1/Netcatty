@@ -377,8 +377,9 @@ function startLocalSession(event, payload) {
   const shell = normalizeExecutablePath(resolvedShell) || defaultShell;
   const shellArgs = resolvedArgs ?? getLocalShellArgs(shell);
   const shellKind = detectShellKind(shell);
+  const { buildTerminalProcessEnv } = require("./httpNetworkProxyBridge.cjs");
   const env = applyLocaleDefaults({
-    ...process.env,
+    ...buildTerminalProcessEnv(process.env),
     ...(payload?.env || {}),
     TERM: "xterm-256color",
     COLORTERM: "truecolor",
@@ -574,6 +575,7 @@ const moshSessionApi = createMoshSessionApi({
   openTerminalOutputSession, closeTerminalOutputSession,
   get selectZmodemUploadFiles() { return selectZmodemUploadFiles; },
   get selectZmodemDownloadDirectory() { return selectZmodemDownloadDirectory; },
+  ensureMoshStatsConnection: (...args) => require("./sshBridge.cjs").ensureMoshStatsConnection(...args),
   bundledMoshClient: (...args) => bundledMoshClient(...args),
 });
 const {

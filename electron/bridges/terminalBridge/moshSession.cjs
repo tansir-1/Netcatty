@@ -5,6 +5,20 @@ const {
   shouldAcceptSessionOutput,
   shouldProcessSessionOutput,
 } = require("../terminalFlowAck.cjs");
+const { createSshConnExecProbe } = require("../ai/sessionShellKind.cjs");
+
+function withShellProbeTimeout(promise, timeoutMs) {
+  const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 3000;
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), ms);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 function createMoshSessionApi(ctx) {
   with (ctx) {
@@ -396,7 +410,8 @@ function createMoshSessionApi(ctx) {
         sshArgs: moshAuth.sshArgs,
       });
     
-      const sshEnv = { ...process.env, ...optionsEnv, TERM: "xterm-256color" };
+      const { buildTerminalProcessEnv } = require("../httpNetworkProxyBridge.cjs");
+      const sshEnv = { ...buildTerminalProcessEnv(process.env), ...optionsEnv, TERM: "xterm-256color" };
       // macOS Terminal/iTerm export LC_CTYPE=UTF-8 (a bare value, not a real
       // locale name). System ssh_config has `SendEnv LC_*`, so without scrubbing
       // these the remote shell tries to setlocale("UTF-8") and prints a warning
@@ -431,7 +446,19 @@ function createMoshSessionApi(ctx) {
         hostname: options.hostname || "",
         username: options.username || "",
         label: options.label || options.hostname || "Mosh Session",
-        shellKind: "posix",
+        // Leave unset so ensureSessionShellKind can probe via companion SSH
+        // exec before AI wrappers (fish login shells — issue #1854).
+        shellKind: undefined,
+        _shellKindExecProbe: async (command, timeoutMs) => {
+          if (typeof ensureMoshStatsConnection !== "function") return null;
+          const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
+          const conn = await withShellProbeTimeout(
+            ensureMoshStatsConnection(session, sessionId, contents),
+            timeoutMs,
+          );
+          const probe = createSshConnExecProbe(conn);
+          return probe ? probe(command, timeoutMs) : null;
+        },
         shellExecutable: "remote-shell",
         flushPendingData: null,
         lastIdlePrompt: "",
@@ -587,8 +614,9 @@ function createMoshSessionApi(ctx) {
     function swapToMoshClient(session, options, ctx) {
       const { bareClient, optionsEnv, lang, parsed, bufferData, flush, flushPaced, sessionId } = ctx;
     
+      const { buildTerminalProcessEnv } = require("../httpNetworkProxyBridge.cjs");
       const env = moshHandshake.buildMoshClientEnv({
-        baseEnv: { ...process.env, ...optionsEnv, TERM: "xterm-256color" },
+        baseEnv: { ...buildTerminalProcessEnv(process.env), ...optionsEnv, TERM: "xterm-256color" },
         key: parsed.key,
         lang,
       });

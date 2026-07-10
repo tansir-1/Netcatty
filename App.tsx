@@ -53,6 +53,8 @@ import {
 import { getCredentialProtectionAvailability } from './infrastructure/services/credentialProtection';
 import { netcattyBridge } from './infrastructure/services/netcattyBridge';
 import { localStorageAdapter } from './infrastructure/persistence/localStorageAdapter';
+import { syncExternalMcpStartupState } from './application/state/useExternalMcpToggleState';
+import { useExternalMcpSessionSync } from './application/state/useExternalMcpSessionSync';
 import {
   STORAGE_KEY_DEBUG_HOTKEYS,
   STORAGE_KEY_PORT_FORWARDING,
@@ -72,6 +74,9 @@ import { Host, HostProtocol, KnownHost, SerialConfig, Snippet, SSHKey, TerminalS
 import { resolveSnippetCommand } from './components/SnippetExecutionProvider';
 import { isScriptSnippet } from './domain/snippetScript.ts';
 import { ScriptAutomationRoot } from './components/scripts/ScriptAutomationRoot';
+import { ExternalMcpApprovalsHost } from './components/ai/ExternalMcpApprovalsHost';
+import { useExternalMcpGrantPersister } from './components/ai/useExternalMcpGrantPersister';
+import { setupMcpApprovalBridge } from './infrastructure/ai/shared/approvalGate';
 import { AppActiveTabChrome } from './application/app/AppActiveTabChrome';
 import { AppView } from './application/app/AppView';
 import { useAppStartupEffects } from './application/app/useAppStartupEffects';
@@ -177,6 +182,16 @@ function App({ settings }: { settings: SettingsState }) {
       document.documentElement.removeAttribute('data-workspace-focus');
     }
   }, [workspaceFocusStyle]);
+
+  // External MCP: only persistent+enabled restores at app startup.
+  // Keep this on the App mount path (not Settings) so temporary mode is not
+  // accidentally disabled when the AI settings page remounts.
+  // Skip peer session windows — they also mount App and must not clear a
+  // temporary-mode runtime that the main window already started.
+  useEffect(() => {
+    if (isPeerSessionWindow) return;
+    syncExternalMcpStartupState(netcattyBridge.get());
+  }, [isPeerSessionWindow]);
 
   const {
     isInitialized: isVaultInitialized,
@@ -388,6 +403,13 @@ function App({ settings }: { settings: SettingsState }) {
 
   // Get port forwarding rules and import function
   const { rules: portForwardingRules, importRules: importPortForwardingRules, startTunnel, stopTunnel } = usePortForwardingState();
+
+  // App-level External MCP session sync (before TerminalLayer lazy-mount).
+  useExternalMcpSessionSync({
+    sessions,
+    hosts: terminalHosts,
+    portForwardingRules,
+  });
 
   const portForwardingRulesForSync = useMemo(
     () =>
@@ -985,6 +1007,23 @@ function App({ settings }: { settings: SettingsState }) {
     return materializeHostProxyProfile(withGroupDefaults, proxyProfiles);
   }, [groupConfigs, proxyProfileIdSet, proxyProfiles]);
 
+  // Wrapper to connect to host with logging
+  const handleConnectToHost = useCallback((host: Host) => { return handleConnectToHostImpl(() => ({ addConnectionLog, connectToHost, host, identities, keys, resolveEffectiveHost, resolveHostAuth, systemInfoRef }), host); }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys]);
+
+  const openHostForVaultAgent = useCallback((hostId: string) => {
+    const host = hosts.find((item) => item.id === hostId);
+    if (!host) {
+      return { ok: false as const, error: `Host "${hostId}" was not found.` };
+    }
+    const sessionId = handleConnectToHost(host);
+    if (!sessionId) {
+      return { ok: false as const, error: `Failed to open host "${hostId}".` };
+    }
+    // Surface the main window for external MCP / CLI open requests.
+    void netcattyBridge.get()?.openMainWindow?.();
+    return { ok: true as const, sessionId, host };
+  }, [handleConnectToHost, hosts]);
+
   useVaultAgentBridge({
     hosts,
     snippets,
@@ -1001,10 +1040,8 @@ function App({ settings }: { settings: SettingsState }) {
     updateNotes,
     startTunnel,
     stopTunnel,
+    openHost: openHostForVaultAgent,
   });
-
-  // Wrapper to connect to host with logging
-  const handleConnectToHost = useCallback((host: Host) => { return handleConnectToHostImpl(() => ({ addConnectionLog, connectToHost, host, identities, keys, resolveEffectiveHost, resolveHostAuth, systemInfoRef }), host); }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys]);
 
   const _handleSshDeepLink = useEffectEvent((payload: { url?: string }) => {
     const rawUrl = payload?.url || '';
@@ -1399,11 +1436,21 @@ function AppWithProviders() {
     }
   }, []);
 
+  // Keep MCP/SDK approval IPC alive for the whole app lifetime — including the
+  // ~5s before TerminalLayer lazy-mounts, and when External MCP is used without
+  // opening the Catty AI panel.
+  useEffect(() => {
+    return setupMcpApprovalBridge();
+  }, []);
+
+  useExternalMcpGrantPersister();
+
   return (
     <I18nProvider locale={settings.uiLanguage}>
       <ToastProvider>
         <TooltipProvider delayDuration={300}>
           <ScriptAutomationRoot />
+          <ExternalMcpApprovalsHost />
           <App settings={settings} />
         </TooltipProvider>
       </ToastProvider>
