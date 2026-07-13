@@ -9,15 +9,18 @@ const { Client: SSHClient } = require("ssh2");
 const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const { connectThroughChain, buildAlgorithms } = require("./sshBridge.cjs");
+const { resolveSshConnectionTimeouts } = require("./sshBridge/startSession.cjs");
 const hostKeyVerifier = require("./hostKeyVerifier.cjs");
-const { createProxySocket } = require("./proxyUtils.cjs");
+const { createProxySocket, runWhenProxyConnectionReady } = require("./proxyUtils.cjs");
 const { 
   buildAuthHandler, 
   createKeyboardInteractiveHandler, 
   applyAuthToConnOpts,
+  shouldSkipKiPasswordAutoFill,
   findAllDefaultPrivateKeys: findAllDefaultPrivateKeysFromHelper,
   preparePrivateKeyForAuth,
   loadFirstIdentityFileForAuth,
+  prepareSystemSshAgentForAuth,
   isPassphraseCancelledError,
 } = require("./sshAuthHelper.cjs");
 
@@ -85,12 +88,24 @@ async function startPortForward(event, payload) {
     proxy,
     jumpHosts = [],
     identityFilePaths,
+    useSshAgent,
+    agentPublicKeys,
+    identityAgent,
+    identitiesOnly,
+    addKeysToAgent,
+    useKeychain,
     legacyAlgorithms,
     skipEcdsaHostKey,
     algorithmOverrides,
     keepaliveInterval: resolvedKeepaliveInterval,
     keepaliveCountMax: resolvedKeepaliveCountMax,
+    sshTcpConnectTimeoutMs,
+    sshAuthReadyTimeoutMs,
   } = payload;
+  const connectionTimeouts = resolveSshConnectionTimeouts({
+    sshTcpConnectTimeoutMs,
+    sshAuthReadyTimeoutMs,
+  });
 
   const conn = new SSHClient();
   const sender = event.sender;
@@ -135,7 +150,8 @@ async function startPortForward(event, payload) {
     host: hostname,
     port: port,
     username: username || 'root',
-    readyTimeout: 120000, // 2 minutes for 2FA input
+    timeout: connectionTimeouts.tcpConnectTimeoutMs,
+    readyTimeout: 0,
     keepaliveInterval: tunnelKeepaliveMs,
     keepaliveCountMax: tunnelKeepaliveCountMax,
     // Enable keyboard-interactive authentication (required for 2FA/MFA)
@@ -156,8 +172,21 @@ async function startPortForward(event, payload) {
   portForwardingTunnels.set(tunnelId, tunnelState);
 
   let defaultKeys = [];
+  let portForwardAuthPhase = { hadPartialSuccess: false, passwordAlreadySucceeded: false };
   try {
-    const identityFile = !privateKey
+    const systemAuthAgent = hasCertificate ? null : await prepareSystemSshAgentForAuth({
+      useSshAgent,
+      agentPublicKeys,
+      identityAgent,
+      identityFilePaths,
+      identitiesOnly,
+      addKeysToAgent,
+      useKeychain,
+      hostname,
+      port,
+      username,
+    }, "[PortForward]");
+    const identityFile = !privateKey && !systemAuthAgent
       ? await loadFirstIdentityFileForAuth({
         sender,
         identityFilePaths,
@@ -170,7 +199,7 @@ async function startPortForward(event, payload) {
         },
       })
       : null;
-    const inlineKey = privateKey
+    const inlineKey = privateKey && !systemAuthAgent
       ? await preparePrivateKeyForAuth({
         sender,
         privateKey,
@@ -190,6 +219,9 @@ async function startPortForward(event, payload) {
       return { tunnelId, success: false, cancelled: true };
     }
 
+    if (systemAuthAgent) {
+      connectOpts.agent = systemAuthAgent;
+    }
     if (hasCertificate) {
       connectOpts.agent = new NetcattyAgent({
         mode: "certificate",
@@ -211,8 +243,12 @@ async function startPortForward(event, payload) {
       connectOpts.password = password;
     }
 
-    // Get default keys
-    defaultKeys = await findAllDefaultPrivateKeysFromHelper();
+    // Keep the discovered keys available to unrelated jump hosts even when
+    // strict agent selection disables them for the final target.
+    const discoveredDefaultKeys = await findAllDefaultPrivateKeysFromHelper();
+    defaultKeys = systemAuthAgent && identitiesOnly
+      ? []
+      : discoveredDefaultKeys;
     if (isTunnelCancelled(tunnelState)) {
       portForwardingTunnels.delete(tunnelId);
       return { tunnelId, success: false, cancelled: true };
@@ -227,8 +263,10 @@ async function startPortForward(event, payload) {
       username: connectOpts.username,
       logPrefix: "[PortForward]",
       defaultKeys,
+      allowAgentFallback: useSshAgent !== false,
     });
     applyAuthToConnOpts(connectOpts, authConfig);
+    portForwardAuthPhase = authConfig.authPhase || portForwardAuthPhase;
     if (isTunnelCancelled(tunnelState)) {
       portForwardingTunnels.delete(tunnelId);
       return { tunnelId, success: false, cancelled: true };
@@ -244,6 +282,12 @@ async function startPortForward(event, payload) {
           password,
           privateKey,
           passphrase,
+          useSshAgent,
+          identityAgent,
+          identityFilePaths,
+          identitiesOnly,
+          addKeysToAgent,
+          useKeychain,
           proxy,
           knownHosts,
           verifyHostKeys,
@@ -251,7 +295,9 @@ async function startPortForward(event, payload) {
           legacyAlgorithms,
           skipEcdsaHostKey,
           algorithmOverrides,
-          _defaultKeys: defaultKeys,
+          sshTcpConnectTimeoutMs: connectionTimeouts.tcpConnectTimeoutMs,
+          sshAuthReadyTimeoutMs: connectionTimeouts.authReadyTimeoutMs,
+          _defaultKeys: discoveredDefaultKeys,
           _connectionsRef: chainConnections,
           _tunnelRef: tunnelState,
           _passphraseSignal: passphraseAbortController.signal,
@@ -275,6 +321,7 @@ async function startPortForward(event, payload) {
       delete connectOpts.port;
     } else if (hasProxy) {
       connectionSocket = await createProxySocket(proxy, hostname, port, {
+        timeoutMs: connectionTimeouts.tcpConnectTimeoutMs,
         onSocket: (socket) => {
           tunnelState.pendingConn = socket;
         },
@@ -321,14 +368,34 @@ async function startPortForward(event, payload) {
     password,
     logPrefix: "[PortForward]",
     scope: "external",
+    shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(portForwardAuthPhase),
   }));
 
   return new Promise((resolve, reject) => {
     // Track whether the Promise has been settled so conn.on('close')
     // can reject if the tunnel was killed during SSH handshake.
     let settled = false;
+    let authReadyTimer = null;
+    const clearAuthReadyTimer = () => {
+      if (!authReadyTimer) return;
+      clearTimeout(authReadyTimer);
+      authReadyTimer = null;
+    };
+
+    conn.once('connect', () => {
+      runWhenProxyConnectionReady(conn._sock, () => {
+        try { conn._sock?.setTimeout?.(0); } catch { /* ignore */ }
+        clearAuthReadyTimer();
+        authReadyTimer = setTimeout(
+          () => conn.emit('timeout'),
+          connectionTimeouts.authReadyTimeoutMs,
+        );
+        authReadyTimer.unref?.();
+      });
+    });
 
     conn.once('ready', () => {
+      clearAuthReadyTimer();
       console.log(`[PortForward] SSH connection ready for tunnel ${tunnelId}`);
 
       if (type === 'local') {
@@ -524,6 +591,7 @@ async function startPortForward(event, payload) {
     });
 
     conn.on('error', (err) => {
+      clearAuthReadyTimer();
       console.error(`[PortForward] SSH error:`, err.message);
       if (settled) return;
       sendStatus('error', err.message);
@@ -533,6 +601,7 @@ async function startPortForward(event, payload) {
     });
 
     conn.once('close', () => {
+      clearAuthReadyTimer();
       console.log(`[PortForward] SSH connection closed for tunnel ${tunnelId}`);
       const tunnel = portForwardingTunnels.get(tunnelId) || tunnelState;
       // Capture the cancelled flag BEFORE cleanup deletes the entry.
@@ -560,6 +629,17 @@ async function startPortForward(event, payload) {
           reject(new Error(`Tunnel ${tunnelId} closed before connection established`));
         }
       }
+    });
+
+    conn.once('timeout', () => {
+      clearAuthReadyTimer();
+      if (settled) return;
+      const err = new Error(`Connection timeout to ${hostname}`);
+      sendStatus('error', err.message);
+      cleanupChainConnections(chainConnections);
+      settled = true;
+      reject(err);
+      conn.end();
     });
 
     conn.connect(connectOpts);

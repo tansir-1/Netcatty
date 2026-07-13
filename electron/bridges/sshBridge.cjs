@@ -16,17 +16,23 @@ const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
 const hostKeyVerifier = require("./hostKeyVerifier.cjs");
-const { createProxySocket } = require("./proxyUtils.cjs");
+const { createProxySocket, runWhenProxyConnectionReady } = require("./proxyUtils.cjs");
 const { attachX11Forwarding } = require("./x11Forwarding.cjs");
 const { createPtyOutputBuffer } = require("./ptyOutputBuffer.cjs");
 const {
   buildAuthHandler,
   createKeyboardInteractiveHandler,
+  createOrderedStringAuthHandler,
+  createAuthPhase,
+  markAuthPhasePartialSuccess,
+  shouldSkipKiPasswordAutoFill,
   applyAuthToConnOpts,
   safeSend: authSafeSend,
   requestPassphrasesForEncryptedKeys,
   findAllDefaultPrivateKeys: findAllDefaultPrivateKeysFromHelper,
   getSshAgentSocket,
+  getAvailableAgentSocket: getAvailableSystemAgentSocket,
+  prepareSystemSshAgentForAuth,
   readFileNoFollow,
   expandIdentityFilePath,
   isAutoFillablePasswordChallenge,
@@ -47,6 +53,7 @@ const {
   _resetAlgorithmSupportCacheForTests,
 } = require("./sshAlgorithms.cjs");
 const { enableSshNoDelay, enableTcpNoDelay } = require("./tcpNoDelay.cjs");
+const { createTcpConnectLatencyProbe } = require("./tcpConnectLatency.cjs");
 const {
   configureTerminalSessionDataEmitter,
 } = require("./emitTerminalSessionData.cjs");
@@ -55,8 +62,10 @@ const {
 const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
 // Match any private key file: id_* but not *.pub
 const SSH_KEY_PATTERN = /^id_[\w-]+$/;
-const SSH_TCP_CONNECT_TIMEOUT_MS = 20000;
-const SSH_AUTH_READY_TIMEOUT_MS = 120000;
+const {
+  createStartSessionApi,
+  resolveSshConnectionTimeouts,
+} = require("./sshBridge/startSession.cjs");
 
 function quoteShellArg(value) {
   return "'" + String(value).replace(/'/g, "'\\''") + "'";
@@ -487,6 +496,7 @@ function closeTerminalOutputSession(sessionId) {
  * Connect through a chain of jump hosts
  */
 async function connectThroughChain(event, options, jumpHosts, targetHost, targetPort, sessionId) {
+  const targetConnectionTimeouts = resolveSshConnectionTimeouts(options);
   const sender = event.sender;
   const connections = options?._connectionsRef || [];
   const sshDiagnosticLogger = options?._sshDiagnosticLogger || log;
@@ -526,13 +536,16 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       // serializers that don't populate the per-hop fields yet.
       const hopInterval = jump.keepaliveInterval ?? options.keepaliveInterval ?? 0;
       const hopCountMax = jump.keepaliveCountMax ?? options.keepaliveCountMax ?? 10;
+      const hopConnectionTimeouts = resolveSshConnectionTimeouts(jump);
       // Build connection options
       const connOpts = {
         host: jump.hostname,
         port: jump.port || 22,
         username: jump.username || 'root',
-        timeout: SSH_TCP_CONNECT_TIMEOUT_MS,
-        readyTimeout: SSH_AUTH_READY_TIMEOUT_MS, // 2 minutes to allow for keyboard-interactive (2FA/MFA)
+        timeout: hopConnectionTimeouts.tcpConnectTimeoutMs,
+        // ssh2 starts readyTimeout before TCP connects. The auth-ready timer
+        // below starts explicitly from the connection event instead.
+        readyTimeout: 0,
         keepaliveInterval: hopInterval > 0 ? hopInterval * 1000 : 0,
         keepaliveCountMax: hopInterval > 0 ? hopCountMax : 0,
         // Enable keyboard-interactive authentication (required for 2FA/MFA)
@@ -583,7 +596,11 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       const hasCertificate =
         typeof jump.certificate === "string" && jump.certificate.trim().length > 0;
 
-      const identityFile = !jump.privateKey
+      const systemAuthAgent = hasCertificate
+        ? null
+        : await prepareSystemSshAgentForAuth(jump, `[Chain] Hop ${i + 1}:`);
+
+      const identityFile = !jump.privateKey && !systemAuthAgent
         ? await loadFirstIdentityFileForAuth({
           sender,
           identityFilePaths: jump.identityFilePaths,
@@ -608,7 +625,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           },
         })
         : null;
-      const inlineKey = jump.privateKey
+      const inlineKey = jump.privateKey && !systemAuthAgent
         ? await preparePrivateKeyForAuth({
           sender,
           privateKey: jump.privateKey,
@@ -630,6 +647,9 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       const effectivePassphrase = inlineKey?.passphrase || identityFile?.passphrase;
 
       let authAgent = null;
+      if (systemAuthAgent) {
+        connOpts.agent = systemAuthAgent;
+      }
       if (hasCertificate) {
         authAgent = new NetcattyAgent({
           mode: "certificate",
@@ -676,7 +696,9 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       if (jump.password) connOpts.password = jump.password;
 
       // Get default keys (either from options if pre-fetched, or fetch them now)
-      const defaultKeys = options._defaultKeys || await findAllDefaultPrivateKeys();
+      const defaultKeys = systemAuthAgent && jump.identitiesOnly
+        ? []
+        : options._defaultKeys || await findAllDefaultPrivateKeys();
 
       // Build auth handler using shared helper
       // Pass unlocked encrypted keys from options so jump hosts can use them for retry
@@ -687,20 +709,24 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
         agent: connOpts.agent,
         username: connOpts.username,
         logPrefix: `[Chain] Hop ${i + 1}`,
-        unlockedEncryptedKeys: options._unlockedEncryptedKeys || [],
+        unlockedEncryptedKeys: systemAuthAgent && jump.identitiesOnly
+          ? []
+          : options._unlockedEncryptedKeys || [],
         defaultKeys,
+        allowAgentFallback: jump.useSshAgent !== false,
         onAuthAttempt: (method) => {
           sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', method);
         },
       });
       applyAuthToConnOpts(connOpts, authConfig);
+      const hopAuthPhase = authConfig.authPhase || createAuthPhase();
 
       // If first hop and proxy is configured, connect through proxy
       const hasUsableJumpProxy = hasUsableProxy(jump.proxy);
       const effectiveHopProxy = isFirst ? ((hasUsableJumpProxy ? jump.proxy : null) || options.proxy) : null;
       if (effectiveHopProxy) {
         currentSocket = await createProxySocket(effectiveHopProxy, jump.hostname, jump.port || 22, {
-          timeoutMs: SSH_TCP_CONNECT_TIMEOUT_MS,
+          timeoutMs: hopConnectionTimeouts.tcpConnectTimeoutMs,
           onSocket: (socket) => {
             if (options?._tunnelRef) {
               options._tunnelRef.pendingConn = socket;
@@ -724,11 +750,23 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 
       // Connect this hop
       await new Promise((resolve, reject) => {
+        let settled = false;
+        let authReadyTimer = null;
+        const clearAuthReadyTimer = () => {
+          if (authReadyTimer) {
+            clearTimeout(authReadyTimer);
+            authReadyTimer = null;
+          }
+        };
         conn.once('handshake', () => {
+          if (settled) return;
           console.log(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} handshake complete`);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'authenticating');
         });
         conn.once('ready', () => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
           console.log(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} connected`);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'connected');
           if (options?._tunnelRef) {
@@ -738,10 +776,14 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           resolve();
         });
         conn.once('error', (err) => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
           console.error(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} error:`, err.message);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'error', err.message);
           if (isChainAuthError(err)) {
             err.isJumpHostAuthError = true;
+            err.jumpHostIndex = i;
             err.jumpHostLabel = hopLabel;
             err.jumpHostHostname = jump.hostname;
             err.message = `Jump host authentication failed for "${hopLabel}": ${err.message}`;
@@ -749,10 +791,21 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           reject(err);
         });
         conn.once('timeout', () => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
           console.error(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} timeout`);
           const errMsg = `Connection timeout to ${hopLabel}`;
           sendProgress(i + 1, totalHops + 1, hopLabel, 'error', errMsg);
           try { conn.destroy(); } catch { }
+          reject(new Error(errMsg));
+        });
+        conn.once('close', () => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
+          const errMsg = `Connection to ${hopLabel} closed before authentication completed`;
+          sendProgress(i + 1, totalHops + 1, hopLabel, 'error', errMsg);
           reject(new Error(errMsg));
         });
         // Handle keyboard-interactive authentication for jump hosts (2FA/MFA)
@@ -763,6 +816,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           password: jump.password,
           logPrefix: `[Chain] Hop ${i + 1}/${totalHops}`,
           scope: keyboardInteractiveScope,
+          shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(hopAuthPhase),
           onAutoFill: () => sendProgress(
             i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'using saved password',
           ),
@@ -775,9 +829,17 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
         }));
         console.log(`[Chain] Hop ${i + 1}/${totalHops}: Connecting to ${hopLabel}...`);
         conn.once('connect', () => {
-          try { conn._sock?.setTimeout?.(0); } catch { }
-          sendProgress(i + 1, totalHops + 1, hopLabel, 'tcp-connected');
-          enableSshNoDelay(conn);
+          runWhenProxyConnectionReady(conn._sock, () => {
+            try { conn._sock?.setTimeout?.(0); } catch { }
+            clearAuthReadyTimer();
+            authReadyTimer = setTimeout(
+              () => conn.emit('timeout'),
+              hopConnectionTimeouts.authReadyTimeoutMs,
+            );
+            authReadyTimer.unref?.();
+            sendProgress(i + 1, totalHops + 1, hopLabel, 'tcp-connected');
+            enableSshNoDelay(conn);
+          });
         });
         if (connOpts.sock) enableTcpNoDelay(connOpts.sock);
         conn.connect(connOpts);
@@ -786,23 +848,26 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       connections.push(conn);
 
       // Determine next target
-      let nextHost, nextPort;
+      let nextHost, nextPort, nextConnectionTimeouts;
       if (isLast) {
         // Last jump host, forward to final target
         nextHost = targetHost;
         nextPort = targetPort;
+        nextConnectionTimeouts = targetConnectionTimeouts;
       } else {
         // Forward to next jump host
         const nextJump = jumpHosts[i + 1];
         nextHost = nextJump.hostname;
         nextPort = nextJump.port || 22;
+        nextConnectionTimeouts = resolveSshConnectionTimeouts(nextJump);
       }
 
       // Create forward stream to next hop
       console.log(`[Chain] Hop ${i + 1}/${totalHops}: Forwarding from ${hopLabel} to ${nextHost}:${nextPort}...`);
       sendProgress(i + 1, totalHops + 1, hopLabel, 'forwarding');
       currentSocket = await new Promise((resolve, reject) => {
-        const forwardTimeoutMs = options?._forwardTimeoutMs || SSH_TCP_CONNECT_TIMEOUT_MS;
+        const forwardTimeoutMs = options?._forwardTimeoutMs
+          || nextConnectionTimeouts.tcpConnectTimeoutMs;
         let settled = false;
         const timeout = setTimeout(() => {
           if (settled) return;
@@ -854,7 +919,6 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 /**
  * Start an SSH session
  */
-const { createStartSessionApi } = require("./sshBridge/startSession.cjs");
 const startSessionApi = createStartSessionApi({
   get sessions() { return sessions; },
   get electronModule() { return electronModule; },
@@ -871,7 +935,7 @@ const startSessionApi = createStartSessionApi({
   openTerminalOutputSession, closeTerminalOutputSession,
   get selectZmodemUploadFiles() { return selectZmodemUploadFiles; },
   get selectZmodemDownloadDirectory() { return selectZmodemDownloadDirectory; },
-  preparePrivateKeyForAuth, loadFirstIdentityFileForAuth, hasUserConfiguredKey, isPasswordProvided, createKeyboardInteractiveHandler,
+  preparePrivateKeyForAuth, loadFirstIdentityFileForAuth, prepareSystemSshAgentForAuth, hasUserConfiguredKey, isPasswordProvided, createKeyboardInteractiveHandler, createOrderedStringAuthHandler, createAuthPhase, markAuthPhasePartialSuccess, shouldSkipKiPasswordAutoFill,
   createConnectionRef, acquireConnectionRef, releaseConnectionRef, findReusableSession,
   get probeReceiveConflicts() { return probeReceiveConflicts; },
   get removeRemoteFiles() { return removeRemoteFiles; },
@@ -882,8 +946,9 @@ const { createExecCommandApi } = require("./sshBridge/execCommand.cjs");
 const execCommandApi = createExecCommandApi({
   SSHClient, NetcattyAgent, randomUUID, console, setTimeout, clearTimeout, Error,
   findAllDefaultPrivateKeysFromHelper, preparePrivateKeyForAuth, loadIdentityFileForAuth,
+  prepareSystemSshAgentForAuth,
   isPassphraseCancelledError, buildAlgorithms, buildAuthHandler, applyAuthToConnOpts,
-  createKeyboardInteractiveHandler,
+  createKeyboardInteractiveHandler, shouldSkipKiPasswordAutoFill, resolveSshConnectionTimeouts,
 });
 const { execCommand } = execCommandApi;
 
@@ -960,13 +1025,32 @@ function isChainAuthError(err) {
 
 function canRetryWithEncryptedDefaultKeys(options) {
   const hasJumpHosts = options.jumpHosts && options.jumpHosts.length > 0;
+  const hasStrictTargetAgent = options.useSshAgent === true && options.identitiesOnly === true;
   const isPasswordOnly = !hasJumpHosts &&
     !options.agentForwarding &&
     !!options.password &&
     !options.privateKey &&
     !options.certificate;
   return !isPasswordOnly &&
+    (hasJumpHosts || !hasStrictTargetAgent) &&
     (!options._unlockedEncryptedKeys || options._unlockedEncryptedKeys.length === 0);
+}
+
+function isStrictAgentAuthFailure(options, err) {
+  if (!err?.isJumpHostAuthError) {
+    return options.useSshAgent === true && options.identitiesOnly === true;
+  }
+  const jumpHosts = options.jumpHosts || [];
+  if (Number.isInteger(err.jumpHostIndex) && err.jumpHostIndex >= 0) {
+    const failedJump = jumpHosts[err.jumpHostIndex];
+    return failedJump?.useSshAgent === true && failedJump.identitiesOnly === true;
+  }
+  const matchingJumps = jumpHosts.filter((jump) => (
+    (err.jumpHostHostname && jump.hostname === err.jumpHostHostname)
+    || (err.jumpHostLabel && jump.label === err.jumpHostLabel)
+  ));
+  const failedJump = matchingJumps.length === 1 ? matchingJumps[0] : undefined;
+  return failedJump?.useSshAgent === true && failedJump.identitiesOnly === true;
 }
 
 function canReuseExistingSession(options) {
@@ -1023,7 +1107,7 @@ async function startSSHSessionWrapper(event, options) {
     if (isAuthError) {
       // Check if there are encrypted default keys we haven't tried yet
       // Only offer retry if no unlocked keys were provided in this attempt
-      if (canRetryEncryptedDefaults) {
+      if (canRetryEncryptedDefaults && !isStrictAgentAuthFailure(options, err)) {
         const encryptedKeys = loadedRetryableEncryptedKeys
           ? retryableEncryptedKeys
           : await loadRetryableEncryptedKeys();
@@ -1076,6 +1160,7 @@ async function startSSHSessionWrapper(event, options) {
                 authError.isAuthError = true;
                 if (retryErr.isJumpHostAuthError) {
                   authError.isJumpHostAuthError = true;
+                  authError.jumpHostIndex = retryErr.jumpHostIndex;
                   authError.jumpHostLabel = retryErr.jumpHostLabel;
                   authError.jumpHostHostname = retryErr.jumpHostHostname;
                 }
@@ -1104,6 +1189,7 @@ async function startSSHSessionWrapper(event, options) {
       authError.isAuthError = true;
       if (err.isJumpHostAuthError) {
         authError.isJumpHostAuthError = true;
+        authError.jumpHostIndex = err.jumpHostIndex;
         authError.jumpHostLabel = err.jumpHostLabel;
         authError.jumpHostHostname = err.jumpHostHostname;
       }
@@ -1149,12 +1235,13 @@ const { isHostKeyTrustedBySystem } = createSystemKnownHostsApi({
 const { createMoshStatsConnectionApi } = require("./sshBridge/moshStatsConnection.cjs");
 const { ensureMoshStatsConnection, ensureEtStatsConnection } = createMoshStatsConnectionApi({
   get sessions() { return sessions; },
-  SSHClient, sshUtils, NetcattyAgent, buildAlgorithms, getSshAgentSocket,
+  SSHClient, sshUtils, NetcattyAgent, buildAlgorithms, getSshAgentSocket, prepareSystemSshAgentForAuth,
   readFileNoFollow, expandIdentityFilePath, isAutoFillablePasswordChallenge,
   hostKeyVerifier, isHostKeyTrustedBySystem, log,
 });
 
 const { createSessionOpsApi } = require("./sshBridge/sessionOps.cjs");
+const measureTcpConnectLatency = createTcpConnectLatencyProbe({ net });
 const sessionOpsApi = createSessionOpsApi({
   get sessions() { return sessions; },
   get electronModule() { return electronModule; },
@@ -1162,6 +1249,7 @@ const sessionOpsApi = createSessionOpsApi({
   getSessionDecoder, resetSessionDecoders, sessionEncodings, normalizeTerminalEncoding,
   safeSend,
   quoteShellArg, log, ensureMoshStatsConnection, ensureEtStatsConnection,
+  measureTcpConnectLatency,
   execOnEtSession: (...args) => require("./terminalBridge.cjs").execOnEtSession(...args),
   getServerStats: undefined,
 });
@@ -1235,8 +1323,17 @@ function registerHandlers(ipcMain, options = {}) {
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
   ipcMain.handle("netcatty:sshDebugLog:info", getSshDebugLogInfo);
   ipcMain.handle("netcatty:sshDebugLog:openDir", openSshDebugLogDir);
-  ipcMain.handle("netcatty:ssh:check-agent", async () => {
-    return await checkWindowsSshAgent();
+  ipcMain.handle("netcatty:ssh:check-agent", async (_event, options = {}) => {
+    const identityAgent = typeof options === "string" ? options : options.identityAgent;
+    if (process.platform === "win32" && !identityAgent) {
+      return await checkWindowsSshAgent();
+    }
+    const socketPath = await getAvailableSystemAgentSocket(identityAgent, typeof options === "string" ? {} : options);
+    return {
+      running: Boolean(socketPath),
+      startupType: socketPath ? "running" : "stopped",
+      error: socketPath ? null : "SSH Agent socket not connectable",
+    };
   });
   ipcMain.handle("netcatty:ssh:get-default-keys", async () => {
     const sshDir = path.join(os.homedir(), ".ssh");
@@ -1272,5 +1369,6 @@ module.exports = {
   // derives the preferred default key from findAllDefaultPrivateKeys()[0]).
   _findDefaultPrivateKey: findDefaultPrivateKey,
   _findAllDefaultPrivateKeys: findAllDefaultPrivateKeys,
+  _isStrictAgentAuthFailure: isStrictAgentAuthFailure,
   ensureMoshStatsConnection,
 };

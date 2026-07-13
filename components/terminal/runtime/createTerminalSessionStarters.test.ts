@@ -81,6 +81,156 @@ test("getMissingChainHostIds reports unresolved jump hosts", () => {
   );
 });
 
+test("startSSH forwards imported system agent authentication settings", async () => {
+  let capturedOptions: Record<string, unknown> | null = null;
+  const terminalBackend = {
+    backendAvailable: () => true,
+    startSSHSession: async (options: Record<string, unknown>) => {
+      capturedOptions = options;
+      return "ssh-session";
+    },
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+  const ctx = createStarterContext({
+    host: {
+      id: "host-1",
+      label: "aws-sg",
+      hostname: "1.1.1.1",
+      username: "root",
+      port: 2222,
+      useSshAgent: true,
+      identityAgent: "$SSH_AUTH_SOCK",
+      identityFilePaths: ["~/.ssh/aws_root"],
+      identitiesOnly: true,
+      addKeysToAgent: "yes",
+      useKeychain: true,
+    },
+    terminalBackend,
+  });
+
+  await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+
+  assert.deepEqual(
+    capturedOptions && {
+      useSshAgent: capturedOptions.useSshAgent,
+      identityAgent: capturedOptions.identityAgent,
+      identityFilePaths: capturedOptions.identityFilePaths,
+      identitiesOnly: capturedOptions.identitiesOnly,
+      addKeysToAgent: capturedOptions.addKeysToAgent,
+      useKeychain: capturedOptions.useKeychain,
+    },
+    {
+      useSshAgent: true,
+      identityAgent: "$SSH_AUTH_SOCK",
+      identityFilePaths: ["~/.ssh/aws_root"],
+      identitiesOnly: true,
+      addKeysToAgent: "yes",
+      useKeychain: true,
+    },
+  );
+});
+
+test("startSSH uses the system agent when a synced vault key cannot be decrypted", async () => {
+  let capturedOptions: Record<string, unknown> | null = null;
+  const terminalBackend = {
+    backendAvailable: () => true,
+    startSSHSession: async (options: Record<string, unknown>) => {
+      capturedOptions = options;
+      return "ssh-session";
+    },
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+  const ctx = createStarterContext({
+    host: {
+      id: "host-1",
+      label: "Agent host",
+      hostname: "agent.example.test",
+      username: "root",
+      authMethod: "key",
+      identityFileId: "key-1",
+      useSshAgent: true,
+    },
+    keys: [{
+      id: "key-1",
+      label: "Synced key",
+      type: "ED25519",
+      publicKey: "ssh-ed25519 AAAASELECTED",
+      privateKey: "enc:v1:djEwAAAA",
+      source: "imported",
+      category: "key",
+      created: 1,
+    }],
+    terminalBackend,
+  });
+
+  await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+
+  assert.equal(capturedOptions?.useSshAgent, true);
+  assert.deepEqual(capturedOptions?.agentPublicKeys, ["ssh-ed25519 AAAASELECTED"]);
+  assert.equal(capturedOptions?.privateKey, undefined);
+});
+
+for (const protocol of ["Mosh", "ET"] as const) {
+  test(`${protocol} keeps certificate signing material when the system agent toggle is also enabled`, async () => {
+    let capturedOptions: Record<string, unknown> | null = null;
+    const terminalBackend = {
+      backendAvailable: () => true,
+      moshAvailable: () => true,
+      etAvailable: () => true,
+      startMoshSession: async (options: Record<string, unknown>) => {
+        capturedOptions = options;
+        return "mosh-session";
+      },
+      startEtSession: async (options: Record<string, unknown>) => {
+        capturedOptions = options;
+        return "et-session";
+      },
+      onSessionData: () => noop,
+      onSessionExit: () => noop,
+      writeToSession: noop,
+      resizeSession: noop,
+    };
+    const ctx = createStarterContext({
+      host: {
+        id: "host-1",
+        label: "Certificate host",
+        hostname: "cert.example.test",
+        username: "alice",
+        authMethod: "certificate",
+        identityFileId: "cert-key",
+        useSshAgent: true,
+      },
+      keys: [{
+        id: "cert-key",
+        label: "Certificate key",
+        type: "ED25519",
+        category: "key",
+        source: "imported",
+        created: 1,
+        privateKey: "PRIVATE KEY",
+        certificate: "ssh-ed25519-cert-v01@openssh.com AAAATEST",
+      }],
+      terminalBackend,
+    });
+
+    const starters = createTerminalSessionStarters(ctx as never);
+    if (protocol === "Mosh") await starters.startMosh(createTermStub() as never);
+    else await starters.startEt(createTermStub() as never);
+
+    assert.equal(capturedOptions?.privateKey, "PRIVATE KEY");
+    assert.equal(capturedOptions?.certificate, "ssh-ed25519-cert-v01@openssh.com AAAATEST");
+    assert.equal(capturedOptions?.useSshAgent, false);
+  });
+}
+
 test("startSSH forwards custom ProxyCommand to the SSH bridge", async () => {
   let capturedOptions: Record<string, unknown> | null = null;
   const terminalBackend = {
@@ -253,6 +403,8 @@ test("startSSH resolves jump host proxy credentials from an identity", async () 
       label: "Target",
       hostname: "target.example.test",
       username: "alice",
+      sshTcpConnectTimeoutSeconds: 50,
+      sshAuthReadyTimeoutSeconds: 240,
       hostChain: { hostIds: ["jump-1"] },
     },
     resolvedChainHosts: [{
@@ -260,6 +412,8 @@ test("startSSH resolves jump host proxy credentials from an identity", async () 
       label: "Jump",
       hostname: "jump.example.test",
       username: "jump",
+      sshTcpConnectTimeoutSeconds: 75,
+      sshAuthReadyTimeoutSeconds: 360,
       proxyConfig: {
         type: "socks5",
         host: "jump-proxy.example.test",
@@ -287,6 +441,10 @@ test("startSSH resolves jump host proxy credentials from an identity", async () 
     username: "proxy-user",
     password: "proxy-secret",
   });
+  assert.equal(capturedOptions?.sshTcpConnectTimeoutMs, 50_000);
+  assert.equal(capturedOptions?.sshAuthReadyTimeoutMs, 240_000);
+  assert.equal(jumpHosts[0]?.sshTcpConnectTimeoutMs, 75_000);
+  assert.equal(jumpHosts[0]?.sshAuthReadyTimeoutMs, 360_000);
 });
 
 test("startSSH shows jump-host auth failures without opening target auth retry", async () => {
@@ -1072,6 +1230,7 @@ test("startSSH resets the TCP dial timeout state before password fallback", asyn
     error?: string,
   ) => void = noop;
   let startCalls = 0;
+  const startOptions: Record<string, unknown>[] = [];
   const tcpDialState: boolean[] = [];
   const terminalBackend = {
     backendAvailable: () => true,
@@ -1080,8 +1239,9 @@ test("startSSH resets the TCP dial timeout state before password fallback", asyn
     localAvailable: () => true,
     serialAvailable: () => true,
     execAvailable: () => true,
-    startSSHSession: async () => {
+    startSSHSession: async (options: Record<string, unknown>) => {
       startCalls += 1;
+      startOptions.push(options);
       if (startCalls === 1) {
         chainProgressListener("session-1", 1, 1, "target.example.test", "tcp-connected");
         throw new Error("Authentication failed");
@@ -1112,6 +1272,7 @@ test("startSSH resets the TCP dial timeout state before password fallback", asyn
       authMethod: "key",
       identityFileId: "key-1",
       password: "login-secret",
+      useSshAgent: true,
     },
     keys: [{
       id: "key-1",
@@ -1129,6 +1290,8 @@ test("startSSH resets the TCP dial timeout state before password fallback", asyn
   await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
 
   assert.equal(startCalls, 2);
+  assert.equal(startOptions[0]?.useSshAgent, true);
+  assert.equal(startOptions[1]?.useSshAgent, false);
   assert.deepEqual(tcpDialState, [false, false, true, false]);
 });
 
@@ -2686,7 +2849,7 @@ test("startSSH allows jump hosts that use reference key files with unavailable s
   assert.equal(jumpHosts[0]?.passphrase, undefined);
 });
 
-test("startSSH forwards the SSH debug logging setting to the native bridge", async () => {
+test("startSSH forwards per-host SSH settings to the native bridge", async () => {
   let capturedOptions: Record<string, unknown> | null = null;
 
   const terminalBackend = {
@@ -2720,6 +2883,8 @@ test("startSSH forwards the SSH debug logging setting to the native bridge", asy
       username: "alice",
       port: 22,
       password: "pw",
+      sshTcpConnectTimeoutSeconds: 45,
+      sshAuthReadyTimeoutSeconds: 300,
     },
     keys: [],
     knownHosts: [],
@@ -2727,7 +2892,10 @@ test("startSSH forwards the SSH debug logging setting to the native bridge", asy
     sessionId: "session-1",
     terminalBackend,
     sshDebugLogEnabled: true,
-    terminalSettings: { keepaliveInterval: 30, keepaliveCountMax: 10 },
+    terminalSettings: {
+      keepaliveInterval: 30,
+      keepaliveCountMax: 10,
+    },
     sessionRef: { current: null },
     hasConnectedRef: { current: false },
     hasRunStartupCommandRef: { current: false },
@@ -2757,6 +2925,8 @@ test("startSSH forwards the SSH debug logging setting to the native bridge", asy
   await createTerminalSessionStarters(ctx as unknown as TerminalSessionStartersContext).startSSH(term);
 
   assert.equal(capturedOptions?.sshDebugLogEnabled, true);
+  assert.equal(capturedOptions?.sshTcpConnectTimeoutMs, 45_000);
+  assert.equal(capturedOptions?.sshAuthReadyTimeoutMs, 300_000);
 });
 
 test("startSSH omits identity file paths when password auth is selected", async () => {

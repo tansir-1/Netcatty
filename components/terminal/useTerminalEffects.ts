@@ -47,7 +47,12 @@ import {
   scheduleTerminalCloseTeardown,
   serializeTerminalCloseFallback,
 } from './runtime/terminalCloseCapture';
-import { getConnectionTimeoutMs, shouldRunConnectionTimeout } from './connectionTimeouts';
+import {
+  getConnectionTimeoutMs,
+  resolveActiveConnectionTimeoutHost,
+  shouldRunConnectionTimeout,
+} from './connectionTimeouts';
+import { resolveHostSshConnectionTimeouts } from '../../domain/sshConnectionTimeouts';
 
 type TerminalEffectsContext = Record<string, any>;
 
@@ -160,7 +165,7 @@ export function resolveSelectionOverlayPosition(term: any, container: HTMLElemen
 }
 
 export function useTerminalEffects(ctx: TerminalEffectsContext) {
-  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, isBroadcastEnabledRef, isComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOutputTriggerUserInputRef, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, prepareRestoredReconnect, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setHasSelection, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setSelectionOverlayPosition, setShowLogs, setStatus, setTimeLeft, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, onSnippetShortkeyRef, snippetsRef, splitResizeActive, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState } = ctx;
+  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, chainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, isBroadcastEnabledRef, isComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOutputTriggerUserInputRef, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, prepareRestoredReconnect, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setHasSelection, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setSelectionOverlayPosition, setShowLogs, setStatus, setTimeLeft, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, onSnippetShortkeyRef, snippetsRef, splitResizeActive, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState } = ctx;
   const hibernateHiddenTabs = resolveTerminalHibernateEnabled(terminalSettings);
   const isRendererActive = isVisible || !hibernateHiddenTabs;
   const isRendererActiveRef = useRef(isRendererActive);
@@ -315,6 +320,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
   useEffect(() => {
     let disposed = false;
+    let initialFitTimer: ReturnType<typeof setTimeout> | undefined;
     const closeGeneration = ++terminalBootCloseGenerationRef.current;
     isBootActiveRef.current = true;
     terminalDataCapturedRef.current = false;
@@ -404,7 +410,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
         hasRuntimeRef.current = true;
         // xterm boots asynchronously; ResizeObserver may have already run without
         // fitAddon and will not re-attach until isVisible/isResizing changes.
-        setTimeout(() => {
+        initialFitTimer = setTimeout(() => {
           if (disposed) return;
           safeFit({ force: true, requireVisible: true });
         }, 0);
@@ -502,6 +508,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
     return () => {
       disposed = true;
+      if (initialFitTimer !== undefined) clearTimeout(initialFitTimer);
       isBootActiveRef.current = false;
       if (hibernatedRef?.current) {
         forceCloseHibernatedSession?.();
@@ -587,7 +594,17 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     };
     if (!shouldRunConnectionTimeout(timeoutState)) return;
 
-    const connectionTimeout = getConnectionTimeoutMs(timeoutState) || CONNECTION_TIMEOUT;
+    const activeTimeoutHost = resolveActiveConnectionTimeoutHost(
+      host,
+      chainHosts,
+      chainProgress?.currentHop,
+      chainProgress?.connectionPhase,
+    );
+    const hostConnectionTimeouts = resolveHostSshConnectionTimeouts(activeTimeoutHost);
+    const connectionTimeout = getConnectionTimeoutMs(timeoutState, {
+      tcpConnectTimeoutMs: hostConnectionTimeouts.tcpConnectTimeoutSeconds * 1000,
+      authReadyTimeoutMs: hostConnectionTimeouts.authReadyTimeoutSeconds * 1000,
+    }) || CONNECTION_TIMEOUT;
     setTimeLeft(connectionTimeout / 1000);
     const countdown = setInterval(() => {
       setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
@@ -615,7 +632,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       clearInterval(prog);
     };
      
-  }, [status, auth.needsAuth, host.protocol, host.hostname, host.moshEnabled, host.etEnabled, isLocalConnection, isSerialConnection, needsHostKeyVerification, isConnectionAwaitingUserInput, isConnectionPastTcpDial]);
+  }, [status, auth.needsAuth, host.protocol, host.hostname, host.moshEnabled, host.etEnabled, host.sshTcpConnectTimeoutSeconds, host.sshAuthReadyTimeoutSeconds, chainHosts, chainProgress?.currentHop, chainProgress?.connectionPhase, isLocalConnection, isSerialConnection, needsHostKeyVerification, isConnectionAwaitingUserInput, isConnectionPastTcpDial]);
 
 
   useEffect(() => {
@@ -656,7 +673,8 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     termRef.current.options.fontSize = effectiveFontSize;
     xtermRuntimeRef.current?.clearTextureAtlas();
     if (isRendererActiveRef.current) {
-      setTimeout(() => safeFit({ force: true, requireVisible: true }), 50);
+      const refitTimer = setTimeout(() => safeFit({ force: true, requireVisible: true }), 50);
+      return () => clearTimeout(refitTimer);
     } else {
       lastFittedSizeRef.current = null;
     }
@@ -720,7 +738,8 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     xtermRuntimeRef.current?.clearTextureAtlas();
 
     if (isRendererActiveRef.current) {
-      setTimeout(() => safeFit({ force: true, requireVisible: true }), 50);
+      const refitTimer = setTimeout(() => safeFit({ force: true, requireVisible: true }), 50);
+      return () => clearTimeout(refitTimer);
     } else {
       lastFittedSizeRef.current = null;
     }

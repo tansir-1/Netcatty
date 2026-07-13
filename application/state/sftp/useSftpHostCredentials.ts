@@ -1,8 +1,9 @@
 import { useCallback } from "react";
 import type { Host, Identity, KnownHost, SSHKey, TerminalSettings } from "../../../domain/models";
 import { isEncryptedCredentialPlaceholder, sanitizeCredentialValue } from "../../../domain/credentials";
-import { resolveBridgeKeyAuth, resolveHostAuth } from "../../../domain/sshAuth";
+import { resolveBridgeKeyAuth, resolveBridgeSshAgentAuth, resolveHostAuth } from "../../../domain/sshAuth";
 import { resolveHostKeepalive } from "../../../domain/host";
+import { resolveHostSshConnectionTimeouts } from "../../../domain/sshConnectionTimeouts";
 import {
   findIncompleteProxyIdentityId,
   findMissingProxyIdentityId,
@@ -99,12 +100,15 @@ export const buildSftpHostCredentials = ({
       const jumpPassword = sanitizeCredentialValue(jumpAuth.password);
       const jumpKeyAuth = resolveBridgeKeyAuth({
         key: jumpKey,
-        fallbackIdentityFilePaths: jumpAuth.authMethod === "password" || jumpAuth.keyId
+        fallbackIdentityFilePaths: (!jumpHost.useSshAgent && jumpAuth.authMethod === "password") || jumpAuth.keyId
           ? undefined
           : jumpHost.identityFilePaths,
         passphrase: jumpAuth.passphrase,
       });
-      const hasJumpKeyMaterial = Boolean(jumpKeyAuth.privateKey || jumpKeyAuth.identityFilePaths?.length);
+      const jumpAgentAuth = resolveBridgeSshAgentAuth(jumpHost, jumpKey);
+      const hasJumpKeyMaterial = Boolean(
+        jumpAgentAuth.useSshAgent || jumpKeyAuth.privateKey || jumpKeyAuth.identityFilePaths?.length,
+      );
       const hasConfiguredJumpProxyEndpoint =
         index === 0 &&
         hasUsableProxyConfig(jumpHost.proxyConfig);
@@ -125,6 +129,7 @@ export const buildSftpHostCredentials = ({
         throw new Error(`Saved credentials for jump host "${jumpHost.label || jumpHost.hostname}" cannot be decrypted on this device. Open host settings and re-enter them.`);
       }
       const hopKeepalive = resolveHostKeepalive(jumpHost, globalTerminalSettings);
+      const hopConnectionTimeouts = resolveHostSshConnectionTimeouts(jumpHost);
       return {
         hostname: jumpHost.hostname,
         port: jumpHost.port || 22,
@@ -141,8 +146,11 @@ export const buildSftpHostCredentials = ({
           ? resolveProxyConfigAuth(jumpHost.proxyConfig, identities)
           : undefined,
         identityFilePaths: jumpKeyAuth.identityFilePaths,
+        ...jumpAgentAuth,
         keepaliveInterval: hopKeepalive.interval,
         keepaliveCountMax: hopKeepalive.countMax,
+        sshTcpConnectTimeoutMs: hopConnectionTimeouts.tcpConnectTimeoutSeconds * 1000,
+        sshAuthReadyTimeoutMs: hopConnectionTimeouts.authReadyTimeoutSeconds * 1000,
         verifyHostKeys: globalTerminalSettings.verifyHostKeys,
         legacyAlgorithms: jumpHost.legacyAlgorithms,
         skipEcdsaHostKey: jumpHost.skipEcdsaHostKey,
@@ -157,13 +165,16 @@ export const buildSftpHostCredentials = ({
 
   const keyAuth = resolveBridgeKeyAuth({
     key,
-    fallbackIdentityFilePaths: resolved.authMethod === "password" || resolved.keyId
+    fallbackIdentityFilePaths: (!host.useSshAgent && resolved.authMethod === "password") || resolved.keyId
       ? undefined
       : host.identityFilePaths,
     passphrase: resolved.passphrase,
   });
+  const targetAgentAuth = resolveBridgeSshAgentAuth(host, key);
   const password = sanitizeCredentialValue(resolved.password);
-  const hasKeyMaterial = Boolean(keyAuth.privateKey || keyAuth.identityFilePaths?.length);
+  const hasKeyMaterial = Boolean(
+    targetAgentAuth.useSshAgent || keyAuth.privateKey || keyAuth.identityFilePaths?.length,
+  );
   const hasUnreadableCredential =
     isEncryptedCredentialPlaceholder(resolved.password) ||
     isEncryptedCredentialPlaceholder(key?.privateKey) ||
@@ -176,6 +187,7 @@ export const buildSftpHostCredentials = ({
   }
 
   const targetKeepalive = resolveHostKeepalive(host, globalTerminalSettings);
+  const targetConnectionTimeouts = resolveHostSshConnectionTimeouts(host);
   return {
     hostname: host.hostname,
     username: resolved.username,
@@ -191,8 +203,11 @@ export const buildSftpHostCredentials = ({
     jumpHosts: jumpHosts && jumpHosts.length > 0 ? jumpHosts : undefined,
     sudo: host.sftpSudo,
     identityFilePaths: keyAuth.identityFilePaths,
+    ...targetAgentAuth,
     keepaliveInterval: targetKeepalive.interval,
     keepaliveCountMax: targetKeepalive.countMax,
+    sshTcpConnectTimeoutMs: targetConnectionTimeouts.tcpConnectTimeoutSeconds * 1000,
+    sshAuthReadyTimeoutMs: targetConnectionTimeouts.authReadyTimeoutSeconds * 1000,
     knownHosts,
     verifyHostKeys: globalTerminalSettings.verifyHostKeys,
     // Algorithm settings — must reach the SFTP bridge or hosts that need

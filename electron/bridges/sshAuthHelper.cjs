@@ -6,8 +6,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const { createHash } = require("node:crypto");
 const { exec } = require("node:child_process");
 const { utils: sshUtils } = require("ssh2");
+const { prepareSystemSshAgent } = require("./systemSshAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
 const {
@@ -447,6 +449,214 @@ function windowsPipeConnectable(pipePath, timeoutMs = 1000) {
   });
 }
 
+function isWindowsNamedPipe(agentPath) {
+  return /^[/\\][/\\]\.[/\\]pipe[/\\].+/.test(agentPath);
+}
+
+function ssh2AgentConnectable(agentPath, options = {}) {
+  const createAgentImpl = options.createAgentImpl || require("ssh2/lib/agent.js").createAgent;
+  const timeoutMs = options.timeoutMs ?? 1000;
+  return new Promise((resolve) => {
+    let settled = false;
+    let stream = null;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (stream) {
+        stream.removeAllListeners();
+        stream.destroy();
+      }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      createAgentImpl(agentPath).getStream((error, agentStream) => {
+        if (settled) {
+          agentStream?.destroy?.();
+          return;
+        }
+        if (error || !agentStream) return finish(false);
+        stream = agentStream;
+        let response = Buffer.alloc(0);
+        stream.on("data", (chunk) => {
+          response = Buffer.concat([response, chunk]);
+          if (response.length < 5) return;
+          const payloadLength = response.readUInt32BE(0);
+          if (payloadLength < 1 || payloadLength > 1024 * 1024) return finish(false);
+          if (response.length < payloadLength + 4) return;
+          finish(response[4] === 12 || response[4] === 5);
+        });
+        stream.once("error", () => finish(false));
+        stream.once("end", () => finish(false));
+        stream.once("close", () => finish(false));
+        stream.write(Buffer.from([0, 0, 0, 1, 11]));
+      });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+function cygwinAgentConnectable(agentPath, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 1000;
+  const readFile = options.readFileImpl || require("node:fs").promises.readFile;
+  const createConnection = options.createConnectionImpl || require("node:net").createConnection;
+  const descriptorPattern = /^!<socket >(\d+) s ([A-Z0-9]{8}-[A-Z0-9]{8}-[A-Z0-9]{8}-[A-Z0-9]{8})/;
+  const resolveCygwinPath = options.resolveCygwinPathImpl || ((value) => new Promise((resolve, reject) => {
+    require("node:child_process").execFile(
+      "cygpath",
+      ["-w", value],
+      { timeout: timeoutMs, windowsHide: true },
+      (error, stdout) => {
+        const converted = String(stdout || "").trim();
+        if (error || !converted) reject(error || new Error("cygpath returned an empty path"));
+        else resolve(converted);
+      },
+    );
+  }));
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let activeSocket = null;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (activeSocket) {
+        activeSocket.removeAllListeners();
+        activeSocket.destroy();
+      }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+
+    const negotiate = (port, secret, credentials, keepOpen) => new Promise((resolveNegotiation, rejectNegotiation) => {
+      const socket = activeSocket = createConnection({ host: "127.0.0.1", port });
+      let state = "secret";
+      let response = Buffer.alloc(0);
+      const fail = (error) => {
+        socket.removeAllListeners();
+        socket.destroy();
+        rejectNegotiation(error instanceof Error ? error : new Error("Cygwin agent negotiation failed"));
+      };
+      socket.once("connect", () => socket.write(secret));
+      socket.once("error", fail);
+      socket.once("end", () => fail(new Error("Cygwin agent ended during negotiation")));
+      socket.once("close", () => fail(new Error("Cygwin agent closed during negotiation")));
+      socket.on("data", (chunk) => {
+        response = Buffer.concat([response, chunk]);
+        const needed = state === "secret" ? 16 : 12;
+        if (response.length < needed) return;
+        const value = response.subarray(0, needed);
+        response = response.subarray(needed);
+        if (state === "secret") {
+          state = "credentials";
+          socket.write(credentials);
+          return;
+        }
+        socket.removeAllListeners();
+        if (!keepOpen) {
+          socket.destroy();
+          activeSocket = null;
+        }
+        resolveNegotiation({ credentials: value, socket: keepOpen ? socket : null, buffered: response });
+      });
+    });
+
+    const readDescriptor = async () => {
+      try {
+        return await readFile(agentPath, "utf8");
+      } catch {
+        const convertedPath = await resolveCygwinPath(agentPath);
+        return readFile(convertedPath, "utf8");
+      }
+    };
+
+    readDescriptor().then(async (contents) => {
+      if (settled) return;
+      const match = descriptorPattern.exec(String(contents));
+      if (!match) return finish(false);
+      const port = Number(match[1]);
+      const secret = Buffer.from(match[2].replace(/-/g, ""), "hex");
+      for (let offset = 0; offset < secret.length; offset += 4) {
+        secret.writeUInt32LE(secret.readUInt32BE(offset), offset);
+      }
+      try {
+        const first = await negotiate(port, secret, Buffer.alloc(12), false);
+        if (settled) return;
+        const retryCredentials = Buffer.from(first.credentials);
+        retryCredentials.writeUInt32LE(options.processId ?? process.pid, 0);
+        const second = await negotiate(port, secret, retryCredentials, true);
+        if (settled || !second.socket) return;
+        activeSocket = second.socket;
+        let response = second.buffered;
+        const inspectResponse = () => {
+          if (response.length < 5) return;
+          const payloadLength = response.readUInt32BE(0);
+          if (payloadLength < 1 || payloadLength > 1024 * 1024) return finish(false);
+          if (response.length < payloadLength + 4) return;
+          finish(response[4] === 12 || response[4] === 5);
+        };
+        activeSocket.on("data", (chunk) => {
+          response = Buffer.concat([response, chunk]);
+          inspectResponse();
+        });
+        activeSocket.once("error", () => finish(false));
+        activeSocket.once("end", () => finish(false));
+        activeSocket.once("close", () => finish(false));
+        activeSocket.write(Buffer.from([0, 0, 0, 1, 11]));
+        inspectResponse();
+      } catch {
+        finish(false);
+      }
+    }).catch(() => finish(false));
+  });
+}
+
+function socketAgentConnectable(agentPath, options = {}) {
+  const createConnection = options.createConnectionImpl || require("node:net").createConnection;
+  const timeoutMs = options.timeoutMs ?? 1000;
+  return new Promise((resolve) => {
+    let settled = false;
+    let socket = null;
+    let response = Buffer.alloc(0);
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (socket) {
+        socket.removeAllListeners();
+        socket.destroy();
+      }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      socket = createConnection(agentPath);
+      socket.once("connect", () => {
+        // SSH_AGENTC_REQUEST_IDENTITIES: uint32 payload length + byte 11.
+        socket.write(Buffer.from([0, 0, 0, 1, 11]));
+      });
+      socket.on("data", (chunk) => {
+        response = Buffer.concat([response, chunk]);
+        if (response.length < 5) return;
+        const payloadLength = response.readUInt32BE(0);
+        if (payloadLength < 1 || payloadLength > 1024 * 1024) return finish(false);
+        if (response.length < payloadLength + 4) return;
+        const responseType = response[4];
+        // SSH_AGENT_IDENTITIES_ANSWER (12), or SSH_AGENT_FAILURE (5).
+        finish(responseType === 12 || responseType === 5);
+      });
+      socket.once("error", () => finish(false));
+      socket.once("end", () => finish(false));
+      socket.once("close", () => finish(false));
+    } catch {
+      finish(false);
+    }
+  });
+}
+
 /**
  * Check if an SSH agent is available on Windows.
  * Probes the well-known named pipe via net.connect(). This supports any
@@ -464,13 +674,50 @@ function checkWindowsSshAgentRunning() {
  * Get ssh-agent socket path based on platform (synchronous, best-effort)
  * @returns {string|null}
  */
-function getSshAgentSocket() {
+function resolveIdentityAgentPath(rawPath, context = {}) {
+  if (typeof rawPath !== "string" || rawPath.trim() === "") return null;
+  const value = rawPath.trim().replace(/^["']|["']$/g, "");
+  if (value.toLowerCase() === "none") return null;
+  if (value === "SSH_AUTH_SOCK") return process.env.SSH_AUTH_SOCK || null;
+  const localHostname = context.localHostname || os.hostname();
+  const hostname = context.hostname || "";
+  const port = String(context.port || 22);
+  const username = context.username || "";
+  const proxyJump = context.proxyJump || "";
+  const tokenValues = {
+    "%": "%",
+    d: os.homedir(),
+    h: hostname,
+    i: String(context.uid ?? (typeof process.getuid === "function" ? process.getuid() : "")),
+    j: proxyJump,
+    k: context.hostKeyAlias || hostname,
+    L: context.shortLocalHostname || localHostname.split(".")[0],
+    l: localHostname,
+    n: context.originalHostname || hostname,
+    p: port,
+    r: username,
+    u: context.localUsername || os.userInfo().username,
+  };
+  tokenValues.C = createHash("sha1")
+    .update(`${localHostname}${hostname}${port}${username}${proxyJump}`)
+    .digest("hex");
+  const expanded = value
+    .replace(/%([%CdhijkLlnpru])/g, (match, token) => tokenValues[token] ?? match)
+    .replace(/^~(?=$|[\\/])/, os.homedir())
+    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => process.env[name] ?? "")
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => process.env[name] ?? "");
+  return expanded || null;
+}
+
+function getSshAgentSocket(identityAgent, context = {}) {
+  const configuredSocket = resolveIdentityAgentPath(identityAgent, context);
+  if (identityAgent && !configuredSocket) return null;
   if (process.platform === "win32") {
     // On Windows, always return the pipe path; the caller should use
     // getAvailableAgentSocket() for a reliable async check.
-    return "\\\\.\\pipe\\openssh-ssh-agent";
+    return configuredSocket || WIN_SSH_AGENT_PIPE;
   }
-  const agentSocket = process.env.SSH_AUTH_SOCK;
+  const agentSocket = configuredSocket || process.env.SSH_AUTH_SOCK;
   if (!agentSocket) return null;
 
   try {
@@ -487,12 +734,63 @@ function getSshAgentSocket() {
  * Get ssh-agent socket path with async validation (checks Windows service status)
  * @returns {Promise<string|null>}
  */
-async function getAvailableAgentSocket() {
-  if (process.platform === "win32") {
-    const running = await checkWindowsSshAgentRunning();
-    return running ? "\\\\.\\pipe\\openssh-ssh-agent" : null;
+async function getAvailableAgentSocket(identityAgent, injected = {}) {
+  const configuredSocket = resolveIdentityAgentPath(identityAgent, injected);
+  if (identityAgent && !configuredSocket) return null;
+  const platform = injected.platform || process.platform;
+  if (platform === "win32") {
+    const socketPath = configuredSocket || WIN_SSH_AGENT_PIPE;
+    const running = isWindowsNamedPipe(socketPath)
+      ? await (injected.windowsPipeConnectable || windowsPipeConnectable)(socketPath)
+      : socketPath === "pageant"
+        ? await (injected.ssh2AgentConnectable || ssh2AgentConnectable)(socketPath)
+        : await (injected.cygwinAgentConnectable || cygwinAgentConnectable)(socketPath);
+    return running ? socketPath : null;
   }
-  return getSshAgentSocket();
+  const socketPath = getSshAgentSocket(configuredSocket, injected);
+  if (!socketPath) return null;
+  const running = await (injected.socketAgentConnectable || socketAgentConnectable)(socketPath);
+  return running ? socketPath : null;
+}
+
+async function getNativeOpenSshAgentSocket(identityAgent, injected = {}) {
+  const socketPath = await getAvailableAgentSocket(identityAgent, injected);
+  const platform = injected.platform || process.platform;
+  if (platform === "win32" && socketPath && !isWindowsNamedPipe(socketPath)) {
+    const error = new Error(
+      "This SSH agent is available only to Netcatty's built-in SSH client. Mosh and EternalTerminal require a Windows named-pipe agent.",
+    );
+    error.code = "ERR_SSH_AGENT_NATIVE_UNSUPPORTED";
+    throw error;
+  }
+  return socketPath;
+}
+
+async function prepareSystemSshAgentForAuth(options, logPrefix = "[SSHAuth]") {
+  if (options?.useSshAgent !== true) return null;
+  const socketPath = await getAvailableAgentSocket(options.identityAgent, {
+    hostname: options.hostname,
+    port: options.port,
+    username: options.username,
+  });
+  if (!socketPath) {
+    const error = new Error("System SSH agent is unavailable. Start or unlock it, or configure a valid agent socket.");
+    error.code = "ERR_SSH_AGENT_UNAVAILABLE";
+    throw error;
+  }
+  return prepareSystemSshAgent({
+    socketPath,
+    identityFilePaths: options.identityFilePaths,
+    identitiesOnly: options.identitiesOnly,
+    addKeysToAgent: options.addKeysToAgent,
+    useKeychain: options.useKeychain,
+    agentPublicKeys: options.agentPublicKeys,
+    hostname: options.hostname,
+    port: options.port,
+    username: options.username,
+  }, {
+    log: (message, details) => console.log(`${logPrefix} ${message}`, details ?? ""),
+  });
 }
 
 /**
@@ -535,6 +833,7 @@ function isPasswordProvided(password) {
  */
 function buildAuthHandler(options) {
   const { privateKey, password, passphrase, agent, username, logPrefix = "[SSH]", unlockedEncryptedKeys = [], defaultKeys = [], sshAgentSocketOverride, onAuthAttempt } = options;
+  const allowAgentFallback = options.allowAgentFallback !== false;
 
   // Determine what type of explicit auth the user configured
   const hasExplicitKey = !!privateKey;
@@ -549,7 +848,9 @@ function buildAuthHandler(options) {
   // Allow callers to pass in a pre-validated agent socket (e.g. from async
   // getAvailableAgentSocket). Fall back to synchronous getSshAgentSocket()
   // which on Windows always returns the pipe path without checking the service.
-  const sshAgentSocket = sshAgentSocketOverride !== undefined ? sshAgentSocketOverride : getSshAgentSocket();
+  const sshAgentSocket = allowAgentFallback
+    ? (sshAgentSocketOverride !== undefined ? sshAgentSocketOverride : getSshAgentSocket())
+    : null;
 
   // Only use system ssh-agent BEFORE user's auth when:
   // - User explicitly configured agent, OR
@@ -578,7 +879,10 @@ function buildAuthHandler(options) {
     (!hasExplicitAgent && sshAgentSocket) ||
     (isPasswordOnly && defaultKeys.length > 0);
 
-  // If only simple auth methods and no fallback keys needed, use array-based handler
+  // Simple explicit auth with no fallback keys: preserve the old ordered
+  // method list, but use a function handler so we can observe partialSuccess
+  // for second-factor keyboard-interactive (#2150). Plain string arrays hide
+  // that signal from us and leave authPhase stuck at false.
   if (hasExplicitAuth && !hasFallbackOptions) {
     const authMethods = ["none"]; // Always try none first per RFC 4252
     if (effectiveAgent) authMethods.push("agent");
@@ -586,11 +890,13 @@ function buildAuthHandler(options) {
     if (password) authMethods.push("password");
     authMethods.push("keyboard-interactive");
 
+    const authPhase = createAuthPhase();
     return {
-      authHandler: authMethods,
+      authHandler: createOrderedStringAuthHandler(authMethods, authPhase),
       privateKey: effectivePrivateKey,
       agent: effectiveAgent,
       usedDefaultKeys: false,
+      authPhase,
     };
   }
 
@@ -703,6 +1009,11 @@ function buildAuthHandler(options) {
   let authIndex = 0;
   let lastAttemptedLabel = null;
   const attemptedMethodIds = new Set();
+  // Shared with keyboard-interactive auto-fill. See createAuthPhase /
+  // shouldSkipKiPasswordAutoFill — only password-as-first-factor suppresses
+  // reusing the saved host password on a later KI challenge (#2150 / #2151).
+  const authPhase = createAuthPhase();
+  let lastAttemptedType = null;
 
   let triedNone = false;
 
@@ -713,6 +1024,7 @@ function buildAuthHandler(options) {
     if (methodsLeft === null && !triedNone) {
       triedNone = true;
       lastAttemptedLabel = "none (no credentials)";
+      lastAttemptedType = "none";
       onAuthAttempt?.("none (no credentials)");
       return callback("none");
     }
@@ -722,6 +1034,10 @@ function buildAuthHandler(options) {
     // Log rejection of previous method (authHandler is called again when server rejects)
     if (lastAttemptedLabel && !partialSuccess) {
       onAuthAttempt?.(`${lastAttemptedLabel} rejected`);
+    }
+
+    if (partialSuccess) {
+      markAuthPhasePartialSuccess(authPhase, lastAttemptedType);
     }
 
     while (authIndex < authMethods.length) {
@@ -734,6 +1050,7 @@ function buildAuthHandler(options) {
       if (method.type === "agent" && (availableMethods.includes("publickey") || availableMethods.includes("agent"))) {
         console.log(`${logPrefix} Trying agent auth`);
         lastAttemptedLabel = "SSH agent";
+        lastAttemptedType = "agent";
         onAuthAttempt?.("SSH agent");
         return callback("agent");
       } else if (method.type === "publickey" && availableMethods.includes("publickey")) {
@@ -747,6 +1064,7 @@ function buildAuthHandler(options) {
               ? "configured key"
               : method.id;
         lastAttemptedLabel = keyLabel;
+        lastAttemptedType = "publickey";
         onAuthAttempt?.(keyLabel);
         const pubkeyAuth = {
           type: "publickey",
@@ -760,6 +1078,7 @@ function buildAuthHandler(options) {
       } else if (method.type === "password" && availableMethods.includes("password")) {
         console.log(`${logPrefix} Trying password auth`);
         lastAttemptedLabel = "password";
+        lastAttemptedType = "password";
         onAuthAttempt?.("password");
         return callback({
           type: "password",
@@ -768,6 +1087,7 @@ function buildAuthHandler(options) {
         });
       } else if (method.type === "keyboard-interactive" && availableMethods.includes("keyboard-interactive")) {
         lastAttemptedLabel = "keyboard-interactive";
+        lastAttemptedType = "keyboard-interactive";
         onAuthAttempt?.("keyboard-interactive");
         return callback("keyboard-interactive");
       }
@@ -786,17 +1106,18 @@ function buildAuthHandler(options) {
     privateKey: effectivePrivateKey,
     agent: returnAgent,
     usedDefaultKeys: true,
+    authPhase,
   };
 }
 
-// OTP / MFA / token vocabulary. Matched FIRST — any hit here disqualifies the
-// challenge from auto-fill even if it also contains a "password" keyword.
+// OTP / MFA / step-up vocabulary. Matched FIRST — any hit here disqualifies
+// the challenge from auto-fill even if it also contains a "password" keyword.
 // Catches phrases like "One-time password", "动态密码", "动态口令",
-// "一次性密码", "Verification code", "Duo passcode", "two-factor", etc.
-// — all single-prompt shapes that look like password fields on the surface
-// but actually want an OTP. Submitting the saved password into any of these
-// burns an auth attempt and risks `pam_faillock` / `pam_tally2` lockout.
-// (#969 PR review, second round.)
+// "一次性密码", "Verification code", "Duo passcode", "two-factor", and
+// EDR/secondary-password prompts like "二次密码" / "Secondary password"
+// (issue #2150). Submitting the saved login password into any of these
+// burns an auth attempt and often disconnects without re-prompting.
+// (#969 PR review, second round; #2150.)
 const OTP_PROMPT_PATTERN = new RegExp(
   [
     "one[\\s-]?time",
@@ -809,6 +1130,15 @@ const OTP_PROMPT_PATTERN = new RegExp(
     "multi[\\s-]?factor",
     "\\bmfa\\b",
     "second\\s+factor",
+    // Step-up / secondary password (login password already used as first factor).
+    // Allow a few words between "secondary" and "password" so prompts like
+    // "Secondary Authentication Password:" (common EDR English label) match.
+    "secondary(?:\\s+\\w+){0,3}\\s+passw",
+    "second(?:\\s+\\w+){0,3}\\s+passw",
+    "additional(?:\\s+\\w+){0,3}\\s+passw",
+    "re[-\\s]?enter\\s+passw",
+    "confirm\\s+passw",
+    "\\bedr\\b",
     "duo",
     // CJK — no word boundaries; substring match is intentional
     "动态",
@@ -820,18 +1150,108 @@ const OTP_PROMPT_PATTERN = new RegExp(
     "多因素",
     "短信验证",
     "手机验证",
+    // Corporate EDR / bastion second-factor password prompts (#2150)
+    // Covers "二次密码", "二次认证密码", "二次验证", etc.
+    "二次",
+    "安全密码",
+    "挑战码",
   ].join("|"),
   "i",
 );
 
 // Latin-script + CJK keywords for "this prompt is asking for a reusable
 // password". Only consulted AFTER OTP_PROMPT_PATTERN clears, so phrases like
-// "One-time password" or "动态密码" never reach this step.
+// "One-time password", "动态密码", or "二次密码" never reach this step.
 //
 // Custom-localized prompts that don't match these keywords fall through to
 // the modal, which is the same behavior as before the auto-fill optimization
 // — strictly no worse than the old "always prompt" baseline.
 const PASSWORD_PROMPT_PATTERN = /passw(or)?d|密\s*码|口\s*令/i;
+
+/**
+ * Shared auth-phase state for keyboard-interactive auto-fill decisions.
+ * passwordAlreadySucceeded means the password method already contributed a
+ * successful factor — later KI challenges must not silently re-submit the
+ * same host password (EDR second factor). publickey/agent partialSuccess
+ * alone does NOT set this, so publickey+password MFA still auto-fills.
+ */
+function createAuthPhase() {
+  return { hadPartialSuccess: false, passwordAlreadySucceeded: false };
+}
+
+/**
+ * Record a partialSuccess against authPhase. Pass the method type that just
+ * succeeded (e.g. "password", "publickey", "agent").
+ */
+function markAuthPhasePartialSuccess(authPhase, succeededMethodType) {
+  if (!authPhase) return;
+  authPhase.hadPartialSuccess = true;
+  if (succeededMethodType === "password") {
+    authPhase.passwordAlreadySucceeded = true;
+  }
+}
+
+/**
+ * Whether keyboard-interactive should refuse to auto-fill / prefill the saved
+ * host password. True only when password already succeeded as a prior factor
+ * (or callers force-skip). publickey→Password: MFA must return false.
+ */
+function shouldSkipKiPasswordAutoFill(authPhase) {
+  return Boolean(authPhase && authPhase.passwordAlreadySucceeded);
+}
+
+/**
+ * Wrap a simple ordered list of ssh2 auth method *strings* (the form used by
+ * `connectOpts.authHandler = ["none","password","keyboard-interactive"]`)
+ * so callers can observe `partialSuccess` for multi-factor flows (#2150).
+ *
+ * Behavior mirrors ssh2's array handler, with one important difference from a
+ * naive index cursor: methods that are merely *unavailable on this call*
+ * (not in `methodsLeft`) are NOT permanently consumed. That matters when a
+ * server first advertises only `publickey`, then after a partial-success key
+ * re-advertises `password` — advancing past password on the first pass would
+ * leave the connection unable to offer the second factor (Codex P2 on #2151).
+ *
+ * @param {string[]} order
+ * @param {{ hadPartialSuccess: boolean, passwordAlreadySucceeded?: boolean }} authPhase
+ * @returns {(methodsLeft: string[]|null, partialSuccess: boolean, callback: Function) => void}
+ */
+function createOrderedStringAuthHandler(order, authPhase) {
+  // Methods we actually offered (server got a chance to accept/reject).
+  let attempted = new Set();
+  // Methods that contributed a successful factor; never retried.
+  const succeeded = new Set();
+  let lastOffered = null;
+
+  return (methodsLeft, partialSuccess, callback) => {
+    if (partialSuccess) {
+      markAuthPhasePartialSuccess(authPhase, lastOffered);
+      if (lastOffered) succeeded.add(lastOffered);
+      // Drop rejected/skipped attempts so a method that was not advertised
+      // earlier can be offered now that the server is asking for it.
+      attempted = new Set(succeeded);
+    }
+
+    const available = Array.isArray(methodsLeft) && methodsLeft.length > 0
+      ? methodsLeft
+      : null;
+
+    for (const method of order) {
+      if (attempted.has(method)) continue;
+      if (available) {
+        const allowed =
+          available.includes(method) ||
+          (method === "agent" && available.includes("publickey"));
+        // Not advertised right now — leave it eligible for a later phase.
+        if (!allowed) continue;
+      }
+      attempted.add(method);
+      lastOffered = method;
+      return callback(method);
+    }
+    return callback(false);
+  };
+}
 
 /**
  * Decide whether a keyboard-interactive challenge is "just a PAM-wrapped
@@ -841,24 +1261,61 @@ const PASSWORD_PROMPT_PATTERN = /passw(or)?d|密\s*码|口\s*令/i;
  * connection pops a second password dialog even when the host already has a
  * saved credential — see #969.
  *
- * Conservative criteria, matching OpenSSH and Tabby behavior:
+ * Conservative criteria:
  *   - exactly one prompt (multi-prompt is almost certainly real 2FA / MFA)
  *   - the prompt has `echo === false`
- *   - the prompt text does NOT contain any OTP / MFA vocabulary
+ *   - the prompt text + optional name/instructions do NOT contain any OTP /
+ *     MFA / secondary-password vocabulary (EDR often puts the Chinese
+ *     "二次认证密码" wording in instructions and only "Secondary
+ *     Authentication Password:" in the prompt field — see #2150)
  *   - the prompt text DOES contain a recognized password keyword (Latin
  *     "password" / "passwd", CJK "密码" / "口令")
  *   - we have a non-empty saved password
  *
  * Anything else falls through to the modal so the user can answer in person.
+ *
+ * @param {Array} prompts
+ * @param {string} password
+ * @param {string} [contextText] - name + instructions from the KI challenge
  */
-function isAutoFillablePasswordChallenge(prompts, password) {
+function isAutoFillablePasswordChallenge(prompts, password, contextText = "") {
   if (typeof password !== "string" || password.length === 0) return false;
   if (!Array.isArray(prompts) || prompts.length !== 1) return false;
   const prompt = prompts[0];
   if (!prompt || prompt.echo !== false) return false;
   const promptText = typeof prompt.prompt === "string" ? prompt.prompt : "";
-  if (OTP_PROMPT_PATTERN.test(promptText)) return false;
+  // Scan prompt + name/instructions together so secondary-password wording
+  // that only appears in the instruction banner still blocks auto-fill.
+  const haystack = [contextText, promptText].filter(Boolean).join("\n");
+  if (OTP_PROMPT_PATTERN.test(haystack)) return false;
   return PASSWORD_PROMPT_PATTERN.test(promptText);
+}
+
+/**
+ * Whether the modal may pre-fill / offer-to-save the host login password for
+ * this challenge. Single secondary/EDR prompts and post-partialSuccess
+ * challenges must open empty (#2150). Multi-prompt forms (password + OTP)
+ * still get the saved value as a convenience for the password slot.
+ *
+ * @param {Array} prompts
+ * @param {string} password
+ * @param {{ skipAutoFill?: boolean, contextText?: string }} [opts]
+ */
+function shouldPrefillSavedPassword(prompts, password, { skipAutoFill = false, contextText = "" } = {}) {
+  if (skipAutoFill) return false;
+  if (typeof password !== "string" || password.length === 0) return false;
+  if (!Array.isArray(prompts) || prompts.length === 0) return false;
+  // Single-prompt: only prefill classic first-factor password challenges.
+  // Secondary/OTP wording in name/instructions still blocks via contextText.
+  if (prompts.length === 1) {
+    return isAutoFillablePasswordChallenge(prompts, password, contextText);
+  }
+  // Multi-prompt (e.g. Password: + Verification code: / Duo): always prefill
+  // the password slot when we have a saved host password. Challenge names like
+  // "Duo two-factor" must NOT suppress prefill — skipAutoFill already covers
+  // true post-partialSuccess second-factor rounds (Codex P3 on #2151).
+  // The modal only writes into isAPasswordPrompt fields, not OTP slots.
+  return true;
 }
 
 /**
@@ -872,6 +1329,11 @@ function isAutoFillablePasswordChallenge(prompts, password) {
  *   password-prompt fast path (#969).
  * @param {string} [options.logPrefix] - Log prefix for debugging
  * @param {"terminal"|"external"} [options.scope] - Renderer-side routing scope
+ * @param {Function} [options.shouldSkipAutoFill] - Optional predicate. When it
+ *   returns true, never auto-fill — always show the modal. Callers set this
+ *   after a first-factor `partialSuccess` so a second-factor challenge that
+ *   merely says "Password:" / "密码：" is not silently answered with the
+ *   already-used login password (#2150).
  * @param {Function} [options.onAutoFill] - Called when the saved password is
  *   auto-filled into the challenge (no modal shown). Lets callers emit a
  *   different progress message than the user-prompt flow.
@@ -889,6 +1351,7 @@ function createKeyboardInteractiveHandler(options) {
     password,
     logPrefix = "[SSH]",
     scope = "external",
+    shouldSkipAutoFill,
     onAutoFill,
     onPromptShown,
     onUserResponded,
@@ -913,7 +1376,26 @@ function createKeyboardInteractiveHandler(options) {
       return;
     }
 
-    if (!autoFilledOnce && isAutoFillablePasswordChallenge(prompts, password)) {
+    // name + instructions often carry the real EDR banner (e.g. "请输入二次认证密码")
+    // while prompts[i].prompt is only the short English field label.
+    const contextText = [name, instructions].filter((s) => typeof s === "string" && s.trim()).join("\n");
+
+    let skipAutoFill = false;
+    try {
+      skipAutoFill = typeof shouldSkipAutoFill === "function" && !!shouldSkipAutoFill();
+    } catch (err) {
+      console.warn(`${logPrefix} shouldSkipAutoFill callback threw`, err);
+    }
+
+    // After a first factor already succeeded (partialSuccess), never reuse the
+    // saved login password for a later keyboard-interactive challenge — even
+    // if the prompt text looks like a plain "Password:" / "密码：". Corporate
+    // EDR step-up often reuses password wording for a different secret.
+    if (
+      !skipAutoFill &&
+      !autoFilledOnce &&
+      isAutoFillablePasswordChallenge(prompts, password, contextText)
+    ) {
       autoFilledOnce = true;
       console.log(`${logPrefix} Auto-filling saved password into single keyboard-interactive prompt`);
       try { onAutoFill?.(); } catch (err) { console.warn(`${logPrefix} onAutoFill callback threw`, err); }
@@ -934,6 +1416,37 @@ function createKeyboardInteractiveHandler(options) {
       echo: p.echo,
     }));
 
+    // Never prefill the host login password into a second-factor challenge or
+    // into a retry after a failed auto-fill. Passing null here is what keeps
+    // KeyboardInteractiveModal from re-submitting the wrong secret on Enter
+    // (#2150). autoFilledOnce blocks prefill only — not the save checkbox.
+    const savedPasswordForModal = shouldPrefillSavedPassword(prompts, password, {
+      skipAutoFill: skipAutoFill || autoFilledOnce,
+      contextText,
+    })
+      ? password
+      : null;
+    // Hide "Save password" only for true second-factor challenges:
+    //   - after a first-factor partialSuccess, or
+    //   - a *single* OTP / EDR secondary field (possibly with secondary wording
+    //     only in name/instructions).
+    // Do NOT disable save after a failed auto-fill retry of the same first-
+    // factor Password: prompt — the user may have corrected a stale login
+    // password and should be able to persist it (Codex P2 on #2151).
+    // Do NOT disable save just because a multi-prompt challenge also includes
+    // an OTP field next to Password: (PAM/Duo first-login) — the modal only
+    // ever saves the isAPasswordPrompt slot (Codex P3 on #2151).
+    const singlePromptText =
+      prompts.length === 1 && typeof prompts[0]?.prompt === "string"
+        ? prompts[0].prompt
+        : "";
+    const singleSecondaryChallenge =
+      prompts.length === 1 &&
+      OTP_PROMPT_PATTERN.test(
+        [contextText, singlePromptText].filter(Boolean).join("\n"),
+      );
+    const allowSavePassword = !(skipAutoFill || singleSecondaryChallenge);
+
     console.log(`${logPrefix} Showing modal for ${promptsData.length} prompts`);
     try { onPromptShown?.(); } catch (err) { console.warn(`${logPrefix} onPromptShown callback threw`, err); }
 
@@ -944,7 +1457,8 @@ function createKeyboardInteractiveHandler(options) {
       instructions: instructions || "",
       prompts: promptsData,
       hostname: hostname,
-      savedPassword: password || null,
+      savedPassword: savedPasswordForModal,
+      allowSavePassword,
       scope,
     });
   };
@@ -1039,9 +1553,21 @@ module.exports = {
   findAllDefaultPrivateKeys,
   getSshAgentSocket,
   getAvailableAgentSocket,
+  getNativeOpenSshAgentSocket,
+  isWindowsNamedPipe,
+  ssh2AgentConnectable,
+  cygwinAgentConnectable,
+  socketAgentConnectable,
+  resolveIdentityAgentPath,
+  prepareSystemSshAgentForAuth,
   buildAuthHandler,
+  createAuthPhase,
+  markAuthPhasePartialSuccess,
+  shouldSkipKiPasswordAutoFill,
+  createOrderedStringAuthHandler,
   createKeyboardInteractiveHandler,
   isAutoFillablePasswordChallenge,
+  shouldPrefillSavedPassword,
   applyAuthToConnOpts,
   safeSend,
   requestPassphrasesForEncryptedKeys,

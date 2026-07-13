@@ -53,6 +53,12 @@ declare global {
       keyId?: string;
       passphrase?: string;
       identityFilePaths?: string[];
+      useSshAgent?: boolean;
+      agentPublicKeys?: string[];
+      identityAgent?: string;
+      identitiesOnly?: boolean;
+      addKeysToAgent?: string;
+      useKeychain?: boolean;
       port?: number;
       moshServerPath?: string;
       moshClientPath?: string;
@@ -85,6 +91,12 @@ declare global {
       passphrase?: string;
       authMethod?: 'password' | 'key' | 'certificate';
       identityFilePaths?: string[];
+      useSshAgent?: boolean;
+      agentPublicKeys?: string[];
+      identityAgent?: string;
+      identitiesOnly?: boolean;
+      addKeysToAgent?: string;
+      useKeychain?: boolean;
       port?: number;
       etPort?: number;
       legacyAlgorithms?: boolean;
@@ -153,7 +165,12 @@ declare global {
       bits?: number;
       comment?: string;
     }): Promise<{ success: boolean; privateKey?: string; publicKey?: string; error?: string }>;
-    checkSshAgent?(): Promise<{ running: boolean; startupType: string | null; error: string | null }>;
+    checkSshAgent?(options?: {
+      identityAgent?: string;
+      hostname?: string;
+      port?: number;
+      username?: string;
+    }): Promise<{ running: boolean; startupType: string | null; error: string | null }>;
     getDefaultKeys?(): Promise<Array<{ name: string; path: string }>>;
     execCommand(options: {
       hostname: string;
@@ -166,11 +183,22 @@ declare global {
       keyId?: string;
       keySource?: 'generated' | 'imported' | 'reference';
       identityFilePaths?: string[];
+      useSshAgent?: boolean;
+      agentPublicKeys?: string[];
+      identityAgent?: string;
+      identitiesOnly?: boolean;
+      addKeysToAgent?: string;
+      useKeychain?: boolean;
       passphrase?: string;
       command: string;
       timeout?: number;
+      sshTcpConnectTimeoutMs?: number;
+      sshAuthReadyTimeoutMs?: number;
       enableKeyboardInteractive?: boolean;
       sessionId?: string;
+      legacyAlgorithms?: boolean;
+      skipEcdsaHostKey?: boolean;
+      algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
     }): Promise<{ stdout: string; stderr: string; code: number | null }>;
     /** Get current working directory from an active SSH session */
     getSessionPwd?(
@@ -246,7 +274,7 @@ declare global {
         }>;
         netRxSpeed: number;           // Total network receive speed (bytes/sec)
         netTxSpeed: number;           // Total network transmit speed (bytes/sec)
-        latencyMs: number | null;     // Approximate network round-trip over the SSH stats channel
+        latencyMs: number | null;     // TCP connection establishment latency to the SSH endpoint
         netInterfaces: Array<{        // Per-interface network stats
           name: string;               // Interface name (e.g., eth0, ens33)
           rxBytes: number;            // Total received bytes
@@ -355,6 +383,8 @@ declare global {
         prompts: Array<{ prompt: string; echo: boolean }>;
         hostname: string;
         savedPassword?: string | null;
+        /** When false, UI must not offer saving the response as the host password. */
+        allowSavePassword?: boolean;
         scope?: "terminal" | "external";
       }) => void
     ): () => void;

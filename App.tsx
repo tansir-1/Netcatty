@@ -1008,7 +1008,16 @@ function App({ settings }: { settings: SettingsState }) {
   }, [groupConfigs, proxyProfileIdSet, proxyProfiles]);
 
   // Wrapper to connect to host with logging
-  const handleConnectToHost = useCallback((host: Host) => { return handleConnectToHostImpl(() => ({ addConnectionLog, connectToHost, host, identities, keys, resolveEffectiveHost, resolveHostAuth, systemInfoRef }), host); }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys]);
+  const handleConnectToHost = useCallback((host: Host) => {
+    if (host.ephemeral) {
+      setEphemeralHosts((previous) => {
+        const existingIndex = previous.findIndex((candidate) => candidate.id === host.id);
+        if (existingIndex < 0) return [...previous, host];
+        return previous.map((candidate, index) => index === existingIndex ? host : candidate);
+      });
+    }
+    return handleConnectToHostImpl(() => ({ addConnectionLog, connectToHost, host, identities, keys, resolveEffectiveHost, resolveHostAuth, systemInfoRef }), host);
+  }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys]);
 
   const openHostForVaultAgent = useCallback((hostId: string) => {
     const host = hosts.find((item) => item.id === hostId);
@@ -1421,19 +1430,23 @@ function AppWithProviders() {
   });
 
   useEffect(() => {
+    let splashRemovalTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       // Hide splash screen with a fade-out animation
       const splash = document.getElementById('splash');
       if (splash) {
         splash.classList.add('fade-out');
         // Remove from DOM after animation completes
-        setTimeout(() => splash.remove(), 200);
+        splashRemovalTimer = setTimeout(() => splash.remove(), 200);
       }
       // Notify main process that renderer is ready
       netcattyBridge.get()?.rendererReady?.();
     } catch {
       // ignore
     }
+    return () => {
+      if (splashRemovalTimer !== undefined) clearTimeout(splashRemovalTimer);
+    };
   }, []);
 
   // Keep MCP/SDK approval IPC alive for the whole app lifetime — including the

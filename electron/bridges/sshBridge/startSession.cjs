@@ -13,9 +13,30 @@ const {
   logTerminalInterruptDrainDropSample,
   logTerminalOutputDropSample,
 } = require("../terminalInterruptDiagnostics.cjs");
+const { runWhenProxyConnectionReady } = require("../proxyUtils.cjs");
 
 const SSH_TCP_CONNECT_TIMEOUT_MS = 20000;
 const SSH_AUTH_READY_TIMEOUT_MS = 120000;
+const MAX_SSH_CONNECTION_TIMEOUT_MS = 3600000;
+
+function normalizeSshConnectionTimeoutMs(value, fallback) {
+  return Number.isFinite(value) && value >= 1000 && value <= MAX_SSH_CONNECTION_TIMEOUT_MS
+    ? Math.round(value)
+    : fallback;
+}
+
+function resolveSshConnectionTimeouts(options = {}) {
+  return {
+    tcpConnectTimeoutMs: normalizeSshConnectionTimeoutMs(
+      options.sshTcpConnectTimeoutMs,
+      SSH_TCP_CONNECT_TIMEOUT_MS,
+    ),
+    authReadyTimeoutMs: normalizeSshConnectionTimeoutMs(
+      options.sshAuthReadyTimeoutMs,
+      SSH_AUTH_READY_TIMEOUT_MS,
+    ),
+  };
+}
 
 function isSshAuthFailure(err) {
   const message = err?.message?.toLowerCase() || "";
@@ -25,6 +46,14 @@ function isSshAuthFailure(err) {
     message.includes("too many authentication failures") ||
     /permission denied\s*\(/.test(message) ||
     message.includes("no authentication methods available");
+}
+
+function shouldOfferAgentForLogin(options, connectOpts) {
+  return options?.useSshAgent !== false && Boolean(connectOpts?.agent);
+}
+
+function resolveUnlockedEncryptedKeysForAuth(options, strictAgentSelection) {
+  return strictAgentSelection ? [] : (options?._unlockedEncryptedKeys || []);
 }
 
 function createStartSessionApi(ctx) {
@@ -89,6 +118,10 @@ function createStartSessionApi(ctx) {
           port: options.port || 22,
           username: options.username || 'root',
         },
+        tcpLatencyDirect:
+          !Array.isArray(options.jumpHosts) || options.jumpHosts.length === 0
+            ? !options.proxy
+            : false,
         cols: options.cols || 80,
         rows: options.rows || 24,
       };
@@ -563,6 +596,7 @@ function createStartSessionApi(ctx) {
       };
 
       try {
+        const { tcpConnectTimeoutMs, authReadyTimeoutMs } = resolveSshConnectionTimeouts(options);
         log("session starting", {
           sessionId,
           hostname: options.hostname,
@@ -589,8 +623,10 @@ function createStartSessionApi(ctx) {
           username: options.username || "root",
           // `timeout` covers TCP dial silence; `readyTimeout` covers the full
           // SSH handshake/auth flow so MFA still has enough time.
-          timeout: SSH_TCP_CONNECT_TIMEOUT_MS,
-          readyTimeout: SSH_AUTH_READY_TIMEOUT_MS,
+          timeout: tcpConnectTimeoutMs,
+          // ssh2 starts readyTimeout before TCP connects. The auth-ready timer
+          // below starts explicitly from the connection event instead.
+          readyTimeout: 0,
           // Resolved keepalive (caller decides whether host override or global
           // applies). interval is in seconds; 0 means truly disabled, so
           // countMax also goes to 0 to skip ssh2's dead-connection check.
@@ -642,13 +678,16 @@ function createStartSessionApi(ctx) {
         });
 
         let authAgent = null;
+        const systemAuthAgent = hasCertificate
+          ? null
+          : await prepareSystemSshAgentForAuth(options, "[SSH]");
         // Kick off the default-key scan now so it overlaps the identity-file /
         // inline-key preparation below instead of running serially after it.
         // findAllDefaultPrivateKeys swallows its own fs errors and never rejects,
         // so leaving this promise briefly unawaited cannot surface an unhandled
         // rejection even if the key prep throws first.
         const defaultKeysPromise = findAllDefaultPrivateKeys();
-        const identityFile = !options.privateKey
+        const identityFile = !options.privateKey && !systemAuthAgent
           ? await loadFirstIdentityFileForAuth({
             sender,
             identityFilePaths: options.identityFilePaths,
@@ -669,7 +708,7 @@ function createStartSessionApi(ctx) {
             },
           })
           : null;
-        const inlineKey = options.privateKey
+        const inlineKey = options.privateKey && !systemAuthAgent
           ? await preparePrivateKeyForAuth({
             sender,
             privateKey: options.privateKey,
@@ -688,6 +727,10 @@ function createStartSessionApi(ctx) {
           : null;
         const effectivePrivateKey = inlineKey?.privateKey || identityFile?.privateKey;
         const effectiveIdentityPassphrase = inlineKey?.passphrase || identityFile?.passphrase;
+
+        if (systemAuthAgent) {
+          connectOpts.agent = systemAuthAgent;
+        }
 
         if (hasCertificate) {
           authAgent = new NetcattyAgent({
@@ -721,7 +764,10 @@ function createStartSessionApi(ctx) {
         // of walking ~/.ssh a second time. (Pinned by
         // sshBridge.defaultKeyEquivalence.test.cjs.)
         let usedDefaultKeyAsPrimary = false;
-        const allDefaultKeys = await defaultKeysPromise;
+        const discoveredDefaultKeys = await defaultKeysPromise;
+        const allDefaultKeys = systemAuthAgent && options.identitiesOnly
+          ? []
+          : discoveredDefaultKeys;
         const defaultKeyInfo = allDefaultKeys[0] ?? null;
         if (defaultKeyInfo) {
           log("Found default SSH key for fallback", { keyPath: defaultKeyInfo.keyPath, keyName: defaultKeyInfo.keyName });
@@ -729,7 +775,10 @@ function createStartSessionApi(ctx) {
 
         // Use unlocked encrypted keys if provided (from retry after auth failure)
         // These are passed via _unlockedEncryptedKeys from startSSHSessionWrapper
-        const unlockedEncryptedKeys = options._unlockedEncryptedKeys || [];
+        const unlockedEncryptedKeys = resolveUnlockedEncryptedKeysForAuth(
+          options,
+          Boolean(systemAuthAgent && options.identitiesOnly),
+        );
         if (unlockedEncryptedKeys.length > 0) {
           log("Using unlocked encrypted keys from retry", {
             count: unlockedEncryptedKeys.length,
@@ -742,7 +791,9 @@ function createStartSessionApi(ctx) {
         // identityFilePaths) even if loading that key failed (issue #1614).
         if (!connectOpts.privateKey && !connectOpts.password && !connectOpts.agent) {
           // First, try to use ssh-agent if available (this is what regular SSH does)
-          const sshAgentSocket = await getAvailableAgentSocket();
+          const sshAgentSocket = options.useSshAgent !== false
+            ? await getAvailableAgentSocket()
+            : null;
 
           if (sshAgentSocket) {
             log("No auth method configured, trying ssh-agent first", { agentSocket: sshAgentSocket });
@@ -788,6 +839,10 @@ function createStartSessionApi(ctx) {
 
         // Track which method succeeded for caching
         let lastTriedMethod = null;
+        // Shared with keyboard-interactive auto-fill. Only suppresses reuse of
+        // the saved host password when password already succeeded as a factor
+        // (EDR step-up). publickey partialSuccess still allows Password: auto-fill.
+        const authPhase = createAuthPhase();
 
         if (authAgent) {
           const order = ["none", "agent"];
@@ -799,7 +854,9 @@ function createStartSessionApi(ctx) {
             order.push("publickey");
           }
           order.push("keyboard-interactive");
-          connectOpts.authHandler = order;
+          // Function form so authPhase.hadPartialSuccess updates for cert/agent
+          // first-factor + keyboard-interactive second-factor (#2150).
+          connectOpts.authHandler = createOrderedStringAuthHandler(order, authPhase);
           log("Auth order (agent mode)", { order });
         } else {
           // Build dynamic auth handler for fallback support
@@ -811,7 +868,7 @@ function createStartSessionApi(ctx) {
           }
 
           // Then try agent if configured (try agent before password since it's usually faster)
-          if (connectOpts.agent) {
+          if (shouldOfferAgentForLogin(options, connectOpts)) {
             authMethods.push({ type: "agent", id: "agent" });
           }
 
@@ -910,6 +967,16 @@ function createStartSessionApi(ctx) {
               // When partialSuccess is true, we should try the remaining methods the server is asking for
               if (partialSuccess && methodsLeft && methodsLeft.length > 0) {
                 hadPartialSuccess = true;
+                // password method id is "password"; key ids start with publickey-
+                const succeededType =
+                  lastTriedMethod === "password"
+                    ? "password"
+                    : lastTriedMethod === "agent"
+                      ? "agent"
+                      : lastTriedMethod === "keyboard-interactive"
+                        ? "keyboard-interactive"
+                        : "publickey";
+                markAuthPhasePartialSuccess(authPhase, succeededType);
                 // Record the first successful method (the one that triggered partialSuccess)
                 if (lastTriedMethod && !firstSuccessfulMethod) {
                   firstSuccessfulMethod = lastTriedMethod;
@@ -1061,7 +1128,7 @@ function createStartSessionApi(ctx) {
         // Handle chain/proxy connections
         if (hasJumpHosts) {
           // Pass fetched keys to chain connection to avoid re-reading files
-          options._defaultKeys = allDefaultKeys;
+          options._defaultKeys = discoveredDefaultKeys;
           options._sshDiagnosticLogger = log;
 
           const chainResult = await connectThroughChain(
@@ -1086,7 +1153,7 @@ function createStartSessionApi(ctx) {
             options.proxy,
             options.hostname,
             options.port || 22,
-            { timeoutMs: SSH_TCP_CONNECT_TIMEOUT_MS }
+            { timeoutMs: tcpConnectTimeoutMs }
           );
           connectOpts.sock = connectionSocket;
           delete connectOpts.host;
@@ -1106,6 +1173,13 @@ function createStartSessionApi(ctx) {
           // through releaseConnectionRef so the last channel — not whichever
           // channel happens to close first — ends the connection + chain.
           let connRef = null;
+          let authReadyTimer = null;
+          const clearAuthReadyTimer = () => {
+            if (authReadyTimer) {
+              clearTimeout(authReadyTimer);
+              authReadyTimer = null;
+            }
+          };
           // Session-log stream token for THIS connection's owner channel,
           // captured in the closure so the connection-level error/timeout/close
           // handlers stop only this connection's stream. Reading it back off the
@@ -1126,9 +1200,14 @@ function createStartSessionApi(ctx) {
           };
 
           conn.once("connect", () => {
-            try { conn._sock?.setTimeout?.(0); } catch { }
-            sendProgress(totalHops, totalHops, options.hostname, 'tcp-connected');
-            enableSshNoDelay(conn);
+            runWhenProxyConnectionReady(conn._sock, () => {
+              try { conn._sock?.setTimeout?.(0); } catch { }
+              clearAuthReadyTimer();
+              authReadyTimer = setTimeout(() => conn.emit("timeout"), authReadyTimeoutMs);
+              authReadyTimer.unref?.();
+              sendProgress(totalHops, totalHops, options.hostname, 'tcp-connected');
+              enableSshNoDelay(conn);
+            });
           });
           if (connectOpts.sock) enableTcpNoDelay(connectOpts.sock);
 
@@ -1139,6 +1218,7 @@ function createStartSessionApi(ctx) {
           });
 
           conn.once("ready", () => {
+            clearAuthReadyTimer();
             console.log(`${logPrefix} ${options.hostname} ready`);
             log("target ready", {
               sessionId,
@@ -1246,6 +1326,7 @@ function createStartSessionApi(ctx) {
           });
 
           conn.on("error", (err) => {
+            clearAuthReadyTimer();
             // After the promise is settled, we can't reject again. But if the
             // session was already established (resolved), we still need to notify
             // the renderer about transport errors so the session shows as failed
@@ -1340,6 +1421,7 @@ function createStartSessionApi(ctx) {
           });
 
           conn.once("timeout", () => {
+            clearAuthReadyTimer();
             console.error(`${logPrefix} ${options.hostname} connection timeout`);
             const err = new Error(`Connection timeout to ${options.hostname}`);
             log("connection timeout", { sessionId, hostname: options.hostname, error: err.message });
@@ -1359,6 +1441,7 @@ function createStartSessionApi(ctx) {
           });
 
           conn.once("close", () => {
+            clearAuthReadyTimer();
             const contents = event.sender;
             const currentSession = sessions.get(sessionId);
             const ownsCurrentSession = Boolean(connRef && currentSession?.connRef === connRef);
@@ -1426,6 +1509,7 @@ function createStartSessionApi(ctx) {
             password: options.password,
             logPrefix,
             scope: "terminal",
+            shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(authPhase),
             onAutoFill: () => sendProgress(
               totalHops, totalHops, options.hostname, 'auth-attempt', 'using saved password',
             ),
@@ -1483,4 +1567,7 @@ module.exports = {
   SSH_AUTH_READY_TIMEOUT_MS,
   SSH_TCP_CONNECT_TIMEOUT_MS,
   createStartSessionApi,
+  resolveSshConnectionTimeouts,
+  shouldOfferAgentForLogin,
+  resolveUnlockedEncryptedKeysForAuth,
 };
