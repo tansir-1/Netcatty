@@ -22,6 +22,13 @@ const {
 const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
 const SSH_KEY_PATTERN = /^id_[\w-]+$/;
 
+function orderSshIdentityNames(names) {
+  const uniqueNames = [...new Set(names)];
+  const preferred = PREFERRED_KEY_NAMES.filter((name) => uniqueNames.includes(name));
+  const rest = uniqueNames.filter((name) => !PREFERRED_KEY_NAMES.includes(name)).sort();
+  return [...preferred, ...rest];
+}
+
 class PassphraseCancelledError extends Error {
   constructor(keyPath) {
     super(`Passphrase entry cancelled for ${keyPath}`);
@@ -355,9 +362,7 @@ async function findDefaultPrivateKey() {
   } catch {
     return null;
   }
-  const preferred = PREFERRED_KEY_NAMES.filter(n => allNames.includes(n));
-  const rest = allNames.filter(n => !PREFERRED_KEY_NAMES.includes(n)).sort();
-  const sorted = [...preferred, ...rest];
+  const sorted = orderSshIdentityNames(allNames);
 
   for (const name of sorted) {
     const keyPath = path.join(sshDir, name);
@@ -391,9 +396,7 @@ async function findAllDefaultPrivateKeys(options = {}) {
   } catch {
     return [];
   }
-  const preferred = PREFERRED_KEY_NAMES.filter(n => allNames.includes(n));
-  const rest = allNames.filter(n => !PREFERRED_KEY_NAMES.includes(n)).sort();
-  const sorted = [...preferred, ...rest];
+  const sorted = orderSshIdentityNames(allNames);
 
   const promises = sorted.map(async (name) => {
     const keyPath = path.join(sshDir, name);
@@ -833,17 +836,26 @@ function isPasswordProvided(password) {
  */
 function buildAuthHandler(options) {
   const { privateKey, password, passphrase, agent, username, logPrefix = "[SSH]", unlockedEncryptedKeys = [], defaultKeys = [], sshAgentSocketOverride, onAuthAttempt } = options;
-  const allowAgentFallback = options.allowAgentFallback !== false;
 
   // Determine what type of explicit auth the user configured
   const hasExplicitKey = !!privateKey;
   const hasExplicitPassword = !!password;
   const hasExplicitAgent = !!agent;
   const hasExplicitAuth = hasExplicitKey || hasExplicitPassword || hasExplicitAgent;
+  const isAutomatic = options.authMethod === "auto";
+  const isExplicitPasswordMode = options.authMethod === "password";
+  const isSelectedKeyMode = options.authMethod === "key" || options.authMethod === "certificate";
+  const eligibleUnlockedEncryptedKeys = isExplicitPasswordMode || isSelectedKeyMode
+    ? []
+    : unlockedEncryptedKeys;
 
   // Determine if this is a password-only or key-only connection
-  const isPasswordOnly = hasExplicitPassword && !hasExplicitKey && !hasExplicitAgent;
-  const isKeyOnly = hasExplicitKey && !hasExplicitAgent;
+  const isPasswordOnly = isExplicitPasswordMode
+    || (!isAutomatic && hasExplicitPassword && !hasExplicitKey && !hasExplicitAgent);
+  const isKeyOnly = !isPasswordOnly && hasExplicitKey && !hasExplicitAgent;
+  const allowAgentFallback = options.allowAgentFallback !== false
+    && !isPasswordOnly
+    && !isSelectedKeyMode;
 
   // Allow callers to pass in a pre-validated agent socket (e.g. from async
   // getAvailableAgentSocket). Fall back to synchronous getSshAgentSocket()
@@ -856,28 +868,43 @@ function buildAuthHandler(options) {
   // - User explicitly configured agent, OR
   // - No explicit auth is configured (pure fallback mode)
   // When user configured key/password, system agent should only be used AFTER as fallback
-  const useAgentFirst = hasExplicitAgent || !hasExplicitAuth;
+  const useAgentFirst = hasExplicitAgent || isAutomatic || !hasExplicitAuth;
 
   // Determine effective agent
-  const effectiveAgent = agent || (useAgentFirst ? sshAgentSocket : null);
+  const effectiveAgent = isPasswordOnly ? null : agent || (useAgentFirst ? sshAgentSocket : null);
 
-  // Determine effective privateKey (user-provided takes priority)
-  const effectivePrivateKey = privateKey || (!hasExplicitAuth && defaultKeys.length > 0 ? defaultKeys[0].privateKey : null);
+  // Determine effective privateKey (user-provided takes priority). Explicit
+  // key/certificate selection must fail closed when the selected material is
+  // unavailable instead of silently substituting an unrelated default key.
+  const mayUseDefaultKeyAsPrimary = isAutomatic || (!isSelectedKeyMode && !hasExplicitAuth);
+  const effectivePrivateKey = isPasswordOnly
+    ? null
+    : privateKey || (mayUseDefaultKeyAsPrimary && defaultKeys.length > 0 ? defaultKeys[0].privateKey : null);
 
   // Determine fallback keys (keys to try after user's primary auth fails)
   // - If user provided a key: all default keys are fallbacks
-  // - If no explicit auth: first default key is primary, rest are fallbacks  
-  // - If password-only or agent-only: all default keys are fallbacks (tried after primary)
-  const fallbackKeys = hasExplicitKey
-    ? defaultKeys
-    : !hasExplicitAuth
-      ? defaultKeys.slice(1)
-      : defaultKeys;
+  // - If no explicit auth: first default key is primary, rest are fallbacks
+  // - If password-only: no default-key fallback (issue #266 / #2079)
+  // - If agent-only: all default keys are fallbacks (tried after primary)
+  const fallbackKeys = isPasswordOnly || isSelectedKeyMode
+    ? []
+    : isAutomatic
+      ? defaultKeys
+    : hasExplicitKey
+      ? defaultKeys
+      : !hasExplicitAuth
+        ? defaultKeys.slice(1)
+        : defaultKeys;
 
-  // Check if we need dynamic handler (have fallback options)
+  // Check if we need dynamic handler (have fallback options).
+  // Password-only never treats default keys as fallbacks — only unlocked
+  // encrypted keys (jump-chain retry) and keyboard-interactive remain.
+  // Callers that pass onAuthAttempt still get progress callbacks on the
+  // simple ordered path (createOrderedStringAuthHandler) so jump/SFTP UIs
+  // keep showing auth attempts after #2079 (Codex review P2).
   const hasFallbackOptions = fallbackKeys.length > 0 ||
-    (!hasExplicitAgent && sshAgentSocket) ||
-    (isPasswordOnly && defaultKeys.length > 0);
+    (!hasExplicitAgent && !isPasswordOnly && sshAgentSocket) ||
+    eligibleUnlockedEncryptedKeys.length > 0;
 
   // Simple explicit auth with no fallback keys: preserve the old ordered
   // method list, but use a function handler so we can observe partialSuccess
@@ -886,13 +913,13 @@ function buildAuthHandler(options) {
   if (hasExplicitAuth && !hasFallbackOptions) {
     const authMethods = ["none"]; // Always try none first per RFC 4252
     if (effectiveAgent) authMethods.push("agent");
-    if (privateKey) authMethods.push("publickey");
+    if (!isPasswordOnly && privateKey) authMethods.push("publickey");
     if (password) authMethods.push("password");
     authMethods.push("keyboard-interactive");
 
     const authPhase = createAuthPhase();
     return {
-      authHandler: createOrderedStringAuthHandler(authMethods, authPhase),
+      authHandler: createOrderedStringAuthHandler(authMethods, authPhase, onAuthAttempt),
       privateKey: effectivePrivateKey,
       agent: effectiveAgent,
       usedDefaultKeys: false,
@@ -902,15 +929,43 @@ function buildAuthHandler(options) {
 
   // Build comprehensive authMethods array with all auth options
   // Order depends on what user explicitly configured:
-  // - Password-only: password -> agent -> default keys -> keyboard-interactive
-  // - Key-only: user key -> password -> agent -> default keys -> keyboard-interactive  
+  // - Password-only: password -> keyboard-interactive (no default-key fallback)
+  // - Key-only: user key -> password -> agent -> default keys -> keyboard-interactive
   // - Agent configured: agent -> user key -> password -> default keys -> keyboard-interactive
   // - No explicit auth: agent -> default keys -> keyboard-interactive
   const authMethods = [];
 
   if (isPasswordOnly) {
-    // Password-only: respect user's explicit choice, no key/agent fallback
-    authMethods.push({ type: "password", id: "password" });
+    // Password-only: respect user's explicit choice, no key/agent fallback.
+    // Matches startSSHSession (issue #2079) and avoids #266 passphrase prompts.
+    if (password) {
+      authMethods.push({ type: "password", id: "password" });
+    }
+  } else if (isAutomatic) {
+    // Automatic: mirror the familiar OpenSSH-style order. Try local key
+    // sources first, then use a saved password as the final non-interactive
+    // fallback before keyboard-interactive prompts.
+    if (effectiveAgent) {
+      authMethods.push({ type: "agent", id: "agent" });
+    }
+    if (privateKey) {
+      authMethods.push({
+        type: "publickey",
+        key: privateKey,
+        passphrase,
+        id: "publickey-user"
+      });
+    }
+    for (const keyInfo of fallbackKeys) {
+      authMethods.push({
+        type: "publickey",
+        key: keyInfo.privateKey,
+        id: `publickey-default-${keyInfo.keyName}`
+      });
+    }
+    if (password) {
+      authMethods.push({ type: "password", id: "password" });
+    }
   } else if (isKeyOnly) {
     // Key-only: user key first, then password (if any), then agent/default keys as fallback
 
@@ -973,7 +1028,7 @@ function buildAuthHandler(options) {
     }
 
     // 5. If no user key provided, add first default key at the beginning (after agent)
-    if (!privateKey && defaultKeys.length > 0) {
+    if (!isSelectedKeyMode && !privateKey && defaultKeys.length > 0) {
       const insertIndex = effectiveAgent ? 1 : 0;
       authMethods.splice(insertIndex, 0, {
         type: "publickey",
@@ -984,7 +1039,7 @@ function buildAuthHandler(options) {
   }
 
   // Add unlocked encrypted default keys (user provided passphrases for these)
-  for (const keyInfo of unlockedEncryptedKeys) {
+  for (const keyInfo of eligibleUnlockedEncryptedKeys) {
     authMethods.push({
       type: "publickey",
       key: keyInfo.privateKey,
@@ -997,6 +1052,7 @@ function buildAuthHandler(options) {
   authMethods.push({ type: "keyboard-interactive", id: "keyboard-interactive" });
 
   console.log(`${logPrefix} Auth methods configured`, {
+    isAutomatic,
     isPasswordOnly,
     hasUserKey: !!privateKey,
     hasPassword: !!password,
@@ -1214,14 +1270,22 @@ function shouldSkipKiPasswordAutoFill(authPhase) {
  *
  * @param {string[]} order
  * @param {{ hadPartialSuccess: boolean, passwordAlreadySucceeded?: boolean }} authPhase
+ * @param {(label: string) => void} [onAuthAttempt] - optional progress callback
+ *   (jump/SFTP connection logs). Mirrors the dynamic authHandler's onAuthAttempt.
  * @returns {(methodsLeft: string[]|null, partialSuccess: boolean, callback: Function) => void}
  */
-function createOrderedStringAuthHandler(order, authPhase) {
+function createOrderedStringAuthHandler(order, authPhase, onAuthAttempt) {
   // Methods we actually offered (server got a chance to accept/reject).
   let attempted = new Set();
   // Methods that contributed a successful factor; never retried.
   const succeeded = new Set();
   let lastOffered = null;
+
+  const attemptLabel = (method) => {
+    if (method === "none") return "none (no credentials)";
+    if (method === "agent") return "SSH agent";
+    return method;
+  };
 
   return (methodsLeft, partialSuccess, callback) => {
     if (partialSuccess) {
@@ -1230,6 +1294,10 @@ function createOrderedStringAuthHandler(order, authPhase) {
       // Drop rejected/skipped attempts so a method that was not advertised
       // earlier can be offered now that the server is asking for it.
       attempted = new Set(succeeded);
+    } else if (lastOffered && methodsLeft !== null) {
+      // Server rejected the previous method (or finished a failed factor).
+      // Skip the initial methodsLeft===null probe which is not a rejection.
+      onAuthAttempt?.(`${attemptLabel(lastOffered)} rejected`);
     }
 
     const available = Array.isArray(methodsLeft) && methodsLeft.length > 0
@@ -1247,8 +1315,10 @@ function createOrderedStringAuthHandler(order, authPhase) {
       }
       attempted.add(method);
       lastOffered = method;
+      onAuthAttempt?.(attemptLabel(method));
       return callback(method);
     }
+    onAuthAttempt?.("all methods exhausted");
     return callback(false);
   };
 }
@@ -1547,6 +1617,7 @@ async function requestPassphrasesForEncryptedKeys(sender, hostname) {
 module.exports = {
   PREFERRED_KEY_NAMES,
   SSH_KEY_PATTERN,
+  orderSshIdentityNames,
   looksLikePrivateKey,
   isKeyEncrypted,
   findDefaultPrivateKey,
