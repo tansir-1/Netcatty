@@ -32,7 +32,10 @@ import {
   setTerminalOutputPressureVisibility,
   shouldDegradeTerminalSideWork,
 } from "./terminalOutputPressure";
-import { createSudoPasswordAutofill } from "./terminalSudoAutofill";
+import {
+  createSudoPasswordAutofill,
+  type SudoPasswordAutofillCandidate,
+} from "./terminalSudoAutofill";
 import {
   filterTerminalSessionData,
   resetTerminalSyncBlockFilter,
@@ -634,6 +637,7 @@ export const tryAttachSessionToTerminal = (
     onExit?: (evt: { exitCode?: number; signal?: number; error?: string; reason?: string }) => void;
     convertLfToCrlf?: boolean;
     sudoAutofillPassword?: string;
+    sudoAutofillCandidates?: SudoPasswordAutofillCandidate[];
   },
 ): boolean => {
   if (!isTerminalBootActive(ctx)) {
@@ -684,6 +688,7 @@ export const attachSessionToTerminal = (
     onExit?: (evt: { exitCode?: number; signal?: number; error?: string; reason?: string }) => void;
     convertLfToCrlf?: boolean;
     sudoAutofillPassword?: string;
+    sudoAutofillCandidates?: SudoPasswordAutofillCandidate[];
   },
 ) => {
   if (!isTerminalBootActive(ctx)) {
@@ -699,10 +704,26 @@ export const attachSessionToTerminal = (
   resetTerminalLineTimestamps(term);
   resetTerminalOutputPressure(term);
   ctx.onSessionAttached?.(id);
+  const assistMode =
+    ctx.terminalSettingsRef?.current?.passwordPromptAssist
+    ?? ctx.terminalSettings?.passwordPromptAssist
+    ?? "hint";
+  const candidates =
+    opts?.sudoAutofillCandidates
+    ?? ctx.sudoAutofillCandidatesRef?.current
+    ?? ctx.sudoAutofillCandidates
+    ?? [];
+  const password =
+    opts?.sudoAutofillPassword
+    ?? ctx.sudoAutofillPasswordRef?.current
+    ?? ctx.sudoAutofillPassword;
   const sudoAutofill = createSudoPasswordAutofill({
-    password: opts?.sudoAutofillPassword,
+    mode: assistMode,
+    password,
+    candidates,
     write: (data) => ctx.terminalBackend.writeToSession(id, data, { automated: true }),
     onHint: (active) => ctx.onSudoHint?.(active) ?? false,
+    onPicker: (active, state) => ctx.onPasswordPromptPicker?.(active, state) ?? false,
   });
   if (ctx.sudoAutofillRef) {
     ctx.sudoAutofillRef.current = sudoAutofill;
@@ -723,6 +744,11 @@ export const attachSessionToTerminal = (
       data = sudoAutofill?.handleOutput(data) ?? data;
       writeSessionData(ctx, term, data, ingressBytes, meta);
       ctx.onTerminalOutput?.(data, meta);
+      // Mark connected on first visible output so the connection overlay
+      // dismisses and interactive Mosh handshake prompts (password/OTP)
+      // remain reachable. Startup commands / pending scripts are gated
+      // separately on netcatty:mosh:ready so they do not hit the handshake
+      // PTY (#2199).
       if (!ctx.hasConnectedRef.current) {
         ctx.updateStatus("connected");
         opts?.onConnected?.();

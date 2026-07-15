@@ -764,6 +764,11 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     data: string,
     options?: { source?: "terminal" | "shift-enter" },
   ) => {
+    // Clipboard paste / typed password while assist is open must dismiss the
+    // hint first. Otherwise Enter is still hijacked for confirmFill and can
+    // append the host session password after the user's pasted secret (#2198).
+    ctx.sudoAutofillRef?.current?.dismissOnUserContentInput(data);
+
     const inputSource = options?.source ?? "terminal";
     const id = ctx.sessionRef.current;
     const dataToWrite = data;
@@ -888,6 +893,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         } else if (data === "\x03") {
           ctx.commandBufferRef.current = "";
           ctx.scriptRecorderRef?.current?.recordClearLine();
+          // Hard-abort password assist when Ctrl+C reaches the input path
+          // (e.g. broadcast peers) so a later su re-arms cleanly (#2191).
+          ctx.sudoAutofillRef?.current?.abort();
         } else if (data === "\x15") {
           ctx.commandBufferRef.current = "";
           ctx.scriptRecorderRef?.current?.recordClearLine();
@@ -969,15 +977,37 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     }
     hideHistoryPreview();
 
-    // Sudo password hint: while a hint is pending, Enter confirms (paste the
-    // saved password + submit); any other visible key dismisses it so the user
-    // can type the password manually. Checked before autocomplete so Enter
-    // pastes the password instead of submitting an empty line.
+    // Password prompt assist (sudo/su): while pending, Enter confirms the
+    // selected/host password; arrows move the picker; Esc soft-dismisses (keeps
+    // arm so the list can re-open). Checked before autocomplete so Enter pastes
+    // the password instead of submitting an empty line.
+    // Paste is handled in handleTerminalInputData (dismissOnUserContentInput)
+    // because clipboard paste does not go through this key handler (#2198).
     const sudoAutofill = ctx.sudoAutofillRef?.current;
     if (sudoAutofill?.isPromptPending()) {
       if (shouldSendShiftEnterText(e, ctx.terminalSettingsRef.current)) {
         sudoAutofill.cancelHint();
         // fall through: Shift+Enter sends the configured terminal text
+      } else if (
+        sudoAutofill.isPickerPending()
+        && e.key === "ArrowDown"
+        && !e.altKey
+        && !e.ctrlKey
+        && !e.metaKey
+      ) {
+        e.preventDefault();
+        sudoAutofill.moveSelection(1);
+        return false;
+      } else if (
+        sudoAutofill.isPickerPending()
+        && e.key === "ArrowUp"
+        && !e.altKey
+        && !e.ctrlKey
+        && !e.metaKey
+      ) {
+        e.preventDefault();
+        sudoAutofill.moveSelection(-1);
+        return false;
       } else if (
         e.key === "Enter" &&
         !e.altKey &&
@@ -993,10 +1023,31 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         sudoAutofill.cancelHint();
         return false; // dismiss without forwarding the byte to the no-echo prompt
       }
-      if (e.key.length === 1) {
+      // Printable keys soft-dismiss so the user can type a password manually.
+      // Keep soft-dismiss for AltGr/Option-produced characters (they report
+      // Ctrl/Alt modifiers on Windows/macOS). Only plain Ctrl+C skips this —
+      // the interrupt path hard-aborts instead (#2191).
+      if (
+        e.key.length === 1
+        && !shouldUseUrgentTerminalInterrupt(e, { hasSelection: term.hasSelection() })
+      ) {
         sudoAutofill.cancelHint();
         // fall through: key becomes the first char of the manually typed password
       }
+    } else if (
+      sudoAutofill?.canReshowAssist()
+      && !e.altKey
+      && !e.ctrlKey
+      && !e.metaKey
+      && (e.key === "Escape" || e.key === "ArrowDown" || e.key === "ArrowUp")
+    ) {
+      // Soft-dismissed but still on Password: — Esc/arrows re-open the assist.
+      e.preventDefault();
+      if (sudoAutofill.tryReshowAssist()) {
+        if (e.key === "ArrowDown") sudoAutofill.moveSelection(1);
+        if (e.key === "ArrowUp") sudoAutofill.moveSelection(-1);
+      }
+      return false;
     }
 
     // Autocomplete key handler (must be checked before other handlers)
@@ -1011,6 +1062,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         const rendererKeyAt = Date.now();
         e.preventDefault();
         e.stopPropagation();
+        // Abort password assist: user is cancelling the remote command, not
+        // soft-dismissing the UI. A later su must re-arm cleanly (#2191).
+        sudoAutofill?.abort();
         const priority = prioritizeTerminalInput(
           term,
           id,
