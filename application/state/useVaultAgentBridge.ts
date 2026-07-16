@@ -1,11 +1,18 @@
 import { useEffect, useRef } from 'react';
-import type { Host, Identity, PortForwardingRule, Snippet, SSHKey, TerminalSettings, VaultNote } from '../../domain/models';
+import { applyGroupDefaults, resolveGroupDefaults } from '../../domain/groupConfig';
+import type { GroupConfig, Host, Identity, KnownHost, ManagedSource, PortForwardingRule, ProxyProfile, Snippet, SSHKey, TerminalSettings, VaultNote } from '../../domain/models';
+import { materializeHostProxyProfile } from '../../domain/proxyProfiles';
 import {
   handleVaultAgentOp,
   registerVaultAgentHandler,
   setupVaultAgentBridge,
   type VaultAgentApiDeps,
 } from '../../infrastructure/ai/vaultAgentBridgeClient';
+import {
+  clearReferenceKeyPassphrases,
+  rememberKeyPassphrase,
+  removeDefaultKeyPassphraseAliases,
+} from '../defaultKeyPassphrases';
 
 export interface UseVaultAgentBridgeInput {
   hosts: Host[];
@@ -13,61 +20,83 @@ export interface UseVaultAgentBridgeInput {
   portForwardingRules: PortForwardingRule[];
   keys: SSHKey[];
   identities: Identity[];
+  knownHosts: KnownHost[];
+  proxyProfiles: ProxyProfile[];
+  managedSources: ManagedSource[];
   terminalSettings?: Pick<TerminalSettings, 'keepaliveInterval' | 'keepaliveCountMax'>;
-  resolveEffectiveHost: (host: Host) => Host;
   updateHosts: (hosts: Host[]) => void;
+  updateKeys: (keys: SSHKey[]) => Promise<unknown> | unknown;
   updateSnippets: (snippets: Snippet[]) => void;
   customGroups: string[];
   updateCustomGroups: (groups: string[]) => void;
+  groupConfigs: GroupConfig[];
+  updateGroupConfigs: (configs: GroupConfig[]) => void;
+  updateManagedSources: (sources: ManagedSource[]) => void;
+  updatePortForwardingRules: (rules: PortForwardingRule[]) => void;
   notes: VaultNote[];
   updateNotes: (notes: VaultNote[]) => void;
   startTunnel: VaultAgentApiDeps['startTunnel'];
   stopTunnel: VaultAgentApiDeps['stopTunnel'];
+  stopRuleTunnels: VaultAgentApiDeps['stopRuleTunnels'];
   openHost?: VaultAgentApiDeps['openHost'];
+  closeSession?: VaultAgentApiDeps['closeSession'];
 }
 
 type VaultAgentSnapshot = {
   hosts: Host[];
+  keys: SSHKey[];
   notes: VaultNote[];
   snippets: Snippet[];
   customGroups: string[];
+  groupConfigs: GroupConfig[];
+  portForwardingRules: PortForwardingRule[];
+  managedSources: ManagedSource[];
 };
+
+const selectVaultAgentSnapshot = (input: UseVaultAgentBridgeInput): VaultAgentSnapshot => ({
+  hosts: input.hosts,
+  keys: input.keys,
+  notes: input.notes,
+  snippets: input.snippets,
+  customGroups: input.customGroups,
+  groupConfigs: input.groupConfigs,
+  portForwardingRules: input.portForwardingRules,
+  managedSources: input.managedSources,
+});
+
+export const haveSameVaultAgentSnapshot = (
+  left: VaultAgentSnapshot,
+  right: VaultAgentSnapshot,
+): boolean => (Object.keys(left) as Array<keyof VaultAgentSnapshot>)
+  .every((key) => left[key] === right[key]);
+
+export function resolveVaultAgentEffectiveHost(
+  host: Host,
+  groupConfigs: GroupConfig[],
+  proxyProfiles: ProxyProfile[],
+): Host {
+  const validProxyProfileIds = new Set(proxyProfiles.map((profile) => profile.id));
+  const withGroupDefaults = host.group
+    ? applyGroupDefaults(
+        host,
+        resolveGroupDefaults(host.group, groupConfigs, { validProxyProfileIds }),
+        { validProxyProfileIds },
+      )
+    : applyGroupDefaults(host, {}, { validProxyProfileIds });
+  return materializeHostProxyProfile(withGroupDefaults, proxyProfiles);
+}
 
 export function useVaultAgentBridge(input: UseVaultAgentBridgeInput): void {
   const inputRef = useRef(input);
   inputRef.current = input;
 
-  const vaultSnapshotRef = useRef<VaultAgentSnapshot>({
-    hosts: input.hosts,
-    notes: input.notes,
-    snippets: input.snippets,
-    customGroups: input.customGroups,
-  });
-  const lastSyncedVaultInputRef = useRef({
-    hosts: input.hosts,
-    notes: input.notes,
-    snippets: input.snippets,
-    customGroups: input.customGroups,
-  });
+  const selectedSnapshot = selectVaultAgentSnapshot(input);
+  const vaultSnapshotRef = useRef<VaultAgentSnapshot>(selectedSnapshot);
+  const lastSyncedVaultInputRef = useRef<VaultAgentSnapshot>(selectedSnapshot);
 
-  if (
-    input.hosts !== lastSyncedVaultInputRef.current.hosts
-    || input.notes !== lastSyncedVaultInputRef.current.notes
-    || input.snippets !== lastSyncedVaultInputRef.current.snippets
-    || input.customGroups !== lastSyncedVaultInputRef.current.customGroups
-  ) {
-    vaultSnapshotRef.current = {
-      hosts: input.hosts,
-      notes: input.notes,
-      snippets: input.snippets,
-      customGroups: input.customGroups,
-    };
-    lastSyncedVaultInputRef.current = {
-      hosts: input.hosts,
-      notes: input.notes,
-      snippets: input.snippets,
-      customGroups: input.customGroups,
-    };
+  if (!haveSameVaultAgentSnapshot(selectedSnapshot, lastSyncedVaultInputRef.current)) {
+    vaultSnapshotRef.current = selectedSnapshot;
+    lastSyncedVaultInputRef.current = selectedSnapshot;
   }
 
   useEffect(() => {
@@ -77,12 +106,20 @@ export function useVaultAgentBridge(input: UseVaultAgentBridgeInput): void {
         getHosts: () => vaultSnapshotRef.current.hosts,
         getNotes: () => vaultSnapshotRef.current.notes,
         getCustomGroups: () => vaultSnapshotRef.current.customGroups,
+        getGroupConfigs: () => vaultSnapshotRef.current.groupConfigs,
+        getPortForwardingRules: () => vaultSnapshotRef.current.portForwardingRules,
+        getManagedSources: () => vaultSnapshotRef.current.managedSources,
         snippets: vaultSnapshotRef.current.snippets,
-        portForwardingRules: current.portForwardingRules,
-        keys: current.keys,
+        keys: vaultSnapshotRef.current.keys,
         identities: current.identities,
+        knownHosts: current.knownHosts,
+        proxyProfiles: current.proxyProfiles,
         terminalSettings: current.terminalSettings,
-        resolveEffectiveHost: current.resolveEffectiveHost,
+        resolveEffectiveHost: (host) => resolveVaultAgentEffectiveHost(
+          host,
+          vaultSnapshotRef.current.groupConfigs,
+          current.proxyProfiles,
+        ),
         updateHostNotes: (hostId, notes) => {
           const nextHosts = vaultSnapshotRef.current.hosts.map((host) => (
             host.id === hostId ? { ...host, notes } : host
@@ -94,9 +131,39 @@ export function useVaultAgentBridge(input: UseVaultAgentBridgeInput): void {
           vaultSnapshotRef.current.customGroups = groups;
           current.updateCustomGroups(groups);
         },
+        updateGroupConfigs: (configs) => {
+          vaultSnapshotRef.current.groupConfigs = configs;
+          current.updateGroupConfigs(configs);
+        },
+        updatePortForwardingRules: (rules) => {
+          vaultSnapshotRef.current.portForwardingRules = rules;
+          current.updatePortForwardingRules(rules);
+        },
+        updateManagedSources: (sources) => {
+          vaultSnapshotRef.current.managedSources = sources;
+          current.updateManagedSources(sources);
+        },
         updateHosts: (hosts) => {
           vaultSnapshotRef.current.hosts = hosts;
           current.updateHosts(hosts);
+        },
+        saveKeyPassphrase: (keyPath, passphrase) => rememberKeyPassphrase({
+          keyPath,
+          passphrase,
+          keys: vaultSnapshotRef.current.keys,
+          updateKeys: current.updateKeys,
+          setCurrentKeys: (keys) => {
+            vaultSnapshotRef.current.keys = keys;
+          },
+        }),
+        removeKeyPassphrases: async (keyPaths) => {
+          const aliases = await removeDefaultKeyPassphraseAliases(keyPaths);
+          const currentKeys = vaultSnapshotRef.current.keys;
+          const updatedKeys = clearReferenceKeyPassphrases(currentKeys, aliases);
+          if (updatedKeys !== currentKeys) {
+            vaultSnapshotRef.current.keys = updatedKeys;
+            await current.updateKeys(updatedKeys);
+          }
         },
         updateNotes: (notes) => {
           vaultSnapshotRef.current.notes = notes;
@@ -108,8 +175,12 @@ export function useVaultAgentBridge(input: UseVaultAgentBridgeInput): void {
         },
         startTunnel: current.startTunnel,
         stopTunnel: current.stopTunnel,
+        stopRuleTunnels: current.stopRuleTunnels,
         openHost: current.openHost
-          ? (hostId) => current.openHost!(hostId)
+          ? (host) => current.openHost!(host)
+          : undefined,
+        closeSession: current.closeSession
+          ? (sessionId) => current.closeSession!(sessionId)
           : undefined,
       });
     });

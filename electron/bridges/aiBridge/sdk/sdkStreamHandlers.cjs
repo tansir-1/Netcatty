@@ -8,6 +8,8 @@ const { buildNetcattySkillsOpenCodePathAllowlist } = require("./netcattySkillsOp
 const { getToolCliStateDir } = require("../../../cli/discoveryPath.cjs");
 const tempDirBridge = require("../../tempDirBridge.cjs");
 const { realpathSync } = require("node:fs");
+const { CodexAppServerRuntime } = require("../codexAppServer/runtime.cjs");
+const { probeCodexAppServer } = require("../codexAppServer/probe.cjs");
 
 const VALID_BACKENDS = new Set(listBackends());
 
@@ -31,14 +33,16 @@ function parseSdkSessionIdentity(value) {
     sessionId: parsed.id,
     backendKey: parsed.backend,
     binPath: parsed.binPath || "",
+    runtime: parsed.runtime === "app-server" ? "app-server" : "sdk",
   };
 }
 
-function buildSdkSessionKey(chatSessionId, backendKey, binPath) {
+function buildSdkSessionKey(chatSessionId, backendKey, binPath, runtime = "sdk") {
   return [
     String(chatSessionId || ""),
     String(backendKey || ""),
     String(binPath || ""),
+    String(runtime || "sdk"),
   ].join("\u0000");
 }
 
@@ -57,11 +61,11 @@ const SDK_MODEL_CACHE_ENV_KEYS = [
   "CURSOR_API_KEY",
 ];
 
-function buildSdkModelCacheKey(backendKey, binPath, env) {
+function buildSdkModelCacheKey(backendKey, binPath, env, runtime = "sdk") {
   const envFingerprint = SDK_MODEL_CACHE_ENV_KEYS
     .map((key) => `${key}=${env?.[key] == null ? "" : String(env[key])}`)
     .join("\u0000");
-  return [String(backendKey || ""), String(binPath || ""), envFingerprint].join("\u0000");
+  return [String(backendKey || ""), String(binPath || ""), String(runtime || "sdk"), envFingerprint].join("\u0000");
 }
 
 function shouldCacheSdkRuntimeModels(_backendKey) {
@@ -90,6 +94,7 @@ function resolveSdkResumeSessionId({
   existingSessionId,
   backendKey,
   binPath,
+  runtime = "sdk",
   hasConfiguredCommand,
 }) {
   const inMemorySessionId = sdkSessionIds.get(sdkSessionKey);
@@ -97,12 +102,16 @@ function resolveSdkResumeSessionId({
 
   const persisted = parseSdkSessionIdentity(existingSessionId);
   if (persisted) {
-    return persisted.backendKey === backendKey && persisted.binPath === String(binPath || "")
+    return persisted.backendKey === backendKey
+      && persisted.binPath === String(binPath || "")
+      && persisted.runtime === runtime
       ? persisted.sessionId
       : undefined;
   }
 
-  return existingSessionId && !hasConfiguredCommand ? existingSessionId : undefined;
+  return runtime === "sdk" && existingSessionId && !hasConfiguredCommand
+    ? existingSessionId
+    : undefined;
 }
 
 function withTimeout(promise, ms, abortController) {
@@ -301,7 +310,22 @@ function registerSdkStreamHandlers(ctx) {
     // chatSessionId -> { sessionId } for resume; controller per requestId.
     const sdkActiveStreams = new Map(); // requestId -> AbortController
     const sdkRequestSessions = new Map(); // requestId -> chatSessionId
+    const sdkRequestRuntimes = new Map(); // requestId -> { backendKey, codexRuntime }
     const sdkSessionIds = new Map(); // chatSessionId -> last sessionId
+    const codexAppServerRuntime = new CodexAppServerRuntime({
+      appVersion: electronModule?.app?.getVersion?.() || "0.0.0",
+      sendInteractionRequest(payload, context) {
+        const sender = context?.sender;
+        if (!sender || sender.isDestroyed?.()) return false;
+        safeSend(sender, "netcatty:ai:codex-app-server:interaction-request", payload);
+        return true;
+      },
+      sendInteractionCleared(payload, context) {
+        const sender = context?.sender;
+        if (!sender || sender.isDestroyed?.()) return;
+        safeSend(sender, "netcatty:ai:codex-app-server:interaction-cleared", payload);
+      },
+    });
 
     ipcMain.handle(
       "netcatty:ai:sdk-agent:stream",
@@ -311,6 +335,7 @@ function registerSdkStreamHandlers(ctx) {
           requestId, chatSessionId, sdkBackend, prompt, cwd,
           model, existingSessionId, toolIntegrationMode,
           defaultTargetSession, userSkillsContext, agentEnv: requestedAgentEnv, agentCommand,
+          codexRuntime: requestedCodexRuntime, permissionMode,
         } = payload;
 
         const backendKey = resolveBackendKey(sdkBackend);
@@ -372,8 +397,13 @@ function registerSdkStreamHandlers(ctx) {
             env = addCodexExecutableEnvForSdk(env, binPath);
           }
 
+          const codexRuntime = backendKey === "codex" && requestedCodexRuntime === "app-server"
+            ? "app-server"
+            : "sdk";
+          sdkRequestRuntimes.set(requestId, { backendKey, codexRuntime });
+
           const hasConfiguredCommand = isPathLikeCommand(agentCommand);
-          const sdkSessionKey = buildSdkSessionKey(chatSessionId, backendKey, binPath);
+          const sdkSessionKey = buildSdkSessionKey(chatSessionId, backendKey, binPath, codexRuntime);
           const hasInMemorySession = sdkSessionIds.has(sdkSessionKey);
           const resumeSessionId = resolveSdkResumeSessionId({
             sdkSessionIds,
@@ -381,13 +411,14 @@ function registerSdkStreamHandlers(ctx) {
             existingSessionId,
             backendKey,
             binPath,
+            runtime: codexRuntime,
             hasConfiguredCommand,
           });
           const stagedAttachments = [];
           const turnPrompt = buildSdkTurnPrompt({
             prompt,
             historyMessages: payload?.historyMessages,
-            replayHistory: !hasInMemorySession,
+            replayHistory: codexRuntime === "app-server" ? !resumeSessionId : !hasInMemorySession,
             attachments: payload?.images,
             onStagedAttachment: (attachment) => stagedAttachments.push(attachment),
           });
@@ -417,6 +448,7 @@ function registerSdkStreamHandlers(ctx) {
                   sessionId,
                   sdkBackend: backendKey,
                   binPath: binPath || "",
+                  runtime: codexRuntime,
                 });
               }
             },
@@ -437,11 +469,14 @@ function registerSdkStreamHandlers(ctx) {
                 .filter(Boolean),
             })
             : undefined;
-          const result = await driver.runTurn({
+          const commonTurnContext = {
+            requestId,
+            chatSessionId,
             prompt: backendKey === "opencode" ? turnPrompt : contextualPrompt,
             systemPrompt: backendKey === "opencode" ? systemContext : undefined,
             cwd: cwd || process.cwd(),
             model: model || undefined,
+            permissionMode: permissionMode || "confirm",
             env,
             binPath,
             injectedMcpServers,
@@ -452,8 +487,13 @@ function registerSdkStreamHandlers(ctx) {
             signal: abortController.signal,
             abortController,
             resumeSessionId,
+            resumeThreadId: resumeSessionId,
             attachments: stagedAttachments,
-          });
+            sender: event.sender,
+          };
+          const result = codexRuntime === "app-server"
+            ? await codexAppServerRuntime.runTurn(commonTurnContext)
+            : await driver.runTurn(commonTurnContext);
 
           // Persist any new session id for resume on the next turn.
           const newSessionId = result?.sessionId || result?.threadId;
@@ -466,13 +506,14 @@ function registerSdkStreamHandlers(ctx) {
         } finally {
           sdkActiveStreams.delete(requestId);
           sdkRequestSessions.delete(requestId);
+          sdkRequestRuntimes.delete(requestId);
         }
       },
     );
 
     ipcMain.handle("netcatty:ai:sdk-agent:list-models", async (event, payload) => {
       if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
-      const { sdkBackend, agentEnv: requestedAgentEnv, agentCommand } = payload || {};
+      const { sdkBackend, agentEnv: requestedAgentEnv, agentCommand, codexRuntime: requestedCodexRuntime } = payload || {};
       const backendKey = resolveBackendKey(sdkBackend);
       if (!backendKey) return { ok: false, error: `Unknown SDK backend: ${sdkBackend}` };
 
@@ -500,10 +541,13 @@ function registerSdkStreamHandlers(ctx) {
           resolveCodexExecutableForSdk,
           resolveCodebuddyExecutableForSdk,
         });
+        const codexRuntime = backendKey === "codex" && requestedCodexRuntime === "app-server"
+          ? "app-server"
+          : "sdk";
         // claude/copilot/opencode enumerate models via the SDK; codex has no
         // catalog (its driver returns []), so the renderer falls back to curated
         // presets. Cache + in-flight coalescing avoid spawn storms (#2184).
-        const cacheKey = buildSdkModelCacheKey(backendKey, binPath, env);
+        const cacheKey = buildSdkModelCacheKey(backendKey, binPath, env, codexRuntime);
         const shouldCacheModels = shouldCacheSdkRuntimeModels(backendKey);
         const cached = shouldCacheModels ? sdkModelCache.get(cacheKey) : null;
         if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) {
@@ -517,7 +561,9 @@ function registerSdkStreamHandlers(ctx) {
           const abortController = new AbortController();
           try {
             const raw = await withTimeout(
-              driver.listModels({ binPath, env, abortController }),
+              codexRuntime === "app-server"
+                ? codexAppServerRuntime.listModels({ binPath, env })
+                : driver.listModels({ binPath, env, abortController }),
               MODEL_LIST_TIMEOUT_MS,
               abortController,
             );
@@ -533,7 +579,12 @@ function registerSdkStreamHandlers(ctx) {
           } catch (err) {
             // Degrade to [] so the renderer keeps its curated presets (never empty).
             console.debug(`[sdk] list-models(${backendKey}) unavailable, using curated presets`);
-            return { ok: true, currentModelId: null, models: [] };
+            return {
+              ok: true,
+              currentModelId: null,
+              models: [],
+              warning: codexRuntime === "app-server" ? (err?.message || String(err)) : undefined,
+            };
           }
         })();
 
@@ -548,8 +599,52 @@ function registerSdkStreamHandlers(ctx) {
       } catch (err) {
         // Degrade to [] so the renderer keeps its curated presets (never empty).
         console.debug(`[sdk] list-models(${backendKey}) unavailable, using curated presets`);
-        return { ok: true, currentModelId: null, models: [] };
+        return {
+          ok: true,
+          currentModelId: null,
+          models: [],
+          warning: backendKey === "codex" && requestedCodexRuntime === "app-server"
+            ? (err?.message || String(err))
+            : undefined,
+        };
       }
+    });
+
+    ipcMain.handle("netcatty:ai:sdk-agent:steer", async (event, payload) => {
+      if (!validateSender(event)) return { status: "failed", message: "Unauthorized IPC sender" };
+      const requestId = String(payload?.requestId || "");
+      const chatSessionId = String(payload?.chatSessionId || "");
+      const prompt = String(payload?.prompt || "");
+      const clientUserMessageId = String(payload?.clientUserMessageId || "");
+      if (!requestId || !chatSessionId || !clientUserMessageId) {
+        return { status: "failed", message: "Invalid Codex steer request" };
+      }
+      if (sdkRequestSessions.get(requestId) !== chatSessionId) {
+        return { status: "inactive" };
+      }
+      const runtime = sdkRequestRuntimes.get(requestId);
+      if (!runtime) return { status: "busy" };
+      if (runtime?.backendKey !== "codex" || runtime.codexRuntime !== "app-server") {
+        return { status: "unsupported" };
+      }
+
+      const stagedAttachments = [];
+      const steerPrompt = buildSdkTurnPrompt({
+        prompt,
+        replayHistory: false,
+        attachments: payload?.images,
+        onStagedAttachment: (attachment) => stagedAttachments.push(attachment),
+      });
+      mcpServerBridge.updateAttachmentMetadata?.(stagedAttachments, chatSessionId);
+      const result = await codexAppServerRuntime.steerTurn(requestId, {
+        chatSessionId,
+        prompt: steerPrompt,
+        attachments: stagedAttachments,
+        clientUserMessageId,
+      });
+      return result.status === "inactive" && sdkActiveStreams.has(requestId)
+        ? { status: "busy" }
+        : result;
     });
 
     ipcMain.handle("netcatty:ai:sdk-agent:cancel", async (event, { requestId, chatSessionId }) => {
@@ -560,6 +655,7 @@ function registerSdkStreamHandlers(ctx) {
       mcpServerBridge.cancelWorkerBackgroundJobsForSession?.(effectiveChatSessionId);
       mcpServerBridge.clearPendingApprovals(effectiveChatSessionId);
       void mcpServerBridge.cancelSftpOpsForSession?.(effectiveChatSessionId);
+      await codexAppServerRuntime.cancelTurn(requestId);
       const controller = sdkActiveStreams.get(requestId);
       if (controller) {
         controller.abort();
@@ -574,12 +670,50 @@ function registerSdkStreamHandlers(ctx) {
       mcpServerBridge.cancelPtyExecsForSession(chatSessionId);
       mcpServerBridge.cancelWorkerBackgroundJobsForSession?.(chatSessionId);
       deleteSdkSessionKeysForChat(sdkSessionIds, chatSessionId);
+      await codexAppServerRuntime.cleanupChatSession(chatSessionId);
       await mcpServerBridge.cleanupScopedMetadata(chatSessionId);
       return { ok: true };
     });
 
+    ipcMain.handle("netcatty:ai:codex-app-server:interaction-response", async (event, payload) => {
+      if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
+      const ok = codexAppServerRuntime.respondInteraction(payload?.interactionId, payload, event.sender);
+      return ok ? { ok: true } : { ok: false, error: "Interaction not found" };
+    });
+
+    ipcMain.handle("netcatty:ai:codex-app-server:status", async (event, payload) => {
+      if (!validateSenderOrSettings(event)) return { ok: false, available: false, error: "Unauthorized IPC sender" };
+      try {
+        const shellEnv = await getShellEnv();
+        let env = buildSdkAgentEnv({
+          shellEnv,
+          requestedAgentEnv: normalizeAgentEnv(payload?.agentEnv),
+          withCliDiscoveryEnv,
+          normalizeClaudeCodeExecutableEnv: normalizeClaudeCodeExecutableEnvForSdk,
+        });
+        const binPath = resolveSdkBackendBinPath({
+          backendKey: "codex",
+          configuredCommand: payload?.agentCommand,
+          shellEnv,
+          env,
+          resolveCliFromPath,
+          normalizeCliPathForPlatform,
+          resolveSdkBinPath,
+          resolveClaudeCodeExecutableForSdk,
+          resolveCodexExecutableForSdk,
+          resolveCodebuddyExecutableForSdk,
+        });
+        env = addCodexExecutableEnvForSdk(env, binPath);
+        const result = await probeCodexAppServer({ binPath, env });
+        return { ok: true, ...result };
+      } catch (error) {
+        return { ok: true, available: false, error: error?.message || String(error) };
+      }
+    });
+
     // Expose teardown so aiBridge.cleanup() can abort active SDK streams.
     ctx.sdkActiveStreams = sdkActiveStreams;
+    ctx.codexAppServerRuntime = codexAppServerRuntime;
   }
 }
 

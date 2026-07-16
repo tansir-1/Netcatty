@@ -106,6 +106,8 @@ export interface SerialConfig {
   flowControl?: SerialFlowControl; // Flow control (default: 'none')
   localEcho?: boolean; // Force local echo (default: false, rely on remote echo)
   lineMode?: boolean; // Line mode - buffer input and send on Enter (default: false)
+  // Store the default explicitly so an open/restored session keeps its launch-time behavior.
+  backspaceBehavior?: 'default' | 'ctrl-h';
 }
 
 // Per-protocol configuration
@@ -158,6 +160,9 @@ export interface Host {
   // Version 1 distinguishes the explicit per-host login choices from the
   // legacy "password" default, which did not mean password-only.
   authPolicyVersion?: 1;
+  // Legacy no-op field from earlier MFA experiments. Auth always uses
+  // password-first with automatic keyboard-interactive fallback (#2150 / #2217).
+  requiresMfa?: boolean;
   // Use the local SSH agent for login. This is separate from agentForwarding,
   // which exposes the local agent to the remote host after login.
   useSshAgent?: boolean;
@@ -216,6 +221,9 @@ export interface Host {
   serialConfig?: SerialConfig;
   // SFTP specific configuration
   sftpSudo?: boolean; // Use sudo for SFTP operations (requires password)
+  // Remote file browser protocol: Auto tries SFTP then falls back to SCP-mode
+  // (shell browse + scp -t/-f transfers) when the SFTP subsystem is unavailable.
+  sftpFileProtocol?: 'auto' | 'sftp' | 'scp';
   sftpEncoding?: SftpFilenameEncoding; // Filename encoding for SFTP operations
   sftpBookmarks?: SftpBookmark[]; // Bookmarked SFTP paths for quick navigation
   sftpFollowTerminalCwd?: boolean; // Overrides global SFTP follow-terminal-directory setting

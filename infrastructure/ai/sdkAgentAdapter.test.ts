@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { formatSdkAgentErrorForDisplay, runSdkAgentTurn } from './sdkAgentAdapter';
+import { formatSdkAgentErrorForDisplay, runSdkAgentTurn, steerSdkAgentTurn } from './sdkAgentAdapter';
 import type { SdkAgentCallbacks } from './sdkAgentAdapter';
 import type { ExternalAgentConfig } from './types';
 
@@ -24,6 +24,32 @@ const sdkConfig: ExternalAgentConfig = {
   enabled: true,
   sdkBackend: 'codex',
 };
+
+test('steerSdkAgentTurn forwards the active request and preserves typed outcomes', async () => {
+  const calls: unknown[][] = [];
+  const result = await steerSdkAgentTurn({
+    aiSdkAgentSteer: async (...args: unknown[]) => {
+      calls.push(args);
+      return { status: 'not-steerable', turnKind: 'review' };
+    },
+  }, 'request-1', 'chat-1', 'change direction', [{
+    base64Data: 'aGVsbG8=',
+    mediaType: 'image/png',
+    filename: 'image.png',
+  }], 'user-1');
+
+  assert.deepEqual(result, { status: 'not-steerable', turnKind: 'review' });
+  assert.deepEqual(calls[0], [
+    'request-1',
+    'chat-1',
+    'change direction',
+    [{ base64Data: 'aGVsbG8=', mediaType: 'image/png', filename: 'image.png' }],
+    'user-1',
+  ]);
+  assert.deepEqual(await steerSdkAgentTurn({}, 'request-1', 'chat-1', 'text', undefined, 'user-1'), {
+    status: 'unsupported',
+  });
+});
 
 test('formatSdkAgentErrorForDisplay preserves nested SDK agent error messages', () => {
   assert.equal(
@@ -114,7 +140,7 @@ test('runSdkAgentTurn forwards configured SDK agent environment', async () => {
     createCallbacks([]),
   );
 
-  assert.deepEqual(streamArgs.at(-2), {
+  assert.deepEqual(streamArgs[13], {
     CLAUDE_CODE_EXECUTABLE: '/opt/homebrew/bin/claude',
   });
   assert.equal(streamArgs[2], 'codex');
@@ -151,7 +177,7 @@ test('runSdkAgentTurn forwards the configured agent command path', async () => {
     createCallbacks([]),
   );
 
-  assert.equal(streamArgs.at(-1), '/opt/homebrew/bin/codex');
+  assert.equal(streamArgs[14], '/opt/homebrew/bin/codex');
 });
 
 test('runSdkAgentTurn does not forward auto-detected command paths', async () => {
@@ -185,7 +211,7 @@ test('runSdkAgentTurn does not forward auto-detected command paths', async () =>
     createCallbacks([]),
   );
 
-  assert.equal(streamArgs.at(-1), undefined);
+  assert.equal(streamArgs[14], undefined);
 });
 
 test('runSdkAgentTurn stores SDK session ids with backend and path metadata', async () => {
@@ -237,6 +263,7 @@ test('runSdkAgentTurn stores SDK session ids with backend and path metadata', as
     id: 'thread-1',
     backend: 'codex',
     binPath: '/opt/homebrew/bin/codex',
+    runtime: 'sdk',
   });
 });
 
@@ -274,7 +301,7 @@ test('runSdkAgentTurn forwards Cursor API key as agent environment', async () =>
     createCallbacks([]),
   );
 
-  assert.deepEqual(streamArgs.at(-2), {
+  assert.deepEqual(streamArgs[13], {
     CURSOR_API_KEY: 'cur-test-key',
   });
   assert.equal(streamArgs[2], 'cursor');

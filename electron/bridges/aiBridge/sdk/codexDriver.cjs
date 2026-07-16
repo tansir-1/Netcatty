@@ -39,7 +39,7 @@ function buildCodexPromptInput(prompt, attachments) {
   ];
 }
 
-function toCodexMcpConfig(injectedMcpServers) {
+function toCodexMcpConfig(injectedMcpServers, { defaultToolsApprovalMode } = {}) {
   const mcp_servers = {};
   for (const cfg of injectedMcpServers || []) {
     if (!cfg || !cfg.name) continue;
@@ -47,6 +47,9 @@ function toCodexMcpConfig(injectedMcpServers) {
       command: cfg.command,
       args: cfg.args || [],
       env: mcpEnvPairsToObject(cfg.env),
+      ...(defaultToolsApprovalMode
+        ? { default_tools_approval_mode: defaultToolsApprovalMode }
+        : {}),
     };
   }
   return mcp_servers;
@@ -83,6 +86,16 @@ const CODEX_REASONING_EFFORTS = new Set([
   "ultra",
 ]);
 
+function parseCodexModelSelection(model) {
+  const value = String(model || "");
+  const slash = value.lastIndexOf("/");
+  const effort = slash > 0 ? value.slice(slash + 1) : "";
+  if (slash > 0 && CODEX_REASONING_EFFORTS.has(effort)) {
+    return { model: value.slice(0, slash), effort };
+  }
+  return { model: value || undefined, effort: undefined };
+}
+
 function buildCodexThreadOptions({ cwd, model }) {
   // model + sandboxMode + workingDirectory belong to ThreadOptions (startThread).
   // runStreamed's TurnOptions only accepts { outputSchema, signal }, so passing
@@ -112,14 +125,9 @@ function buildCodexThreadOptions({ cwd, model }) {
     // (e.g. "gpt-5.5/high"). codex-sdk wants them as separate ThreadOptions.
     // Only split when the trailing segment is a real effort — custom/OpenRouter
     // model ids may legitimately contain "/".
-    const slash = model.lastIndexOf("/");
-    const effort = slash > 0 ? model.slice(slash + 1) : "";
-    if (slash > 0 && CODEX_REASONING_EFFORTS.has(effort)) {
-      opts.model = model.slice(0, slash);
-      opts.modelReasoningEffort = effort;
-    } else {
-      opts.model = model;
-    }
+    const selection = parseCodexModelSelection(model);
+    opts.model = selection.model;
+    if (selection.effort) opts.modelReasoningEffort = selection.effort;
   }
   return opts;
 }
@@ -370,6 +378,7 @@ module.exports = {
   buildCodexConstructorOptions,
   buildCodexThreadOptions,
   buildCodexPromptInput,
+  parseCodexModelSelection,
   translateCodexEvent,
   runCodexTurn,
   toCodexMcpConfig,

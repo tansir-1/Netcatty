@@ -1,4 +1,6 @@
 /* eslint-disable no-undef */
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 const { emitTerminalSessionData } = require("../emitTerminalSessionData.cjs");
 const {
   setBufferedOutputBytes,
@@ -8,12 +10,21 @@ const {
 const { createSshConnExecProbe } = require("../ai/sessionShellKind.cjs");
 const { orderSshIdentityNames, SSH_KEY_PATTERN } = require("../sshAuthHelper.cjs");
 
+const execFileAsync = promisify(execFile);
+
 // MoshCatty normally emits this cleanup together with an alternate-screen
 // exit. Netcatty keeps the primary screen, so restore only terminal modes that
 // can leak from a full-screen remote program and leave scrollback untouched.
 const MOSH_PRIMARY_SCREEN_RESET = "\x1b[?1l\x1b[0m\x1b[?25h"
   + "\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l"
   + "\x1b[?1015l\x1b[?1006l\x1b[?1005l";
+
+// The interactive SSH bootstrap can paint password prompts, MOTD text, and
+// mosh-server diagnostics into Netcatty's primary screen. MoshCatty then
+// reconstructs only the cells present in the remote Mosh state, so untouched
+// bootstrap cells would remain visible around the new shell. Clear the current
+// viewport at the successful handoff while preserving primary-screen scrollback.
+const MOSH_HANDSHAKE_VIEWPORT_RESET = "\x1b[2J\x1b[H";
 
 function withShellProbeTimeout(promise, timeoutMs) {
   const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 3000;
@@ -222,6 +233,17 @@ function createMoshSessionApi(ctx) {
         }
       }
     }
+
+    function buildMoshPreferredAuthentications({ authMethod, requiresMfa = false, hasPassword = false, hasPublicKey = false }) {
+      if (authMethod === "password") {
+        return requiresMfa ? "keyboard-interactive,password" : "password,keyboard-interactive";
+      }
+      if (!requiresMfa) return "";
+      if (hasPublicKey && hasPassword) return "publickey,keyboard-interactive,password";
+      if (hasPublicKey) return "publickey,keyboard-interactive";
+      if (hasPassword) return "keyboard-interactive,password";
+      return "keyboard-interactive";
+    }
     
     async function buildMoshSshAuthArgs(options, sessionId) {
       const sshArgs = [];
@@ -301,6 +323,7 @@ function createMoshSessionApi(ctx) {
         }
 
         const hasSelectedIdentity = sshArgs.some((arg) => arg === "-i");
+        const hasPassword = typeof options.password === "string" && options.password.length > 0;
         if (
           (options.authMethod === "key" || options.authMethod === "certificate")
           && !hasSelectedIdentity
@@ -322,7 +345,15 @@ function createMoshSessionApi(ctx) {
 
         if (options.authMethod === "password") {
           sshArgs.push("-o", "PubkeyAuthentication=no");
-          sshArgs.push("-o", "PreferredAuthentications=password,keyboard-interactive");
+        }
+        const preferredAuthentications = buildMoshPreferredAuthentications({
+          authMethod: options.authMethod,
+          requiresMfa: !!options.requiresMfa,
+          hasPassword,
+          hasPublicKey: Boolean(options.useSshAgent || hasSelectedIdentity),
+        });
+        if (preferredAuthentications) {
+          sshArgs.push("-o", `PreferredAuthentications=${preferredAuthentications}`);
         }
       } catch (err) {
         cleanupMoshAuthTempFiles(tempFiles);
@@ -368,18 +399,22 @@ function createMoshSessionApi(ctx) {
         port: options.port,
         username: options.username,
         lang,
+        locales: optionsEnv,
         moshServer: moshHandshake.buildMoshServerCommand(options.moshServerPath),
         sshArgs: moshAuth.sshArgs,
       });
     
       const { buildTerminalProcessEnv } = require("../httpNetworkProxyBridge.cjs");
       const sshEnv = { ...buildTerminalProcessEnv(process.env), ...optionsEnv, TERM: "xterm-256color" };
-      // macOS Terminal/iTerm export LC_CTYPE=UTF-8 (a bare value, not a real
-      // locale name). System ssh_config has `SendEnv LC_*`, so without scrubbing
-      // these the remote shell tries to setlocale("UTF-8") and prints a warning
-      // on every connection. mosh-server sets the locale it needs separately.
+      // Do not let ssh_config SendEnv force the local locale onto the remote
+      // process. The handshake passes the configured locale variables through
+      // mosh-server's stock `-l` fallback mechanism instead, so a minimal host
+      // can keep its working native C.UTF-8 locale when a requested locale is
+      // not installed.
       for (const key of Object.keys(sshEnv)) {
-        if (key.startsWith("LC_")) delete sshEnv[key];
+        if (key === "LANG" || key === "LANGUAGE" || key.startsWith("LC_")) {
+          delete sshEnv[key];
+        }
       }
       applyMoshSshAgentEnvironment(sshEnv, options);
     
@@ -557,10 +592,10 @@ function createMoshSessionApi(ctx) {
         // "[mosh-server detached]" alone is not mistaken for a successful
         // session that immediately closed (Netcatty #2121 residual connect).
         const handshakeHint =
-          "\r\n[Mosh handshake failed: did not receive a valid MOSH CONNECT "
-          + "line from mosh-server. Confirm mosh-server is installed on the "
-          + "remote host, the SSH login succeeded, and UDP ports for mosh "
-          + "are reachable from this machine.]\r\n";
+          "\r\n[Mosh handshake failed during SSH startup: did not receive a valid "
+          + "MOSH CONNECT line from mosh-server. The UDP client was not started. "
+          + "Confirm the SSH login succeeded and mosh-server started correctly "
+          + "on the remote host.]\r\n";
         try {
           bufferData(handshakeHint);
           sessionLogStreamManager.appendData(sessionId, handshakeHint);
@@ -575,7 +610,7 @@ function createMoshSessionApi(ctx) {
             exitCode,
             signal,
             reason: "error",
-            error: "Mosh handshake failed: no MOSH CONNECT from mosh-server",
+            error: "Mosh SSH startup failed: no MOSH CONNECT from mosh-server (UDP client not started)",
           });
           closeTerminalOutputSession?.(sessionId);
           sessions.delete(sessionId);
@@ -609,6 +644,9 @@ function createMoshSessionApi(ctx) {
         baseEnv: { ...buildTerminalProcessEnv(process.env), ...optionsEnv, TERM: "xterm-256color" },
         key: parsed.key,
         lang,
+        fallbackHost: parsed.host && parsed.host !== options.hostname
+          ? options.hostname
+          : undefined,
       });
       // Netcatty owns the terminal buffer. Keeping MoshCatty on the primary
       // screen preserves scrollback and lets renderer features such as keyword
@@ -637,6 +675,11 @@ function createMoshSessionApi(ctx) {
       session.proc = mcPty;
       session.pty = mcPty;
       session.moshHandshakePhase = "mosh-client";
+
+      // Establish the blank terminal baseline that mosh-client expects before
+      // its first reconstructed frame. Keep this ordered through the same
+      // output buffer as both the SSH bootstrap and Mosh client data.
+      bufferData(MOSH_HANDSHAKE_VIEWPORT_RESET);
 
       // Notify the renderer that the interactive mosh shell is ready. This is
       // distinct from the first SSH-handshake bytes (which can mark the

@@ -465,8 +465,8 @@ function createPreloadApi(ctx) {
   chmodSftp: async (sftpId, path, mode, encoding) => {
     return ipcRenderer.invoke("netcatty:sftp:chmod", { sftpId, path, mode, encoding });
   },
-  getSftpHomeDir: async (sftpId) => {
-    return ipcRenderer.invoke("netcatty:sftp:homeDir", { sftpId });
+  getSftpHomeDir: async (sftpId, encoding) => {
+    return ipcRenderer.invoke("netcatty:sftp:homeDir", { sftpId, encoding });
   },
   // Write binary with real-time progress callback
   writeSftpBinaryWithProgress: async (sftpId, path, content, transferId, encoding, onProgress, onComplete, onError) => {
@@ -1221,11 +1221,36 @@ function createPreloadApi(ctx) {
     return ipcRenderer.invoke("netcatty:ai:vault-agent:response", { requestId, result });
   },
   // SDK external agent streaming
-  aiSdkAgentStream: async (requestId, chatSessionId, sdkBackend, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext, agentEnv, agentCommand) => {
-    return ipcRenderer.invoke("netcatty:ai:sdk-agent:stream", { requestId, chatSessionId, sdkBackend, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext, agentEnv, agentCommand });
+  aiSdkAgentStream: async (requestId, chatSessionId, sdkBackend, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext, agentEnv, agentCommand, codexRuntime, permissionMode) => {
+    return ipcRenderer.invoke("netcatty:ai:sdk-agent:stream", { requestId, chatSessionId, sdkBackend, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext, agentEnv, agentCommand, codexRuntime, permissionMode });
   },
-  aiSdkAgentListModels: async (sdkBackend, cwd, providerId, chatSessionId, agentEnv, agentCommand) => {
-    return ipcRenderer.invoke("netcatty:ai:sdk-agent:list-models", { sdkBackend, cwd, providerId, chatSessionId, agentEnv, agentCommand });
+  aiSdkAgentSteer: async (requestId, chatSessionId, prompt, images, clientUserMessageId) => {
+    return ipcRenderer.invoke("netcatty:ai:sdk-agent:steer", {
+      requestId,
+      chatSessionId,
+      prompt,
+      images,
+      clientUserMessageId,
+    });
+  },
+  aiSdkAgentListModels: async (sdkBackend, cwd, providerId, chatSessionId, agentEnv, agentCommand, codexRuntime) => {
+    return ipcRenderer.invoke("netcatty:ai:sdk-agent:list-models", { sdkBackend, cwd, providerId, chatSessionId, agentEnv, agentCommand, codexRuntime });
+  },
+  codexAppServerGetStatus: async (agentCommand, agentEnv) => {
+    return ipcRenderer.invoke("netcatty:ai:codex-app-server:status", { agentCommand, agentEnv });
+  },
+  onCodexAppServerInteractionRequest: (cb) => {
+    const handler = (_event, payload) => cb(payload);
+    ipcRenderer.on("netcatty:ai:codex-app-server:interaction-request", handler);
+    return () => ipcRenderer.removeListener("netcatty:ai:codex-app-server:interaction-request", handler);
+  },
+  onCodexAppServerInteractionCleared: (cb) => {
+    const handler = (_event, payload) => cb(payload);
+    ipcRenderer.on("netcatty:ai:codex-app-server:interaction-cleared", handler);
+    return () => ipcRenderer.removeListener("netcatty:ai:codex-app-server:interaction-cleared", handler);
+  },
+  respondCodexAppServerInteraction: async (payload) => {
+    return ipcRenderer.invoke("netcatty:ai:codex-app-server:interaction-response", payload);
   },
   aiSdkAgentCancel: async (requestId, chatSessionId) => {
     return ipcRenderer.invoke("netcatty:ai:sdk-agent:cancel", { requestId, chatSessionId });
