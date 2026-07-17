@@ -272,6 +272,7 @@ function App({ settings }: { settings: SettingsState }) {
     createSerialSession,
     connectToHost,
     closeSession,
+    closeSessions,
     closeWorkspace,
     updateSessionStatus,
     updateSessionFontSize,
@@ -557,6 +558,30 @@ function App({ settings }: { settings: SettingsState }) {
     ],
   );
 
+  const handleApplyConvergentSyncPayload = useCallback(
+    (payload: SyncPayload, commitReplica: () => Promise<void>) =>
+      applyProtectedSyncPayload({
+        buildPreApplyPayload: () => buildCurrentSyncPayload(),
+        applyPayload: async () => {
+          await applySyncPayload(payload, {
+            importVaultData: importDataFromString,
+            importPortForwardingRules,
+            onSettingsApplied: settings.rehydrateAllFromStorage,
+          });
+          await commitReplica();
+        },
+        translateProtectiveBackupFailure: (message) =>
+          t('cloudSync.localBackups.protectiveBackupFailed', { message }),
+      }),
+    [
+      buildCurrentSyncPayload,
+      importDataFromString,
+      importPortForwardingRules,
+      settings.rehydrateAllFromStorage,
+      t,
+    ],
+  );
+
   // Auto-sync hook for cloud sync
   const { syncNow: handleSyncNow, emptyVaultConflict, resolveEmptyVaultConflict } = useAutoSync({
     enabled: !isPeerSessionWindow,
@@ -574,6 +599,7 @@ function App({ settings }: { settings: SettingsState }) {
     settingsVersion: settings.settingsVersion,
     startupReady: startupSyncSafetyReady,
     onApplyPayload: handleApplySyncPayload,
+    onApplyConvergentPayload: handleApplyConvergentSyncPayload,
   });
 
   const { clearAndRemoveSource, clearAndRemoveSources, unmanageSource } = useManagedSourceSync({
@@ -861,8 +887,8 @@ function App({ settings }: { settings: SettingsState }) {
   // Used by the "Close all / Close others / Close to the right" context-menu
   // actions on tabs (#748).
   const closeTabsBatch = useCallback(
-    async (targetIds: string[]) => { return closeTabsBatchImpl(() => ({ closeLogView, closeSession, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, logViews, sessions, targetIds, workspaces }), targetIds); },
-    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSession, closeLogView],
+    async (targetIds: string[]) => { return closeTabsBatchImpl(() => ({ closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, logViews, sessions, targetIds, workspaces }), targetIds); },
+    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSessions, closeLogView],
   );
 
   // Shared hotkey action handler - used by both global handler and terminal callback

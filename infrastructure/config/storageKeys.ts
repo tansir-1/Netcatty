@@ -15,6 +15,8 @@ export const STORAGE_KEY_UI_THEME_LIGHT = 'netcatty_ui_theme_light_v1';
 export const STORAGE_KEY_UI_THEME_DARK = 'netcatty_ui_theme_dark_v1';
 export const STORAGE_KEY_UI_FONT_FAMILY = 'netcatty_ui_font_family_v1';
 export const STORAGE_KEY_SYNC = 'netcatty_sync_v1';
+/** Device-local experimental convergent-sync toggle; never included in SyncPayload settings. */
+export const STORAGE_KEY_CONVERGENT_SYNC_CONFIG = 'netcatty_convergent_sync_config_v2';
 export const STORAGE_KEY_TERM_THEME = 'netcatty_term_theme_v1';
 export const STORAGE_KEY_TERM_FOLLOW_APP_THEME = 'netcatty_term_follow_app_theme_v1';
 export const STORAGE_KEY_TERM_THEME_DARK = 'netcatty_term_theme_dark_v1';
@@ -184,6 +186,8 @@ export const STORAGE_KEY_AI_EXTERNAL_MCP_ENABLED = 'netcatty_ai_external_mcp_ena
 export const STORAGE_KEY_AI_EXTERNAL_MCP_MODE = 'netcatty_ai_external_mcp_mode_v1';
 /** External MCP idle timeout in minutes (temporary mode only). */
 export const STORAGE_KEY_AI_EXTERNAL_MCP_IDLE_TIMEOUT_MINUTES = 'netcatty_ai_external_mcp_idle_timeout_minutes_v1';
+/** Idle timeout for terminal sessions opened by an AI through host_open. */
+export const STORAGE_KEY_AI_SESSION_IDLE_TIMEOUT_MINUTES = 'netcatty_ai_session_idle_timeout_minutes_v1';
 
 // SFTP Transfer Concurrency
 export const STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY = 'netcatty_sftp_transfer_concurrency_v1';

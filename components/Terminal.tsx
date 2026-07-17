@@ -166,7 +166,7 @@ import {
   resolveHibernatePreferWasmSerialize,
   resolveHibernateSkipAltScreen,
   resolveTerminalHibernateDelayMs,
-  resolveTerminalHibernateEnabled,
+  resolveTerminalHibernateEnabledForProtocol,
   resolveTerminalHibernateReplayChunkBytes,
   type TerminalHibernateWakePayload,
 } from "../domain/terminalHibernate";
@@ -194,6 +194,10 @@ import { terminalPropsAreEqual } from "./terminal/terminalMemo";
 
 const HIBERNATE_RETRY_AFTER_DRAIN_MS = 250;
 const EMPTY_CHAIN_HOSTS: Host[] = [];
+// Detect password/passphrase prompts in output so the next keystroke is treated
+// as sensitive. Hoisted to module scope + shared by the onTerminalOutput branch
+// so the pattern is compiled once and not duplicated per chunk.
+const PASSWORD_PROMPT_PATTERN = /password|passphrase|口令/i;
 
 const TerminalComponent: React.FC<TerminalProps> = ({
   host,
@@ -380,6 +384,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const wakeInProgressRef = useRef(false);
   const wakePromiseRef = useRef<Promise<boolean> | null>(null);
   const sessionRef = useRef<string | null>(null);
+  const sessionCleanupPromiseRef = useRef<Promise<void> | null>(null);
   const isBootActiveRef = useRef(false);
   const hasConnectedRef = useRef(false);
   const hasRunStartupCommandRef = useRef(false);
@@ -424,7 +429,10 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   onTerminalDataCaptureRef.current = onTerminalDataCapture;
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
-  const isRendererActive = isVisible || !resolveTerminalHibernateEnabled(terminalSettings);
+  const hibernateEnabled = resolveTerminalHibernateEnabledForProtocol(terminalSettings, host.protocol);
+  const hibernateEnabledRef = useRef(hibernateEnabled);
+  hibernateEnabledRef.current = hibernateEnabled;
+  const isRendererActive = isVisible || !hibernateEnabled;
   const isRendererActiveRef = useRef(isRendererActive);
   isRendererActiveRef.current = isRendererActive;
   const pendingOutputScrollRef = useRef(false);
@@ -1206,8 +1214,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     captureHandler(capturedSessionId, capturedData);
   }, [finalizeTerminalLogData]);
 
-  const cleanupSession = () => {
+  const cleanupSession = async () => {
     const closingSessionId = sessionRef.current;
+    sessionRef.current = null;
     disposeDataRef.current?.();
     disposeDataRef.current = null;
     disposeExitRef.current?.();
@@ -1216,7 +1225,14 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     disposeTelnetEchoModeRef.current = null;
     telnetLocalEchoRef.current = false;
 
-    if (closingSessionId) {
+    const pendingCleanup = sessionCleanupPromiseRef.current;
+    if (pendingCleanup) {
+      await pendingCleanup;
+    }
+
+    if (!closingSessionId) return;
+
+    const cleanupPromise = (async () => {
       const activeTerm = termRef.current;
       if (activeTerm) {
         releaseTerminalFlowBeforeHibernate(terminalBackend, activeTerm, closingSessionId, {
@@ -1227,12 +1243,20 @@ const TerminalComponent: React.FC<TerminalProps> = ({
         clearTerminalSessionFlowAck(closingSessionId);
       }
       try {
-        terminalBackend.closeSession(closingSessionId);
+        await terminalBackend.closeSession(closingSessionId);
       } catch (err) {
         logger.warn("Failed to close SSH session", err);
       }
+    })();
+
+    sessionCleanupPromiseRef.current = cleanupPromise;
+    try {
+      await cleanupPromise;
+    } finally {
+      if (sessionCleanupPromiseRef.current === cleanupPromise) {
+        sessionCleanupPromiseRef.current = null;
+      }
     }
-    sessionRef.current = null;
   };
 
   const disposeRuntimeOnly = () => {
@@ -1278,7 +1302,10 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       flushTerminalSessionFlowAck(closingSessionId);
       clearTerminalSessionFlowAck(closingSessionId);
       try {
-        terminalBackend.closeSession(closingSessionId);
+        const closeResult = terminalBackend.closeSession(closingSessionId);
+        void Promise.resolve(closeResult).catch((err) => {
+          logger.warn("Failed to close hibernated session", err);
+        });
       } catch (err) {
         logger.warn("Failed to close hibernated session", err);
       }
@@ -1341,7 +1368,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
         || statusRef.current !== "connected"
         || isSearchOpenRef.current
         || hibernateFileTransferActiveRef.current
-        || !resolveTerminalHibernateEnabled(terminalSettingsRef.current)
+        || !hibernateEnabledRef.current
       ) {
         return;
       }
@@ -1395,7 +1422,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       && statusRef.current === "connected"
       && !isSearchOpenRef.current
       && !hibernateFileTransferActiveRef.current
-      && resolveTerminalHibernateEnabled(terminalSettingsRef.current)
+      && hibernateEnabledRef.current
       && termRef.current === term
       && sessionRef.current === backendId
       && serializeAddonRef.current === serializeAddon
@@ -1510,7 +1537,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     suppressHostStartupCommandRef.current = false;
     clearHibernateRetry();
     clearAutoReconnect();
-    cleanupSession();
+    void cleanupSession();
     disposeRuntimeOnly();
   };
 
@@ -1605,20 +1632,15 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       scheduleAutoReconnect({ evt });
     },
     onTerminalDataCapture: handleTerminalDataCaptureOnce,
-    onTerminalOutput: onTerminalOutput
-      ? (chunk: string, meta?: TerminalSessionDataMeta) => {
-          if (/password|passphrase|口令/i.test(chunk)) {
-            passwordPromptActiveRef.current = true;
-          }
-          appendOutputTriggerOutputRef.current(chunk, meta);
-          onTerminalOutput(sessionId, chunk);
-        }
-      : (chunk: string, meta?: TerminalSessionDataMeta) => {
-          if (/password|passphrase|口令/i.test(chunk)) {
-            passwordPromptActiveRef.current = true;
-          }
-          appendOutputTriggerOutputRef.current(chunk, meta);
-        },
+    onTerminalOutput: (chunk: string, meta?: TerminalSessionDataMeta) => {
+      if (PASSWORD_PROMPT_PATTERN.test(chunk)) {
+        passwordPromptActiveRef.current = true;
+      }
+      appendOutputTriggerOutputRef.current(chunk, meta);
+      if (onTerminalOutput) {
+        onTerminalOutput(sessionId, chunk);
+      }
+    },
     onTerminalLogData: captureTerminalLogData,
     onProgrammaticCommandLogRewrite: queueProgrammaticCommandLogRewrite,
     onOsDetected,
@@ -2283,7 +2305,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     setPendingHostKeyRequestId(null);
     setError("Connection cancelled");
     setProgressLogs((prev) => [...prev, "Cancelled by user."]);
-    cleanupSession();
+    void cleanupSession();
     updateStatus("disconnected");
     setChainProgress(null);
     setTimeout(() => setIsCancelling(false), 600);
@@ -2338,7 +2360,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     setPendingHostKeyRequestId(null);
   };
 
-  const startReconnect = (mode: "manual" | "auto" = "manual") => {
+  const startReconnect = async (mode: "manual" | "auto" = "manual") => {
     if (!termRef.current && hibernatedRef.current) {
       if (reconnectWakeInFlightRef.current) return;
       const wakeForReconnect = wakeHibernatedRuntimeForReconnectRef.current;
@@ -2381,18 +2403,24 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       restoreCwdIntentRef.current = null;
       suppressHostStartupCommandRef.current = true;
     }
-    cleanupSession();
-    // closeSession wiped preload ready listeners — re-arm before startMosh so a
-    // fast handshake cannot emit netcatty:mosh:ready into an empty map.
-    prepareMoshReadySubscription();
-    const term = termRef.current;
-    // Claim a fresh retry token. If the user cancels / closes / unmounts /
-    // kicks off another retry while the chained writes below are still
-    // queued, the token will be invalidated and our callbacks will abort
-    // before opening a ghost backend session with no owning UI.
+    // Claim the retry before awaiting close. A close/cancel/unmount during the
+    // awaited backend cleanup invalidates this token and stops the continuation.
     const retryToken = Symbol("retry");
     retryTokenRef.current = retryToken;
-    const retryStillActive = () => retryTokenRef.current === retryToken && termRef.current === term;
+    const retryTokenStillCurrent = () => retryTokenRef.current === retryToken;
+
+    await cleanupSession();
+    if (!retryTokenStillCurrent()) return;
+    const term = termRef.current;
+    if (!term) return;
+    // closeSession wiped preload ready listeners; re-arm before startMosh so a
+    // fast handshake cannot emit netcatty:mosh:ready into an empty map.
+    prepareMoshReadySubscription();
+    // Keep the same retry token through the queued writes. If the user cancels /
+    // closes / unmounts / kicks off another retry while the chained writes are
+    // queued, the token is invalidated and callbacks abort before opening a
+    // ghost backend session with no owning UI.
+    const retryStillActive = () => retryTokenStillCurrent() && termRef.current === term;
 
     isBootActiveRef.current = true;
     auth.resetForRetry();
@@ -2905,7 +2933,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     getSessionConnectedRef,
     status,
     isSearchOpen,
-    hibernateEnabled: resolveTerminalHibernateEnabled(terminalSettings),
+    hibernateEnabled: hibernateEnabled,
     hibernateDelayMs: resolveTerminalHibernateDelayMs(terminalSettings),
     fileTransferActive: hibernateFileTransferActive,
     hibernatedRef,
