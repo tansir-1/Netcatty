@@ -762,6 +762,9 @@ function createPreloadApi(ctx) {
   getPortForwardStatus: async (tunnelId) => {
     return ipcRenderer.invoke("netcatty:portforward:status", { tunnelId });
   },
+  subscribePortForward: async (tunnelId) => {
+    return ipcRenderer.invoke("netcatty:portforward:subscribe", { tunnelId });
+  },
   listPortForwards: async () => {
     return ipcRenderer.invoke("netcatty:portforward:list");
   },
@@ -915,6 +918,22 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:tempdir:getPath"),
   openTempDir: () =>
     ipcRenderer.invoke("netcatty:tempdir:open"),
+  getToolOutputPersistenceStatus: () =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputPersistenceStatus"),
+  writeToolOutputTemp: (record, content) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputWrite", { record, content }),
+  restoreToolOutputTemp: (handleId, chatSessionId) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputRestore", { handleId, chatSessionId }),
+  readToolOutputTemp: (filePath, request) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputRead", { path: filePath, request }),
+  deleteToolOutputTemp: (filePath) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputDelete", { path: filePath }),
+  deleteChatToolOutputsTemp: (chatSessionId) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputDeleteSession", { chatSessionId }),
+  deleteTerminalToolOutputsTemp: (chatSessionId, terminalSessionId) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputDeleteTerminalSession", { chatSessionId, terminalSessionId }),
+  deleteTerminalToolOutputsEverywhereTemp: (terminalSessionId) =>
+    ipcRenderer.invoke("netcatty:tempdir:toolOutputDeleteTerminal", { terminalSessionId }),
 
   // Session Logs
   exportSessionLog: (payload) =>

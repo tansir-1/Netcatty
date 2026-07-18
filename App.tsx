@@ -53,7 +53,10 @@ import {
 import { getCredentialProtectionAvailability } from './infrastructure/services/credentialProtection';
 import { netcattyBridge } from './infrastructure/services/netcattyBridge';
 import { localStorageAdapter } from './infrastructure/persistence/localStorageAdapter';
-import { syncExternalMcpStartupState } from './application/state/useExternalMcpToggleState';
+import {
+  readExternalMcpFocusOnHostOpen,
+  syncExternalMcpStartupState,
+} from './application/state/useExternalMcpToggleState';
 import { useExternalMcpSessionSync } from './application/state/useExternalMcpSessionSync';
 import {
   STORAGE_KEY_DEBUG_HOTKEYS,
@@ -409,6 +412,7 @@ function App({ settings }: { settings: SettingsState }) {
     startTunnel,
     stopTunnel,
     stopRuleTunnels,
+    hasRuntimeTunnel,
   } = usePortForwardingState();
 
   // App-level External MCP session sync (before TerminalLayer lazy-mount).
@@ -624,13 +628,13 @@ function App({ settings }: { settings: SettingsState }) {
   // Window controls - must be before update toast effect which uses openSettingsWindow
   const { openSettingsWindow } = useWindowControls();
   const _handleTrayJumpToSession = useEffectEvent((sessionId: string) => { return handleTrayJumpToSessionImpl(() => ({ sessionId, sessions, setActiveTabId, setWorkspaceFocusedSession }), sessionId); });
-  const _handleTrayTogglePortForward = useEffectEvent((ruleId: string, start: boolean) => { return handleTrayTogglePortForwardImpl(() => ({ hosts, identities, keys, knownHosts: effectiveKnownHosts, portForwardingRules, resolveEffectiveHost, ruleId, start, startTunnel, stopTunnel, t, terminalSettings, toast, undefined }), ruleId, start); });
+  const _handleTrayTogglePortForward = useEffectEvent((ruleId: string, start: boolean) => { return handleTrayTogglePortForwardImpl(() => ({ hasRuntimeTunnel, hosts, identities, keys, knownHosts: effectiveKnownHosts, portForwardingRules, resolveEffectiveHost, ruleId, start, startTunnel, stopTunnel, t, terminalSettings, toast, undefined }), ruleId, start); });
   const _handleTrayPanelConnect = useEffectEvent((hostId: string) => { return handleTrayPanelConnectImpl(() => ({ addConnectionLog, connectToHost, hostId, hosts, identities, keys, resolveEffectiveHost, resolveHostAuth, systemInfoRef, t, toast }), hostId); });
   const _handleTrayPanelConnectRequest = useEffectEvent((hostId: string) => { return handleTrayPanelConnectRequestImpl(() => ({ connectNow: _handleTrayPanelConnect, hostId, isVaultInitialized, queueConnect: (queuedHostId: string) => setPendingTrayPanelConnectHostIds((prev) => [...prev, queuedHostId]) }), hostId); });
   const _handleGlobalHotkeyKeyDown = useEffectEvent((e: KeyboardEvent) => { return handleGlobalHotkeyKeyDownImpl(() => ({ HOTKEY_DEBUG, closeTabKeyStr, e, executeHotkeyAction, hotkeyScheme, keyBindings, matchesKeyBinding }), e); });
   const _handleEscapeKeyDown = useEffectEvent((e: KeyboardEvent) => { return handleEscapeKeyDownImpl(() => ({ e, isQuickSwitcherOpen, setIsQuickSwitcherOpen }), e); });
 
-  useAppStartupEffects({ dismissUpdate, enabled: !isPeerSessionWindow, groupConfigs, hosts, identities, installUpdate, isVaultInitialized, keys, knownHosts: effectiveKnownHosts, openSettingsWindow, portForwardingRules, proxyProfiles, sessions, setKeyboardInteractiveQueue, t, terminalSettings, updateState, workspaces });
+  useAppStartupEffects({ dismissUpdate, enabled: !isPeerSessionWindow, groupConfigs, hasRuntimeTunnel, hosts, identities, installUpdate, isVaultInitialized, keys, knownHosts: effectiveKnownHosts, openSettingsWindow, portForwardingRules, proxyProfiles, sessions, setKeyboardInteractiveQueue, t, terminalSettings, updateState, workspaces });
 
   useEffect(() => {
     if (isPeerSessionWindow) return;
@@ -1084,8 +1088,11 @@ function App({ settings }: { settings: SettingsState }) {
     if (!sessionId) {
       return { ok: false as const, error: `Failed to open host "${host.id}".` };
     }
-    // Surface the main window for external MCP / CLI open requests.
-    void netcattyBridge.get()?.openMainWindow?.();
+    // Surface the main window for external MCP / CLI open requests, unless the
+    // user disabled this in Settings → AI → External MCP.
+    if (readExternalMcpFocusOnHostOpen()) {
+      void netcattyBridge.get()?.openMainWindow?.();
+    }
     return { ok: true as const, sessionId, host };
   }, [handleConnectToHost]);
 
