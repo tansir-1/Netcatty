@@ -107,7 +107,7 @@ class UtilityPluginRuntime {
   }
 
   async start(runtimeConfig, options = {}) {
-    const { signal } = options;
+    const { signal, getActivationEnvironment } = options;
     this.#assertStarting(signal);
     if (!this.utilityProcess?.fork) throw new Error("Electron utility plugin runtime is unavailable");
     const entryUrl = pathToFileURL(await resolveUtilityEntrypoint(
@@ -141,7 +141,7 @@ class UtilityPluginRuntime {
     this.child.stderr?.on("data", (chunk) => this.logger.write("warn", "utility stderr", { output: String(chunk).slice(0, 8_192) }));
     this.router = new PluginRpcRouter({
       pluginId: this.plugin.id,
-      send: (message) => this.child?.postMessage(message),
+      send: (message, transfer = []) => this.child?.postMessage(message, transfer),
       requestHandlers: this.requestHandlers,
       notificationHandlers: this.notificationHandlers,
       onBeforeMessage: this.onBeforeMessage,
@@ -167,7 +167,12 @@ class UtilityPluginRuntime {
       supportedFeatures: config.supportedFeatures,
     }, { timeoutMs: PLUGIN_ACTIVATION_TIMEOUT_MS });
     this.#assertStarting(signal);
-    await this.router.request("plugin.activate", {}, { timeoutMs: PLUGIN_ACTIVATION_TIMEOUT_MS });
+    const activationEnvironment = typeof getActivationEnvironment === "function"
+      ? getActivationEnvironment()
+      : config.environment;
+    await this.router.request("plugin.activate", activationEnvironment == null
+      ? {}
+      : { environment: activationEnvironment }, { timeoutMs: PLUGIN_ACTIVATION_TIMEOUT_MS });
     this.#assertStarting(signal);
     return initialized;
   }

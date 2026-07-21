@@ -14,10 +14,12 @@ class FakePort extends EventEmitter {
   constructor() {
     super();
     this.sent = [];
+    this.transferLists = [];
   }
 
-  postMessage(message) {
+  postMessage(message, transfer = []) {
     this.sent.push(message);
+    this.transferLists.push(transfer);
     if (message.method === "plugin.initialize") {
       queueMicrotask(() => this.emit("message", { data: {
         jsonrpc: "2.0",
@@ -112,6 +114,9 @@ test("browser host waits for preload and the installed plugin RPC listener", asy
     apiVersion: "0.1.0-internal",
     supportedFeatures: [],
     enabledFeatures: [],
+    environment: { locale: "en" },
+  }, {
+    getActivationEnvironment: () => ({ locale: "zh-CN", theme: "dark" }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(processReadyCalls, 1);
@@ -126,6 +131,12 @@ test("browser host waits for preload and the installed plugin RPC listener", asy
   assert.equal(initialized.pluginId, "com.example.browser-runtime");
   assert.equal(runtime.router.onBeforeMessage, onBeforeMessage);
   assert.deepEqual(port1.sent.map((message) => message.method), ["plugin.initialize", "plugin.activate"]);
+  assert.deepEqual(port1.sent.find((message) => message.method === "plugin.activate").params, {
+    environment: { locale: "zh-CN", theme: "dark" },
+  });
+  const transferable = new ArrayBuffer(8);
+  runtime.router.send({ type: "transfer-test", transferable }, [transferable]);
+  assert.deepEqual(port1.transferLists.at(-1), [transferable]);
   assert.equal(windowOptions.webPreferences.sandbox, true);
   assert.equal(windowOptions.webPreferences.nodeIntegration, false);
   assert.equal(windowOptions.webPreferences.contextIsolation, true);

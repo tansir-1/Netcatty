@@ -72,7 +72,7 @@ class BrowserPluginRuntime {
   }
 
   async start(runtimeConfig, options = {}) {
-    const { signal } = options;
+    const { signal, getActivationEnvironment } = options;
     this.#assertStarting(signal);
     const { BrowserWindow, MessageChannelMain, session } = this.electron;
     if (!BrowserWindow || !MessageChannelMain || !session?.fromPartition) {
@@ -179,7 +179,7 @@ class BrowserPluginRuntime {
     this.port = port1;
     this.router = new PluginRpcRouter({
       pluginId: this.plugin.id,
-      send: (message) => port1.postMessage(message),
+      send: (message, transfer = []) => port1.postMessage(message, transfer),
       requestHandlers: this.requestHandlers,
       notificationHandlers: this.notificationHandlers,
       onBeforeMessage: this.onBeforeMessage,
@@ -250,7 +250,12 @@ class BrowserPluginRuntime {
       supportedFeatures: config.supportedFeatures,
     }, { timeoutMs: PLUGIN_ACTIVATION_TIMEOUT_MS });
     this.#assertStarting(signal);
-    await this.router.request("plugin.activate", {}, { timeoutMs: PLUGIN_ACTIVATION_TIMEOUT_MS });
+    const activationEnvironment = typeof getActivationEnvironment === "function"
+      ? getActivationEnvironment()
+      : config.environment;
+    await this.router.request("plugin.activate", activationEnvironment == null
+      ? {}
+      : { environment: activationEnvironment }, { timeoutMs: PLUGIN_ACTIVATION_TIMEOUT_MS });
     this.#assertStarting(signal);
     return initialized;
   }

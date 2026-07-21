@@ -711,6 +711,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           : await getAvailableAgentSocket();
       const authConfig = buildAuthHandler({
         authMethod: jump.authMethod,
+        requiresMfa: !!jump.requiresMfa,
         privateKey: connOpts.privateKey,
         password: connOpts.password,
         passphrase: connOpts.passphrase,
@@ -1340,6 +1341,17 @@ function registerWorkerHandle(ipcMain, terminalWorkerManager, channel) {
   });
 }
 
+function registerOwnedAuthResponseHandler(ipcMain, terminalWorkerManager, channel, mainProcessHandler) {
+  ipcMain.handle(channel, (event, payload) => {
+    if (mainProcessHandler.getRequests().has(payload?.requestId)) {
+      return mainProcessHandler.handleResponse(event, payload);
+    }
+    return terminalWorkerManager.request(channel, payload, {
+      webContentsId: event?.sender?.id,
+    });
+  });
+}
+
 function registerHandlers(ipcMain, options = {}) {
   const terminalWorkerManager = options.terminalWorkerManager || null;
   if (terminalWorkerManager) {
@@ -1353,10 +1365,25 @@ function registerHandlers(ipcMain, options = {}) {
       "netcatty:ssh:listdir",
       "netcatty:ssh:stats",
       "netcatty:ssh:setEncoding",
-      "netcatty:keyboard-interactive:respond",
-      "netcatty:passphrase:respond",
-      "netcatty:host-key:respond",
     ].forEach((channel) => registerWorkerHandle(ipcMain, terminalWorkerManager, channel));
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:keyboard-interactive:respond",
+      keyboardInteractiveHandler,
+    );
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:passphrase:respond",
+      passphraseHandler,
+    );
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:host-key:respond",
+      hostKeyVerifier,
+    );
     ipcMain.on("netcatty:zmodem:overwrite-response", (event, payload) => {
       terminalWorkerManager.send("netcatty:zmodem:overwrite-response", payload, {
         webContentsId: event?.sender?.id,

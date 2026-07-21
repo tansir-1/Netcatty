@@ -11,6 +11,12 @@ import { useVaultAgentBridge } from './application/state/useVaultAgentBridge';
 import { useWindowControls } from './application/state/useWindowControls';
 import { useEditorTabs } from './application/state/editorTabStore';
 import {
+  isPluginViewTabId,
+  pluginViewTabStore,
+  resolveBatchTabCloseFocus,
+  usePluginViewTabs,
+} from './application/state/pluginViewTabStore';
+import {
   clearReferenceKeyPassphrases,
   clearKeyPassphrasesByIds,
   loadDefaultKeyPassphrase,
@@ -55,6 +61,7 @@ import { netcattyBridge } from './infrastructure/services/netcattyBridge';
 import { localStorageAdapter } from './infrastructure/persistence/localStorageAdapter';
 import {
   readExternalMcpFocusOnHostOpen,
+  readExternalMcpSilentSessions,
   syncExternalMcpStartupState,
 } from './application/state/useExternalMcpToggleState';
 import { useExternalMcpSessionSync } from './application/state/useExternalMcpSessionSync';
@@ -103,6 +110,7 @@ const HOTKEY_DEBUG =
 
 function App({ settings }: { settings: SettingsState }) {
   const { t } = useI18n();
+  const pluginViewTabs = usePluginViewTabs();
 
   const [isQuickSwitcherOpen, setIsQuickSwitcherOpen] = useState(false);
   const [isCreateWorkspaceOpen, setIsCreateWorkspaceOpen] = useState(false);
@@ -237,6 +245,8 @@ function App({ settings }: { settings: SettingsState }) {
     updateGroupConfigs,
   } = useVaultState();
 
+  const hostsRef = useRef(hosts);
+  hostsRef.current = hosts;
   const keysRef = useRef(keys);
   keysRef.current = keys;
   const knownHostsRef = useRef(knownHosts);
@@ -681,10 +691,10 @@ function App({ settings }: { settings: SettingsState }) {
   }, [isVaultInitialized, pendingTrayPanelConnectHostIds]);
 
   // Handle keyboard-interactive submit
-  const handleKeyboardInteractiveSubmit = useCallback((requestId: string, responses: string[], savePassword?: string) => { return handleKeyboardInteractiveSubmitImpl(() => ({ hosts, keyboardInteractiveQueue, netcattyBridge, requestId, responses, savePassword, sessions, setKeyboardInteractiveQueue, updateHosts }), requestId, responses, savePassword); }, [keyboardInteractiveQueue, sessions, hosts, updateHosts]);
+  const handleKeyboardInteractiveSubmit = useCallback((requestId: string, responses: string[], savePassword?: string) => { return handleKeyboardInteractiveSubmitImpl(() => ({ hosts, hostsRef, keyboardInteractiveQueue, netcattyBridge, requestId, responses, savePassword, sessions, setKeyboardInteractiveQueue, t, toast, updateHosts }), requestId, responses, savePassword); }, [keyboardInteractiveQueue, sessions, hosts, t, updateHosts]);
 
   // Handle keyboard-interactive cancel
-  const handleKeyboardInteractiveCancel = useCallback((requestId: string) => { return handleKeyboardInteractiveCancelImpl(() => ({ netcattyBridge, requestId, setKeyboardInteractiveQueue }), requestId); }, []);
+  const handleKeyboardInteractiveCancel = useCallback((requestId: string) => { return handleKeyboardInteractiveCancelImpl(() => ({ netcattyBridge, requestId, setKeyboardInteractiveQueue, t, toast }), requestId); }, [t]);
 
   // Passphrase request event listener for encrypted SSH keys
   useEffect(() => {
@@ -872,11 +882,19 @@ function App({ settings }: { settings: SettingsState }) {
     () => editorTabs.map((tab) => toEditorTabId(tab.id)),
     [editorTabs],
   );
+  const pluginViewTabIds = useMemo(
+    () => pluginViewTabs.map((tab) => tab.id),
+    [pluginViewTabs],
+  );
+  const additionalWorkTabIds = useMemo(
+    () => [...editorTabTopIds, ...pluginViewTabIds],
+    [editorTabTopIds, pluginViewTabIds],
+  );
 
   // 顶层标签顺序需要包含编辑器标签，供顶部标签和编辑器邻居计算使用。
   const orderedTabsWithEditors = useMemo(
-    () => getOrderedWorkTabs(editorTabTopIds),
-    [editorTabTopIds, getOrderedWorkTabs],
+    () => getOrderedWorkTabs(additionalWorkTabIds),
+    [additionalWorkTabIds, getOrderedWorkTabs],
   );
 
   const reorderWorkTabs = useCallback((
@@ -884,19 +902,45 @@ function App({ settings }: { settings: SettingsState }) {
     targetId: string,
     position: 'before' | 'after' = 'before',
   ) => {
-    reorderTabs(draggedId, targetId, position, editorTabTopIds);
-  }, [editorTabTopIds, reorderTabs]);
+    reorderTabs(draggedId, targetId, position, additionalWorkTabIds);
+  }, [additionalWorkTabIds, reorderTabs]);
+
+  const closePluginViewTab = useCallback((tabId: string) => {
+    const index = orderedTabsWithEditors.indexOf(tabId);
+    if (activeTabStore.getActiveTabId() === tabId) {
+      const next = orderedTabsWithEditors[index - 1] ?? orderedTabsWithEditors[index + 1] ?? 'vault';
+      activeTabStore.setActiveTabId(next === tabId ? 'vault' : next);
+    }
+    pluginViewTabStore.close(tabId);
+  }, [orderedTabsWithEditors]);
 
   // Close many tabs at once with a single batched busy-shell confirmation.
   // Used by the "Close all / Close others / Close to the right" context-menu
   // actions on tabs (#748).
   const closeTabsBatch = useCallback(
-    async (targetIds: string[]) => { return closeTabsBatchImpl(() => ({ closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, logViews, sessions, targetIds, workspaces }), targetIds); },
-    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSessions, closeLogView],
+    async (targetIds: string[]) => {
+      const closingTabIds = new Set(targetIds);
+      const activeBeforeClose = activeTabStore.getActiveTabId();
+      const focusAfterClose = resolveBatchTabCloseFocus({
+        orderedTabIds: orderedTabsWithEditors,
+        closingTabIds,
+        activeTabId: activeBeforeClose,
+      });
+      const pluginIds = targetIds.filter((id) => pluginViewTabStore.getTab(id));
+      const regularIds = targetIds.filter((id) => !pluginViewTabStore.getTab(id));
+      const canClose = !regularIds.length || await closeTabsBatchImpl(
+        () => ({ closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, logViews, sessions, targetIds: regularIds, workspaces }),
+        regularIds,
+      );
+      if (!canClose) return;
+      for (const id of pluginIds) pluginViewTabStore.close(id);
+      if (closingTabIds.has(activeBeforeClose)) activeTabStore.setActiveTabId(focusAfterClose);
+    },
+    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSessions, closeLogView, orderedTabsWithEditors],
   );
 
   // Shared hotkey action handler - used by both global handler and terminal callback
-  const executeHotkeyAction = useCallback((action: string, e: KeyboardEvent) => { return executeHotkeyActionImpl(() => ({ IS_DEV, MOVE_FOCUS_DEBOUNCE_MS, action, activeTabStore, addConnectionLogRef, closeSession, closeTabInFlightRef, closeWorkspace, collectSessionIds, confirmIfBusyLocalTerminal, createLocalTerminalWithCurrentShell, e, editorTabs, fromEditorTabId, handleOpenSettingsRef, handleRequestCloseEditorTabRef, isEditorTabId, isQuickSwitcherOpen, lastMoveFocusTimeRef, moveFocusInWorkspace, orderedTabs, resolveCloseIntent, resolveSnippetsShortcutIntent, sessions, setActiveTabId, setAddToWorkspaceDialog, setIsQuickSwitcherOpen, setNavigateToSection, settings, splitSessionWithCurrentShell, systemInfoRef, toEditorTabId, toggleBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, toggleWorkspaceViewMode, workspaces }), action, e); }, [orderedTabs, editorTabs, sessions, workspaces, isQuickSwitcherOpen, setActiveTabId, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, toggleWorkspaceViewMode, settings, confirmIfBusyLocalTerminal]);
+  const executeHotkeyAction = useCallback((action: string, e: KeyboardEvent) => { return executeHotkeyActionImpl(() => ({ IS_DEV, MOVE_FOCUS_DEBOUNCE_MS, action, activeTabStore, addConnectionLogRef, closePluginViewTab, closeSession, closeTabInFlightRef, closeWorkspace, collectSessionIds, confirmIfBusyLocalTerminal, createLocalTerminalWithCurrentShell, e, editorTabs, fromEditorTabId, handleOpenSettingsRef, handleRequestCloseEditorTabRef, isEditorTabId, isPluginViewTabId, isQuickSwitcherOpen, lastMoveFocusTimeRef, moveFocusInWorkspace, orderedTabs: orderedTabsWithEditors, resolveCloseIntent, resolveSnippetsShortcutIntent, sessions, setActiveTabId, setAddToWorkspaceDialog, setIsQuickSwitcherOpen, setNavigateToSection, settings, splitSessionWithCurrentShell, systemInfoRef, toEditorTabId, toggleBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, toggleWorkspaceViewMode, workspaces }), action, e); }, [orderedTabsWithEditors, editorTabs, sessions, workspaces, isQuickSwitcherOpen, setActiveTabId, closePluginViewTab, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, toggleWorkspaceViewMode, settings, confirmIfBusyLocalTerminal]);
 
   const handleWindowCommandCloseRequest = useCallback(async () => {
     const openDialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"][data-state="open"]'));
@@ -913,6 +957,7 @@ function App({ settings }: { settings: SettingsState }) {
       sessionIds: sessions.map((session) => session.id),
       workspaceIds: workspaces.map((workspace) => workspace.id),
       logViewIds: logViews.map((logView) => logView.id),
+      pluginViewTabIds: pluginViewTabs.map((tab) => tab.id),
     });
 
     if (intent.kind === 'closeTab') {
@@ -926,7 +971,7 @@ function App({ settings }: { settings: SettingsState }) {
     }
 
     await netcattyBridge.get()?.windowClose?.();
-  }, [closeLogView, editorTabs, executeHotkeyAction, logViews, sessions, workspaces]);
+  }, [closeLogView, editorTabs, executeHotkeyAction, logViews, pluginViewTabs, sessions, workspaces]);
 
   useEffect(() => {
     const unsubscribe = netcattyBridge.get()?.onWindowCommandCloseRequested?.(() => {
@@ -994,9 +1039,6 @@ function App({ settings }: { settings: SettingsState }) {
   }, [updateKnownHosts]);
 
   // System info for connection logs
-  const hostsRef = useRef(hosts);
-  hostsRef.current = hosts;
-
   const systemInfoRef = useRef<{ username: string; hostname: string }>({
     username: 'user',
     hostname: 'localhost',
@@ -1060,7 +1102,7 @@ function App({ settings }: { settings: SettingsState }) {
   ), [createWorkspaceFromTargets, resolveEffectiveHost]);
 
   // Wrapper to connect to host with logging
-  const handleConnectToHost = useCallback((host: Host, alreadyEffective = false) => {
+  const handleConnectToHost = useCallback((host: Host, alreadyEffective = false, hidden = false) => {
     if (host.ephemeral) {
       setEphemeralHosts((previous) => {
         const existingIndex = previous.findIndex((candidate) => candidate.id === host.id);
@@ -1080,11 +1122,15 @@ function App({ settings }: { settings: SettingsState }) {
       resolveEffectiveHost: effectiveHostResolver,
       resolveHostAuth,
       systemInfoRef,
-    }), host);
+    }), host, hidden);
   }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys]);
 
-  const openHostForVaultAgent = useCallback((host: Host) => {
-    const sessionId = handleConnectToHost(host, true);
+  const openHostForVaultAgent = useCallback((host: Host, isExternalMcpCall: boolean) => {
+    // Silent sessions only apply to actual external MCP clients (chatSessionId
+    // equals the reserved external-MCP scope). The in-app Catty AI chat's
+    // host_open always opens a visible tab, as documented.
+    const hidden = isExternalMcpCall && readExternalMcpSilentSessions();
+    const sessionId = handleConnectToHost(host, true, hidden);
     if (!sessionId) {
       return { ok: false as const, error: `Failed to open host "${host.id}".` };
     }

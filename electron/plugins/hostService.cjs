@@ -6,6 +6,8 @@ const { PLUGIN_API_VERSION } = require("./constants.cjs");
 const { PluginDatabase } = require("./database.cjs");
 const { PluginCompanionSupervisor } = require("./companionSupervisor.cjs");
 const { PluginCredentialBroker, assertLeaseParams } = require("./credentialBroker.cjs");
+const { PluginContributionService } = require("./contributionService.cjs");
+const { PluginContributionIconService } = require("./contributionIconService.cjs");
 const { PluginFilesystemBroker } = require("./filesystemBroker.cjs");
 const { createDefaultPluginHostRpcRegistry } = require("./hostRpcRegistry.cjs");
 const {
@@ -19,6 +21,7 @@ const { PluginManager } = require("./pluginManager.cjs");
 const { PluginNetworkBroker } = require("./networkBroker.cjs");
 const { PluginPermissionEngine } = require("./permissionEngine.cjs");
 const { PluginProtocol } = require("./pluginProtocol.cjs");
+const { PluginViewHost } = require("./pluginViewHost.cjs");
 const {
   RuntimeSupervisor,
   assertStorageParams,
@@ -28,6 +31,7 @@ const { PluginQuotaManager } = require("./quotaManager.cjs");
 const { registerSecurePluginCapabilities } = require("./secureCapabilities.cjs");
 const { PluginSecretStore } = require("./secretStore.cjs");
 const { SecretLeaseStore } = require("./secretLease.cjs");
+const { PluginTerminalProviderService } = require("./terminalProviderService.cjs");
 
 function getElectronProcessMetrics(app, pid) {
   const metric = app.getAppMetrics?.().find((candidate) => candidate.pid === pid);
@@ -50,6 +54,12 @@ function createPluginHostService(options) {
       netcattyVersion: options.app.getVersion(),
       apiVersion: PLUGIN_API_VERSION,
       supportedFeatures: options.supportedFeatures ?? [],
+    });
+    const contributionIconService = new PluginContributionIconService({
+      database,
+      packageStore,
+      BrowserWindow: options.electron.BrowserWindow,
+      rasterizeIcon: options.rasterizeContributionIcon,
     });
     const moduleResources = options.moduleResources
       ? normalizePluginModuleResources(options.moduleResources)
@@ -101,6 +111,19 @@ function createPluginHostService(options) {
       assertStorageParams,
       database,
     });
+    const runtimeAccess = Object.freeze({
+      start: (...args) => runtimeSupervisor.start(...args),
+      request: (...args) => runtimeSupervisor.request(...args),
+      notify: (...args) => runtimeSupervisor.notify(...args),
+      getRuntimeIdentity: (...args) => runtimeSupervisor.getRuntimeIdentity(...args),
+    });
+    const contributionService = new PluginContributionService({
+      database,
+      runtimeSupervisor: runtimeAccess,
+      secretStore,
+      getLocale: options.getLocale,
+    });
+    contributionService.registerRpcCapabilities(rpcRegistry);
     registerSecurePluginCapabilities(rpcRegistry, {
       assertLeaseParams,
       companionSupervisor,
@@ -163,6 +186,7 @@ function createPluginHostService(options) {
       resolveRuntimeKind,
       resolveSecurityPrincipal: options.resolveSecurityPrincipal,
       runtimeMessageGuard,
+      getInitialEnvironment: () => contributionService.getEnvironment(),
       runtimeResourceMonitor: quotaManager,
       runtimeCleanup: async (identity) => {
         leaseStore.revokeRuntime(identity.runtimeId);
@@ -170,14 +194,31 @@ function createPluginHostService(options) {
       },
       utilityModuleMappings: options.utilityModuleMappings ?? createUtilityModuleMappings(moduleResources),
     });
+    runtimeSupervisor.onDidChangeRuntime((event) => contributionService.onRuntimeStateChanged(event));
+    const terminalProviderService = new PluginTerminalProviderService({
+      contributionService,
+      permissionEngine,
+      runtimeSupervisor,
+    });
     quotaManager.setViolationHandler((identity, error) => (
       runtimeSupervisor.enforcePolicyViolation(identity, error)
     ));
+    const viewHost = options.electron.WebContentsView && options.electron.ipcMain
+      ? new PluginViewHost({
+          electron: options.electron,
+          protocol,
+          packageStore,
+          database,
+          contributionService,
+        })
+      : null;
     const manager = new PluginManager({
       database,
       packageStore,
       runtimeSupervisor,
+      contributionService,
       beforeClose: async () => {
+        await viewHost?.shutdown();
         await companionSupervisor.shutdown();
         leaseStore.shutdown();
         permissionEngine.shutdown();
@@ -186,6 +227,8 @@ function createPluginHostService(options) {
     });
     return {
       companionSupervisor,
+      contributionIconService,
+      contributionService,
       credentialBroker,
       database,
       filesystemBroker,
@@ -201,6 +244,8 @@ function createPluginHostService(options) {
       rpcRegistry,
       runtimeSupervisor,
       secretStore,
+      terminalProviderService,
+      viewHost,
     };
   } catch (error) {
     database.close();

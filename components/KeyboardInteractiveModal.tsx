@@ -105,8 +105,8 @@ const isAPasswordPrompt = (prompt: KeyboardInteractivePrompt) => {
 
 interface KeyboardInteractiveModalProps {
   request: KeyboardInteractiveRequest | null;
-  onSubmit: (requestId: string, responses: string[], savePassword?: string) => void;
-  onCancel: (requestId: string) => void;
+  onSubmit: (requestId: string, responses: string[], savePassword?: string) => boolean | Promise<boolean>;
+  onCancel: (requestId: string) => boolean | Promise<boolean>;
 }
 
 export const KeyboardInteractiveModal: React.FC<KeyboardInteractiveModalProps> = ({
@@ -159,26 +159,37 @@ export const KeyboardInteractiveModal: React.FC<KeyboardInteractiveModalProps> =
 
   const canSavePassword = request?.allowSavePassword !== false;
 
-  const handleSubmit = useCallback(() => {
+  const handleSubmit = useCallback(async () => {
     if (!request || isSubmitting) return;
     setIsSubmitting(true);
     const passwordToSave =
       canSavePassword && savePassword && passwordPromptIndex >= 0
         ? responses[passwordPromptIndex]
         : undefined;
-    onSubmit(request.requestId, responses, passwordToSave);
+    try {
+      const submitted = await onSubmit(request.requestId, responses, passwordToSave);
+      if (!submitted) setIsSubmitting(false);
+    } catch {
+      setIsSubmitting(false);
+    }
   }, [request, responses, onSubmit, isSubmitting, savePassword, passwordPromptIndex, canSavePassword]);
 
-  const handleCancel = useCallback(() => {
-    if (!request) return;
-    onCancel(request.requestId);
-  }, [request, onCancel]);
+  const handleCancel = useCallback(async () => {
+    if (!request || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const cancelled = await onCancel(request.requestId);
+      if (!cancelled) setIsSubmitting(false);
+    } catch {
+      setIsSubmitting(false);
+    }
+  }, [request, onCancel, isSubmitting]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter" && !isSubmitting) {
         e.preventDefault();
-        handleSubmit();
+        void handleSubmit();
       }
     },
     [handleSubmit, isSubmitting]
@@ -194,8 +205,13 @@ export const KeyboardInteractiveModal: React.FC<KeyboardInteractiveModalProps> =
       : t("keyboard.interactive.desc");
 
   return (
-    <Dialog open={!!request} onOpenChange={(open) => !open && handleCancel()}>
-      <DialogContent className="sm:max-w-[425px]" hideCloseButton>
+    <Dialog open={!!request} onOpenChange={() => {/* intentionally non-dismissable */}}>
+      <DialogContent
+        className="sm:max-w-[425px]"
+        hideCloseButton
+        onInteractOutside={(e) => e.preventDefault()}
+        onEscapeKeyDown={(e) => e.preventDefault()}
+      >
         <DialogHeader>
           <div className="flex items-center gap-3 mb-2">
             <div className="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">

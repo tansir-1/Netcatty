@@ -5,6 +5,7 @@ import type {
   PluginErrorData,
   PluginErrorName,
   PluginId,
+  ProviderKind,
   PluginWireErrorCode,
   RpcErrorObject,
   SecretLeaseRef,
@@ -43,6 +44,327 @@ export interface PluginSecretStore {
   get(key: string): Promise<SecretRef | undefined>;
   set(key: string, value: string): Promise<SecretRef>;
   delete(key: string): Promise<void>;
+}
+
+export interface PluginSettingOptions {
+  readonly scopeId?: string;
+}
+
+export interface PluginSettingChangeEvent {
+  readonly settingId: string;
+  readonly scope: string;
+  readonly scopeId: string;
+  readonly source: "host" | "plugin";
+}
+
+export interface PluginSettings {
+  get<T extends JsonValue | SecretRef>(settingId: string, options?: PluginSettingOptions): Promise<T | undefined>;
+  update(settingId: string, value: JsonValue, options?: PluginSettingOptions): Promise<Readonly<{ restartRequired: boolean }>>;
+  onDidChange(listener: (event: PluginSettingChangeEvent) => void): Disposable;
+}
+
+export interface PluginCommandInvocation {
+  readonly source: "host" | "plugin" | string;
+  readonly context?: Readonly<Record<string, JsonValue>>;
+}
+
+export type PluginCommandHandler = (args: JsonValue | undefined, invocation: PluginCommandInvocation) => JsonValue | void | Promise<JsonValue | void>;
+
+export interface PluginCommands {
+  registerCommand(commandId: string, handler: PluginCommandHandler): Disposable;
+  executeCommand<T extends JsonValue = JsonValue>(commandId: string, args?: JsonValue): Promise<T>;
+}
+
+export interface PluginContextKeys {
+  set(key: string, value: JsonValue): Promise<void>;
+}
+
+export interface PluginViews {
+  onDidReceiveMessage(viewId: string, listener: (message: JsonValue) => void): Disposable;
+  postMessage(viewId: string, message: JsonValue): void;
+  getState<T extends JsonValue = JsonValue>(viewId: string, scopeId: string): Promise<T | undefined>;
+  setState(viewId: string, scopeId: string, state: JsonValue): Promise<void>;
+}
+
+export interface PluginProviderInvocation<TPayload extends JsonValue = JsonValue> {
+  readonly providerId: string;
+  readonly kind: ProviderKind;
+  readonly operation: string;
+  readonly requestId: string;
+  readonly payload: TPayload | undefined;
+  readonly deadlineMs: number | undefined;
+  readonly cancellationToken: CancellationToken;
+}
+
+export type PluginProviderHandler<
+  TPayload extends JsonValue = JsonValue,
+  TResult extends JsonValue = JsonValue,
+> = (invocation: PluginProviderInvocation<TPayload>) => TResult | void | Promise<TResult | void>;
+
+export interface PluginProviders {
+  register<K extends OrdinaryTerminalProviderKind>(
+    providerId: string,
+    kind: K,
+    handler: OrdinaryTerminalProviderHandler<K>,
+  ): Disposable;
+  register<TPayload extends JsonValue = JsonValue, TResult extends JsonValue = JsonValue>(
+    providerId: string,
+    kind: ProviderKind,
+    handler: PluginProviderHandler<TPayload, TResult>,
+  ): Disposable;
+}
+
+export interface TerminalSessionSnapshot {
+  readonly sessionId: string;
+  readonly hostId?: string;
+  readonly workspaceId?: string;
+  /** Built-in or namespaced plugin connection protocol identifier. */
+  readonly protocol: string;
+  readonly status: "connecting" | "connected" | "disconnected";
+  readonly cwd?: string;
+  readonly title?: string;
+  readonly shellType?: "posix" | "fish" | "powershell" | "cmd" | "unknown";
+  readonly cols?: number;
+  readonly rows?: number;
+  readonly alternateScreen?: boolean;
+}
+
+export interface TerminalSessionEvent {
+  readonly type:
+    | "snapshot"
+    | "created"
+    | "connected"
+    | "reconnected"
+    | "cwdChanged"
+    | "titleChanged"
+    | "resized"
+    | "alternateScreenChanged"
+    | "commandSubmitted"
+    | "commandCompleted"
+    | "disconnected"
+    | "disposed";
+  readonly session: TerminalSessionSnapshot;
+  readonly exitCode?: number;
+}
+
+export interface TerminalProviderPayload {
+  /** Immutable host snapshot bound to this exact invocation. */
+  readonly session: TerminalSessionSnapshot;
+}
+
+export interface TerminalCompletionPayload extends TerminalProviderPayload {
+  readonly input: string;
+  readonly cursor: number;
+  readonly hostOs: "linux" | "windows" | "macos";
+  readonly cwdSource: "prompt" | "fallback" | "none" | null;
+  readonly maximum: number;
+}
+
+export interface TerminalCompletionItem {
+  readonly text: string;
+  /** When supplied, it must equal text; the host always displays the inserted command. */
+  readonly displayText?: string;
+  readonly description?: string;
+  readonly score?: number;
+}
+
+export interface TerminalCompletionResult {
+  readonly items: readonly TerminalCompletionItem[];
+}
+
+export interface TerminalDecorationPayload extends TerminalProviderPayload {
+  readonly reason: string;
+}
+
+export interface TerminalDecorationRule {
+  readonly id: string;
+  readonly label: string;
+  readonly patterns: readonly string[];
+  readonly color: string;
+}
+
+export interface TerminalDecorationResult {
+  readonly rules: readonly TerminalDecorationRule[];
+}
+
+export interface TerminalTextRange {
+  readonly start: number;
+  readonly length: number;
+}
+
+export interface TerminalLinkItem extends TerminalTextRange {
+  readonly uri: string;
+  readonly label?: string;
+}
+
+export interface TerminalLineProviderPayload extends TerminalProviderPayload {
+  readonly line: string;
+  readonly bufferLineNumber: number;
+}
+
+export interface TerminalLinkResult {
+  readonly links: readonly TerminalLinkItem[];
+}
+
+export interface TerminalHoverItem extends TerminalTextRange {
+  readonly contents: string;
+}
+
+export interface TerminalHoverResult {
+  readonly hovers: readonly TerminalHoverItem[];
+}
+
+export interface TerminalMatcherLine {
+  readonly lineId: string;
+  readonly line: string;
+  readonly bufferLineNumber: number;
+}
+
+export interface TerminalMatcherPayload extends TerminalProviderPayload {
+  readonly lines: readonly TerminalMatcherLine[];
+}
+
+export interface TerminalOutputMatchItem extends TerminalTextRange {
+  /** Host-provided line identifier from the provideMatches request batch. */
+  readonly lineId: string;
+  readonly label: string;
+  readonly severity?: "info" | "warning" | "error" | "success";
+  readonly color?: string;
+}
+
+export interface TerminalMatcherResult {
+  readonly matches: readonly TerminalOutputMatchItem[];
+}
+
+export interface TerminalAnnotationItem {
+  readonly text: string;
+  readonly color?: string;
+}
+
+export interface TerminalSemanticResult {
+  readonly classification?: string;
+  readonly description?: string;
+  readonly destructive?: boolean;
+  readonly idempotent?: boolean;
+  readonly annotations?: readonly TerminalAnnotationItem[];
+}
+
+export interface TerminalSemanticPayload extends TerminalProviderPayload {
+  readonly command: string;
+}
+
+export interface TerminalPromptPayload extends TerminalProviderPayload {
+  readonly reason: "commandCompleted";
+  readonly promptLine?: string;
+  readonly bufferLineNumber?: number;
+}
+
+export interface TerminalPromptResult {
+  readonly annotations: readonly TerminalAnnotationItem[];
+}
+
+export interface TerminalBackgroundLayer {
+  readonly id: string;
+  readonly color: string;
+  /** Defaults to a host-owned safe opacity of 0.15. */
+  readonly opacity?: number;
+}
+
+export interface TerminalBackgroundResult {
+  readonly layers: readonly TerminalBackgroundLayer[];
+  /** Optional bounded host refresh cadence. The host clamps this to 250-60000 ms. */
+  readonly refreshAfterMs?: number;
+}
+
+export interface TerminalBackgroundPayload extends TerminalProviderPayload {
+  readonly reason: string;
+  readonly terminalBackground?: string;
+}
+
+export type TerminalThemeColorName =
+  | "background" | "foreground" | "cursor" | "selection"
+  | "black" | "red" | "green" | "yellow" | "blue" | "magenta" | "cyan" | "white"
+  | "brightBlack" | "brightRed" | "brightGreen" | "brightYellow"
+  | "brightBlue" | "brightMagenta" | "brightCyan" | "brightWhite";
+
+export interface TerminalThemePayload extends TerminalProviderPayload {
+  readonly reason: string;
+  readonly currentTheme: {
+    readonly type: "dark" | "light";
+    readonly colors: Readonly<Record<TerminalThemeColorName, string>>;
+  };
+}
+
+export interface TerminalThemeResult {
+  readonly colors: Readonly<Partial<Record<TerminalThemeColorName, string>>>;
+}
+
+export interface OrdinaryTerminalProviderPayloadByKind {
+  readonly "terminal.completion": TerminalCompletionPayload;
+  readonly "terminal.decoration": TerminalDecorationPayload;
+  readonly "terminal.link": TerminalLineProviderPayload;
+  readonly "terminal.hover": TerminalLineProviderPayload;
+  readonly "terminal.matcher": TerminalMatcherPayload;
+  readonly "terminal.semantic": TerminalSemanticPayload;
+  readonly "terminal.prompt": TerminalPromptPayload;
+  readonly "terminal.background": TerminalBackgroundPayload;
+  readonly "terminal.theme": TerminalThemePayload;
+}
+
+export interface OrdinaryTerminalProviderResultByKind {
+  readonly "terminal.completion": TerminalCompletionResult;
+  readonly "terminal.decoration": TerminalDecorationResult;
+  readonly "terminal.link": TerminalLinkResult;
+  readonly "terminal.hover": TerminalHoverResult;
+  readonly "terminal.matcher": TerminalMatcherResult;
+  readonly "terminal.semantic": TerminalSemanticResult;
+  readonly "terminal.prompt": TerminalPromptResult;
+  readonly "terminal.background": TerminalBackgroundResult;
+  readonly "terminal.theme": TerminalThemeResult;
+}
+
+export interface OrdinaryTerminalProviderOperationByKind {
+  readonly "terminal.completion": "provideCompletions";
+  readonly "terminal.decoration": "provideDecorations";
+  readonly "terminal.link": "provideLinks";
+  readonly "terminal.hover": "provideHovers";
+  readonly "terminal.matcher": "provideMatches";
+  readonly "terminal.semantic": "provideSemantics";
+  readonly "terminal.prompt": "provideAnnotations";
+  readonly "terminal.background": "provideBackgrounds";
+  readonly "terminal.theme": "provideTheme";
+}
+
+export type OrdinaryTerminalProviderKind = keyof OrdinaryTerminalProviderPayloadByKind;
+
+export interface OrdinaryTerminalProviderInvocation<K extends OrdinaryTerminalProviderKind> {
+  readonly providerId: string;
+  readonly kind: K;
+  readonly operation: OrdinaryTerminalProviderOperationByKind[K];
+  readonly requestId: string;
+  readonly payload: OrdinaryTerminalProviderPayloadByKind[K];
+  readonly deadlineMs: number | undefined;
+  readonly cancellationToken: CancellationToken;
+}
+
+export type OrdinaryTerminalProviderHandler<K extends OrdinaryTerminalProviderKind> = (
+  invocation: OrdinaryTerminalProviderInvocation<K>,
+) => OrdinaryTerminalProviderResultByKind[K] | Promise<OrdinaryTerminalProviderResultByKind[K]>;
+
+export interface PluginTerminalSessions {
+  onDidChange(listener: (event: TerminalSessionEvent) => void): Disposable;
+}
+
+export interface PluginEnvironmentChangeEvent {
+  readonly locale: string;
+  readonly theme: string;
+  readonly reducedMotion: boolean;
+  readonly highContrast: boolean;
+  readonly themeTokens: Readonly<Record<string, string>>;
+}
+
+export interface PluginEnvironment extends PluginEnvironmentChangeEvent {
+  onDidChange(listener: (event: PluginEnvironmentChangeEvent) => void): Disposable;
 }
 
 export interface PluginCredentialLeaseOptions {
@@ -120,6 +442,13 @@ export interface PluginContext {
   readonly enabledFeatures: ReadonlySet<FeatureId>;
   readonly subscriptions: DisposableStore;
   readonly storage: PluginKeyValueStore;
+  readonly settings: PluginSettings;
+  readonly commands: PluginCommands;
+  readonly contextKeys: PluginContextKeys;
+  readonly views: PluginViews;
+  readonly providers: PluginProviders;
+  readonly terminals: PluginTerminalSessions;
+  readonly environment: PluginEnvironment;
   readonly secrets: PluginSecretStore;
   readonly credentials: PluginCredentialBroker;
   readonly network: PluginNetworkClient;

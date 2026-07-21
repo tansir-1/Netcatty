@@ -92,9 +92,11 @@ pending quota decisions.
 ## Bidirectional invocation and validation
 
 `RuntimeSupervisor.request()`, `notify()`, and `openStream()` are the only
-general host-to-plugin entrypoints. Browser and utility runtimes implement the
-same methods over their private router. Later registries do not reach into a
-runtime window, utility process, MessagePort, or router.
+general host-to-plugin entrypoints. All three can bind work to the exact
+authorized runtime identity; streams repeat that check before opening and
+again after the runtime returns the handle. Browser and utility runtimes
+implement the same methods over their private router. Later registries do not
+reach into a runtime window, utility process, MessagePort, or router.
 
 Outgoing requests accept a method-specific result validator. Command and
 Provider adapters must validate their exact public result schema before using
@@ -206,7 +208,7 @@ new protocol route. Plugin packages still cannot add mappings themselves.
 | Phase | Stable seam available to the phase | Work owned by that phase |
 | --- | --- | --- |
 | PR 3 permissions | RPC middleware, immutable runtime identity, raw-message guard, placement/principal resolver, runtime stop events | principal-bound grants, resource canonicalization, secrets, credentials, companions, quotas (implemented) |
-| PR 4 contributions | host-to-plugin request/notify, runtime events, host module resources | activation-event policy, command/settings/view registries, UI SDK |
+| PR 4 contributions | host-to-plugin request/notify, runtime events, host module resources | implemented: lazy activation, command/settings/view registries, Context Keys, UI SDK and sandboxed views |
 | PR 5 terminal Providers | validated host requests, cancellation, lifecycle events | Provider ranking, deadlines, snapshots, built-in highlighter/autocomplete adapters |
 | PR 6 terminal pipeline | runtime identity and placement policy | direct MessagePort fast path, sensitive-input bypass, circuit breaker |
 | PR 7 connection/auth/import | requests, validated results, streams, crash containment, `CredentialRef` resolver and `SecretLease` consumer | profiles, challenges, provider lease consumption, importer transactions |
@@ -233,17 +235,16 @@ Phase 9 health checks and rollback must preserve this ordering instead of
 writing the active-version pointer directly.
 
 `plugin_kv` is runtime-owned local data and is removed by explicit uninstall.
-Phase-3 encrypted secrets, persistent grants and security audit already use
-separate non-cascade tables. Future user settings, connection profiles and CRDT
-sidecar baselines are the same user-owned class and must not be added to the
-`plugin_kv` cascade when missing plugin code must preserve user or synchronized
-data.
+Phase-3 encrypted secrets, persistent grants and security audit, plus phase-4
+settings and view state, use separate non-cascade tables. Future connection
+profiles and CRDT sidecar baselines are the same user-owned class and must not
+be added to the `plugin_kv` cascade when missing plugin code must preserve user
+or synchronized data.
 
-Activation events are declared by the public manifest, but phase 2 starts
-enabled plugins eagerly only behind the development gate. Phase 4 owns the
-switch to `onStartupFinished`, `onCommand`, `onView`, and `onProvider` lazy
-activation. It uses the existing `start()` and state-listener boundary rather
-than replacing process supervision.
+Activation events are declared by the public manifest. Phase 4 now starts only
+`onStartupFinished` plugins during contribution initialization; commands, views,
+and Providers call the existing idempotent `start()` boundary at first use.
+This implements lazy activation without replacing process supervision.
 
 ## Review checklist for changes to this boundary
 

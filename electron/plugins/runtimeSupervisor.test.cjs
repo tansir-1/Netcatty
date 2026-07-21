@@ -9,6 +9,7 @@ const test = require("node:test");
 const { PluginDatabase } = require("./database.cjs");
 const { PluginHostRpcRegistry } = require("./hostRpcRegistry.cjs");
 const { createPluginPaths } = require("./paths.cjs");
+const { RPC_ERRORS } = require("./rpcRouter.cjs");
 const { RuntimeSupervisor } = require("./runtimeSupervisor.cjs");
 const { createContainmentError } = require("./utilityPluginRuntime.cjs");
 
@@ -67,9 +68,14 @@ function createFixture(context, runtimeFactory, supervisorOptions = {}) {
 
 test("supervisor prefers the ordinary browser runtime and enforces negotiated identity", async (context) => {
   const calls = [];
+  const initialEnvironment = { locale: "en", theme: "light", reducedMotion: false, highContrast: false };
+  const activationEnvironment = { locale: "zh-CN", theme: "dark", reducedMotion: true, highContrast: true };
+  let environment = initialEnvironment;
   const fixture = createFixture(context, () => ({
-    async start(config) {
+    async start(config, options) {
       calls.push(["start", config]);
+      environment = activationEnvironment;
+      assert.deepEqual(options.getActivationEnvironment(), activationEnvironment);
       return {
         pluginId: config.pluginId,
         pluginVersion: config.pluginVersion,
@@ -78,7 +84,13 @@ test("supervisor prefers the ordinary browser runtime and enforces negotiated id
       };
     },
     async stop() { calls.push(["stop"]); },
-  }));
+  }), {
+    getInitialEnvironment(identity) {
+      assert.equal(identity.pluginId, "com.example.runtime-test");
+      assert.match(identity.runtimeId, /^[0-9a-f-]+$/u);
+      return environment;
+    },
+  });
 
   const started = await fixture.supervisor.start(fixture.manifest.id);
   assert.deepEqual(started, fixture.supervisor.getRuntimeIdentity(fixture.manifest.id));
@@ -88,6 +100,8 @@ test("supervisor prefers the ordinary browser runtime and enforces negotiated id
   assert.equal(fixture.runtimeOptions[0].plugin.manifest.main.browser, "dist/browser.js");
   assert.equal(fixture.database.getActivePlugin(fixture.manifest.id).runtime.kind, "browser");
   assert.equal(fixture.database.getActivePlugin(fixture.manifest.id).runtime.status, "running");
+  assert.deepEqual(calls[0][1].environment, initialEnvironment);
+  assert.equal(Object.isFrozen(calls[0][1].environment), true);
   await fixture.supervisor.stop(fixture.manifest.id);
   assert.deepEqual(calls.map(([kind]) => kind), ["start", "stop"]);
 });
@@ -326,14 +340,37 @@ test("supervisor exposes bounded host-to-plugin calls and rejects stale active v
     };
   });
   await fixture.supervisor.start(fixture.manifest.id);
+  const currentIdentity = fixture.supervisor.getRuntimeIdentity(fixture.manifest.id);
   assert.deepEqual(
     await fixture.supervisor.request(fixture.manifest.id, "commands.execute", { command: "run" }),
     { status: "ok" },
   );
   await fixture.supervisor.notify(fixture.manifest.id, "settings.changed", { key: "theme" });
   assert.deepEqual(
-    await fixture.supervisor.openStream(fixture.manifest.id, "provider-output", 1024),
+    await fixture.supervisor.openStream(fixture.manifest.id, "provider-output", 1024, {
+      expectedIdentity: currentIdentity,
+    }),
     { streamId: "provider-output" },
+  );
+  assert.deepEqual(calls.map(([kind]) => kind), ["request", "notify", "stream"]);
+  const staleIdentity = { ...currentIdentity, runtimeId: "runtime:stale" };
+  await assert.rejects(
+    fixture.supervisor.request(fixture.manifest.id, "provider.invoke", {}, {
+      expectedIdentity: staleIdentity,
+    }),
+    (error) => error?.code === RPC_ERRORS.unavailable,
+  );
+  await assert.rejects(
+    fixture.supervisor.notify(fixture.manifest.id, "plugin.terminal.event", {}, {
+      expectedIdentity: staleIdentity,
+    }),
+    (error) => error?.code === RPC_ERRORS.unavailable,
+  );
+  await assert.rejects(
+    fixture.supervisor.openStream(fixture.manifest.id, "stale-output", 1024, {
+      expectedIdentity: staleIdentity,
+    }),
+    (error) => error?.code === RPC_ERRORS.unavailable,
   );
   assert.deepEqual(calls.map(([kind]) => kind), ["request", "notify", "stream"]);
   await assert.rejects(
