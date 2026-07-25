@@ -321,6 +321,10 @@ function createPreloadApi(ctx) {
   resizeSession: (sessionId, cols, rows) => {
     ipcRenderer.send("netcatty:resize", { sessionId, cols, rows });
   },
+  clearSessionPtyBuffer: (sessionId) => {
+    if (!sessionId) return;
+    ipcRenderer.send("netcatty:pty:clear", { sessionId });
+  },
   setSessionFlowPaused: (sessionId, paused) => {
     ipcRenderer.send("netcatty:flow", { sessionId, paused: Boolean(paused) });
   },
@@ -328,6 +332,16 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:terminal:setFlowPausedAndWait", {
       sessionId,
       paused: Boolean(paused),
+    }),
+  acquireSessionFlowPauseLease: (sessionId) =>
+    ipcRenderer.invoke("netcatty:terminal:acquireFlowPauseLease", { sessionId }),
+  waitSessionFlowPauseLease: (sessionId, leaseId) =>
+    ipcRenderer.invoke("netcatty:terminal:waitFlowPauseLease", { sessionId, leaseId }),
+  releaseSessionFlowPauseLease: (sessionId, leaseId, options) =>
+    ipcRenderer.invoke("netcatty:terminal:releaseFlowPauseLease", {
+      sessionId,
+      leaseId,
+      keepPaused: options?.keepPaused === true,
     }),
   onTerminalOutputDrainRequest: (sessionId, cb) => {
     const listeners = ctx.terminalOutputDrainListeners;
