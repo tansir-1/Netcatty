@@ -680,6 +680,7 @@ export const zhCNCoreMessages: Messages = {
   'knownHosts.toast.scanImported': '已导入 {count} 个新主机。',
   'knownHosts.toast.scanNoNew': '没有发现新的主机。',
   'knownHosts.toast.scanFailed': '扫描系统 known_hosts 失败。',
+  'knownHosts.toast.scanFiltered': '已跳过 {count} 个公共服务主机。',
 
   // Port Forwarding
   'pf.empty.title': '配置端口转发规则',
@@ -815,6 +816,9 @@ export const zhCNCoreMessages: Messages = {
   'sftp.transfers.copyTargetPath': '复制目标路径',
   'sftp.transfers.copyTargetPathSuccess': '已复制目标路径',
   'sftp.transfers.copyTargetPathError': '无法复制目标路径',
+  'sftp.transfers.pathConflict.title': '无法开始传输',
+  'sftp.transfers.pathConflict.paused': '“{name}”已有传输任务处于暂停状态，请先继续或取消该任务。',
+  'sftp.transfers.pathConflict.inProgress': '“{name}”已有传输任务正在进行中。',
   'sftp.transferCenter.title': '文件传输',
   'sftp.transferCenter.subtitle': '统一查看所有 SFTP 连接的传输任务',
   'sftp.transferCenter.quitConfirm': '还有 {count} 个文件传输任务未完成。退出后会保留进度，下次打开时需要手动继续。确定退出吗？',

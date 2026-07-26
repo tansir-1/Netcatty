@@ -87,6 +87,7 @@ export const enVaultMessages: Messages = {
   'knownHosts.toast.scanImported': 'Imported {count} new hosts.',
   'knownHosts.toast.scanNoNew': 'No new hosts found.',
   'knownHosts.toast.scanFailed': 'Failed to scan system known_hosts.',
+  'knownHosts.toast.scanFiltered': 'Skipped {count} public service hosts.',
 
   // Port Forwarding
   'pf.empty.title': 'Set up port forwarding',
@@ -245,6 +246,9 @@ export const enVaultMessages: Messages = {
   'sftp.transfers.copyTargetPath': 'Copy target path',
   'sftp.transfers.copyTargetPathSuccess': 'Target path copied',
   'sftp.transfers.copyTargetPathError': 'Could not copy target path',
+  'sftp.transfers.pathConflict.title': 'Transfer blocked',
+  'sftp.transfers.pathConflict.paused': 'Another transfer for "{name}" is paused. Resume or cancel it first.',
+  'sftp.transfers.pathConflict.inProgress': 'Another transfer for "{name}" is already in progress.',
   'sftp.transferCenter.title': 'File Transfers',
   'sftp.transferCenter.subtitle': 'Transfers across all SFTP connections',
   'sftp.transferCenter.quitConfirm': '{count} file transfer(s) are unfinished. Progress will be saved and must be resumed manually next time. Quit anyway?',
@@ -519,6 +523,8 @@ export const enVaultMessages: Messages = {
   'selectHost.newHost': 'New Host',
   'selectHost.continue': 'Continue',
   'selectHost.continueWithCount': 'Continue ({count} selected)',
+  'selectHost.toggleGroup': 'Toggle all hosts in {name}',
+  'selectHost.toggleHost': 'Toggle {name}',
 
   // Quick Connect
   'quickConnect.knownHost.title': 'Are you sure you want to connect?',

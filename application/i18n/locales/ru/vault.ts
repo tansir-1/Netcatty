@@ -123,6 +123,7 @@ export const ruVaultMessages: Messages = {
   'knownHosts.toast.scanImported': 'Импортировано новых хостов: {count}.',
   'knownHosts.toast.scanNoNew': 'Новых хостов не найдено.',
   'knownHosts.toast.scanFailed': 'Не удалось просканировать системный known_hosts.',
+  'knownHosts.toast.scanFiltered': 'Пропущено {count} публичных серверов.',
 
   // Port Forwarding
   'pf.empty.title': 'Настройте проброс портов',
@@ -281,6 +282,9 @@ export const ruVaultMessages: Messages = {
   'sftp.transfers.copyTargetPath': 'Копировать целевой путь',
   'sftp.transfers.copyTargetPathSuccess': 'Целевой путь скопирован',
   'sftp.transfers.copyTargetPathError': 'Не удалось скопировать целевой путь',
+  'sftp.transfers.pathConflict.title': 'Передача заблокирована',
+  'sftp.transfers.pathConflict.paused': 'Другая передача «{name}» приостановлена. Сначала возобновите или отмените её.',
+  'sftp.transfers.pathConflict.inProgress': 'Другая передача «{name}» уже выполняется.',
   'sftp.transferCenter.title': 'Передача файлов',
   'sftp.transferCenter.subtitle': 'Все передачи SFTP в одном месте',
   'sftp.transferCenter.quitConfirm': 'Незавершённых передач: {count}. Прогресс будет сохранён, а после следующего запуска передачу нужно продолжить вручную. Выйти?',
@@ -555,6 +559,8 @@ export const ruVaultMessages: Messages = {
   'selectHost.newHost': 'Новый хост',
   'selectHost.continue': 'Продолжить',
   'selectHost.continueWithCount': 'Продолжить (выбрано: {count})',
+  'selectHost.toggleGroup': 'Переключить все хосты в группе {name}',
+  'selectHost.toggleHost': 'Переключить {name}',
 
   // Quick Connect
   'quickConnect.knownHost.title': 'Вы уверены, что хотите подключиться?',

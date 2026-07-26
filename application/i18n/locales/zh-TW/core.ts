@@ -680,6 +680,7 @@ export const zhTWCoreMessages: Messages = {
   'knownHosts.toast.scanImported': '已匯入 {count} 個新主機。',
   'knownHosts.toast.scanNoNew': '沒有發現新的主機。',
   'knownHosts.toast.scanFailed': '掃描系統 known_hosts 失敗。',
+  'knownHosts.toast.scanFiltered': '已跳過 {count} 個公共服務主機。',
 
   // Port Forwarding
   'pf.empty.title': '設定埠轉發規則',
@@ -815,6 +816,9 @@ export const zhTWCoreMessages: Messages = {
   'sftp.transfers.copyTargetPath': '複製目標路徑',
   'sftp.transfers.copyTargetPathSuccess': '已複製目標路徑',
   'sftp.transfers.copyTargetPathError': '無法複製目標路徑',
+  'sftp.transfers.pathConflict.title': '無法開始傳輸',
+  'sftp.transfers.pathConflict.paused': '「{name}」已有傳輸工作處於暫停狀態，請先繼續或取消該工作。',
+  'sftp.transfers.pathConflict.inProgress': '「{name}」已有傳輸工作正在進行中。',
   'sftp.transferCenter.title': '檔案傳輸',
   'sftp.transferCenter.subtitle': '統一查看所有 SFTP 連線的傳輸工作',
   'sftp.transferCenter.quitConfirm': '還有 {count} 個檔案傳輸工作未完成。結束後會保留進度，下次開啟時需要手動繼續。確定結束嗎？',
