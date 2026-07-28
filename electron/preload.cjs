@@ -8,6 +8,7 @@ const {
   createTerminalDataBacklog,
   createTerminalDataDispatcher,
   hasPluginPipelineIngress,
+  hasPluginPipelineIngressMarker,
 } = require("./preload/terminalDataBacklog.cjs");
 const {
   createTerminalOutputPortRegistry,
@@ -228,7 +229,7 @@ function scheduleMcpBufferedFlush(sessionId) {
 }
 
 function deliverTerminalData(sessionId, data, options = {}) {
-  if (!sessionId || (!data && !hasPluginPipelineIngress(options.meta))) return;
+  if (!sessionId || (!data && !hasPluginPipelineIngressMarker(options.meta))) return;
   if (closedTerminalDataSessions.has(sessionId)) return;
   if (!data) {
     _deliverToListeners(sessionId, "", options.meta);
@@ -675,6 +676,7 @@ ipcRenderer.on("netcatty:transfer:progress", (_event, payload) => {
   if (cb) {
     try {
       cb(payload.transferred, payload.totalBytes, payload.speed, {
+        phase: payload.phase,
         resumeStage: payload.resumeStage,
         checkpointBytes: payload.checkpointBytes,
         downloadCheckpointBytes: payload.downloadCheckpointBytes,

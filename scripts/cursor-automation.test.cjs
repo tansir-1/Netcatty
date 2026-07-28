@@ -1392,9 +1392,16 @@ test('isBotPrForIssue matches marker + Fixes', () => {
 test('hasProtectedChangesInSources checks commit names', () => {
   const hits = auto.hasProtectedChangesInSources({
     gitStatusPorcelain: '',
-    changedFiles: ['.github/workflows/x.yml', 'src/a.ts'],
+    changedFiles: [
+      '.github/workflows/x.yml',
+      'scripts/prepare-cursor-research-input.sh',
+      'src/a.ts',
+    ],
   });
-  assert.deepEqual(hits, ['.github/workflows/x.yml']);
+  assert.deepEqual(hits, [
+    '.github/workflows/x.yml',
+    'scripts/prepare-cursor-research-input.sh',
+  ]);
 });
 
 test('hasProtectedChangesInSources blocks electron-builder configs', () => {
@@ -1737,14 +1744,14 @@ test('every Cursor job prepares and verifies the Linux sandbox host', () => {
   }
 });
 
-test('workflow exposes a write-credential-free Cursor sandbox smoke check', () => {
+test('workflow keeps sandbox probes credential-free and runs an authenticated agent smoke', () => {
   const workflow = fs.readFileSync(
     path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
     'utf8',
   );
   assert.match(
     workflow,
-    /sandbox_smoke:\n\s+description: Verify the Cursor sandbox without repository credentials\n\s+required: false\n\s+type: boolean\n\s+default: false/,
+    /sandbox_smoke:\n\s+description: Verify the Cursor sandbox and authenticated agent\n\s+required: false\n\s+type: boolean\n\s+default: false/,
   );
   const smokeJob = workflow.match(
     /\n  sandbox_smoke:\n[\s\S]*?(?=\n  [a-zA-Z0-9_]+:\n)/,
@@ -1774,7 +1781,28 @@ test('workflow exposes a write-credential-free Cursor sandbox smoke check', () =
   assert.match(smokeJob, /touch \.cursor-runtime\/sandbox-smoke/);
   assert.match(smokeJob, /Cursor sandbox unexpectedly allowed network access/);
   assert.doesNotMatch(smokeJob, /--sandbox-policy/);
-  assert.doesNotMatch(smokeJob, /CURSOR_API_KEY|GITHUB_TOKEN|GH_TOKEN/);
+  const sandboxStep = smokeJob.match(
+    /- name: Verify Cursor sandbox[\s\S]*?(?=\n\s{6}- name:)/,
+  )?.[0] || '';
+  assert.doesNotMatch(sandboxStep, /CURSOR_API_KEY|GITHUB_TOKEN|GH_TOKEN/);
+  assert.match(
+    smokeJob,
+    /- name: Stage Cursor API key for authenticated smoke[\s\S]*?CURSOR_API_KEY: \$\{\{ secrets\.CURSOR_API_KEY \}\}/,
+  );
+  const authenticatedSmokeStep = smokeJob.match(
+    /- name: Run authenticated Cursor agent smoke[\s\S]*?(?=\n\s{6}- name:)/,
+  )?.[0] || '';
+  assert.doesNotMatch(authenticatedSmokeStep, /CURSOR_API_KEY|CURSOR_AUTH_TOKEN/);
+  assert.match(
+    authenticatedSmokeStep,
+    /"\$RUNNER_TEMP\/cursor-agent-authenticated" \\\n\s+-p --trust/,
+  );
+  assert.doesNotMatch(smokeJob, /--api-key/);
+  assert.match(smokeJob, /allow: \["Shell\(node\)"\]/);
+  assert.match(smokeJob, /CURSOR_AUTH_PROBE_OK/);
+  assert.match(smokeJob, /readdirSync\('\/proc'\)/);
+  assert.match(smokeJob, /cursor-auth-config\.\*\/cursor\/auth\.json/);
+  assert.match(smokeJob, /Scan authenticated Cursor smoke output for credential leaks/);
 });
 
 test('workflow prepares missing Cursor config on every agent path and checks it daily', () => {
@@ -1865,6 +1893,73 @@ test('normalizeExternalResearchText accepts sourced research and explicit no-op'
       },
     ),
     'RESEARCH_NOT_NEEDED: only local Netcatty behavior is involved',
+  );
+  assert.equal(
+    auto.normalizeExternalResearchText([
+      '```text',
+      'RESEARCH_NOT_NEEDED: only local Netcatty behavior is involved',
+      '```',
+    ].join('\n')),
+    'RESEARCH_NOT_NEEDED: only local Netcatty behavior is involved',
+  );
+});
+
+test('research input replaces only successfully proxied GitHub image attachments', () => {
+  const attachmentUrl =
+    'https://github.com/user-attachments/assets/4ef1f25a-934d-4537-9ec0-3a415d7e9a32';
+  const noResearchNeeded =
+    'RESEARCH_NOT_NEEDED: the report only concerns local Netcatty behavior';
+  const input = {
+    issue: {
+      body: [
+        'The reconnect prompt disappears while terminal search is open.',
+        `<img alt="Image" src="${attachmentUrl}" />`,
+      ].join('\n'),
+    },
+    comments: [
+      {
+        is_bot: false,
+        body: `${attachmentUrl},https://example.com/project/issue/42`,
+      },
+    ],
+  };
+
+  assert.deepEqual(
+    auto.extractGithubUserAttachmentAssetUrls(input),
+    [attachmentUrl],
+  );
+  for (const suffix of ['/download', '.html', '%2Fdownload', '?raw=1', '#preview']) {
+    const extendedUrl = `${attachmentUrl}${suffix}`;
+    assert.deepEqual(
+      auto.extractGithubUserAttachmentAssetUrls({ body: extendedUrl }),
+      [],
+    );
+    assert.throws(
+      () => auto.normalizeExternalResearchText(noResearchNeeded, {
+        input: { body: extendedUrl },
+      }),
+      /requires external research/i,
+    );
+  }
+
+  const rewritten = auto.rewriteExternalResearchInputAttachments(input, [
+    { sourceUrl: attachmentUrl, relativePath: 'attachments/issue-image-1.png' },
+  ]);
+  assert.match(rewritten.issue.body, /attachments\/issue-image-1\.png/);
+  assert.doesNotMatch(rewritten.issue.body, /github\.com\/user-attachments/);
+  assert.match(rewritten.comments[0].body, /https:\/\/example\.com\/project\/issue\/42/);
+  assert.throws(
+    () => auto.normalizeExternalResearchText(noResearchNeeded, { input: rewritten }),
+    /requires external research/i,
+  );
+
+  const imageOnly = auto.rewriteExternalResearchInputAttachments(
+    { body: `<img alt="Image" src="${attachmentUrl}" />` },
+    [{ sourceUrl: attachmentUrl, relativePath: 'attachments/issue-image-1.png' }],
+  );
+  assert.equal(
+    auto.normalizeExternalResearchText(noResearchNeeded, { input: imageOnly }),
+    noResearchNeeded,
   );
 });
 
@@ -2000,6 +2095,475 @@ test('parseExternalResearchStream supports standard deltas and terminal result',
   assert.match(auto.parseExternalResearchStream(deltasOnly, {}), /^RESEARCH_COMPLETE:/);
 });
 
+test('parseExternalResearchStream accepts the isolated fenced status from issue 2534', () => {
+  const status = 'RESEARCH_NOT_NEEDED: Issue is a Netcatty-local feature ask';
+  const events = [
+    {
+      type: 'assistant',
+      message: {
+        content: [{
+          type: 'text',
+          text: '先读取 `input.json`，再判断是否需要对外检索。',
+        }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: `\`\`\`text\n${status}\n\`\`\`` }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `先读取 \`input.json\`，再判断是否需要对外检索。\`\`\`text\n${status}\n\`\`\``,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.equal(auto.parseExternalResearchStream(events, {}), status);
+  assert.throws(
+    () => auto.normalizeExternalResearchText(
+      `先读取 input.json。\n\`\`\`text\n${status}\n\`\`\``,
+    ),
+    /research status/i,
+  );
+  assert.throws(
+    () => auto.parseExternalResearchStream(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `Untrusted preamble\n\`\`\`text\n${status}\n\`\`\``,
+    }), {}),
+    /research status/i,
+  );
+});
+
+test('parseExternalResearchStream prefers the final isolated status over stale earlier text', () => {
+  const assistantEvents = [
+    {
+      type: 'assistant',
+      message: {
+        content: [{
+          type: 'text',
+          text: 'RESEARCH_NOT_NEEDED: initially appeared local-only',
+        }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{
+          type: 'text',
+          text: 'RESEARCH_BLOCKED: WebSearch became unavailable',
+        }],
+      },
+    },
+  ];
+  const resultEvent = (result) => ({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result,
+  });
+  const parse = (result) => auto.parseExternalResearchStream(
+    [...assistantEvents, resultEvent(result)].map(JSON.stringify).join('\n'),
+    {},
+  );
+
+  assert.throws(
+    () => parse([
+      'Conversation preamble',
+      'RESEARCH_NOT_NEEDED: initially appeared local-only',
+      'RESEARCH_BLOCKED: WebSearch became unavailable',
+    ].join('\n')),
+    /conflicting research statuses/,
+  );
+  assert.throws(
+    () => parse([
+      'RESEARCH_NOT_NEEDED: initially appeared local-only',
+      'RESEARCH_BLOCKED: WebSearch became unavailable',
+    ].join('\n')),
+    /conflicting research statuses/,
+  );
+});
+
+test('parseExternalResearchStream falls back to a complete fenced status split across events', () => {
+  const status = 'RESEARCH_NOT_NEEDED: only local Netcatty behavior is involved';
+  const events = [
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: '```text\n' }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: `${status}\n\`\`\`` }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `Conversation preamble\n\`\`\`text\n${status}\n\`\`\``,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.equal(auto.parseExternalResearchStream(events, {}), status);
+});
+
+test('parseExternalResearchStream prefers a split final status over an earlier valid status', () => {
+  const staleStatus = 'RESEARCH_NOT_NEEDED: initially appeared local-only';
+  const finalStatus = 'RESEARCH_BLOCKED: WebSearch became unavailable';
+  const events = [
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: staleStatus }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: '```text\n' }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: `${finalStatus}\n\`\`\`` }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `${staleStatus}\n\`\`\`text\n${finalStatus}\n\`\`\``,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(events, {}),
+    /conflicting research statuses/,
+  );
+});
+
+test('parseExternalResearchStream prefers a split final fence over cumulative flushes', () => {
+  const staleStatus = 'RESEARCH_NOT_NEEDED: initially appeared local-only';
+  const finalStatus = 'RESEARCH_BLOCKED: WebSearch became unavailable';
+  const cumulative = `${staleStatus}\n\`\`\`text\n${finalStatus}\n\`\`\``;
+  const events = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: {
+        content: [{ type: 'text', text: `${staleStatus}\n` }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: {
+        content: [{ type: 'text', text: '```text\n' }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 3,
+      message: {
+        content: [{ type: 'text', text: `${finalStatus}\n\`\`\`` }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: cumulative }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: cumulative,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(events, {}),
+    /conflicting research statuses/,
+  );
+});
+
+test('parseExternalResearchStream rejects a fenced status example that conflicts with success', () => {
+  const completeStatus = [
+    'RESEARCH_COMPLETE: Cursor documentation was checked.',
+    'Sources:',
+    '- https://docs.cursor.com/en/cli/reference/output-format — official format',
+  ].join('\n');
+  const fencedExample = '```text\nRESEARCH_BLOCKED: example only\n```';
+  const cumulative = `${completeStatus}\n${fencedExample}`;
+  const events = [
+    {
+      type: 'tool_call',
+      subtype: 'completed',
+      tool_call: {
+        webFetchToolCall: {
+          args: { url: 'https://docs.cursor.com/en/cli/reference/output-format' },
+          result: { success: { content: 'Cursor output format documentation' } },
+        },
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: {
+        content: [{ type: 'text', text: `${completeStatus}\n` }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: {
+        content: [{ type: 'text', text: '```text\n' }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 3,
+      message: {
+        content: [{ type: 'text', text: 'RESEARCH_BLOCKED: example only\n```' }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: cumulative }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: cumulative,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(events, {}),
+    /conflicting research statuses/,
+  );
+});
+
+test('parseExternalResearchStream rejects conflicts across every valid candidate', () => {
+  const noOp = 'RESEARCH_NOT_NEEDED: initially appeared local-only';
+  const blocked = 'RESEARCH_BLOCKED: WebSearch became unavailable';
+  const fencedNoOp = `\`\`\`text\n${noOp}\n\`\`\``;
+  const threeWayConflict = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: { content: [{ type: 'text', text: '```text\n' }] },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: { content: [{ type: 'text', text: `${noOp}\n\`\`\`` }] },
+    },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: fencedNoOp }] },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: blocked,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(threeWayConflict, {}),
+    /conflicting research statuses/,
+  );
+
+  const fencedExample = '```text\nRESEARCH_BLOCKED: example only\n```';
+  const partialAggregate = `${noOp}\n${fencedExample}`;
+  const prefixedAggregateConflict = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: { content: [{ type: 'text', text: `${noOp}\n` }] },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: { content: [{ type: 'text', text: '```text\n' }] },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 3,
+      message: { content: [{ type: 'text', text: 'RESEARCH_BLOCKED: example only\n```' }] },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: `Conversation preamble\n${partialAggregate}` }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `Conversation preamble\n${partialAggregate}`,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(prefixedAggregateConflict, {}),
+    /conflicting research statuses/,
+  );
+
+  const quotedNoOp = 'RESEARCH_NOT_NEEDED: quoted example, not the result';
+  const sameStatusConflict = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: { content: [{ type: 'text', text: '```text\n' }] },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: { content: [{ type: 'text', text: `${quotedNoOp}\n\`\`\`` }] },
+    },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: noOp }] },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: noOp,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(sameStatusConflict, {}),
+    /conflicting research statuses/,
+  );
+});
+
+test('parseExternalResearchStream keeps a valid terminal status over assistant fragments', () => {
+  const terminalStatus = 'RESEARCH_BLOCKED: WebSearch became unavailable';
+  const staleAssistantEvents = [
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: 'RESEARCH_NOT_NEEDED: initially appeared local-only' }],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: 'Reconsidering after reading the request.' }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: terminalStatus,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.throws(
+    () => auto.parseExternalResearchStream(staleAssistantEvents, {}),
+    /conflicting research statuses/,
+  );
+
+  const terminalNoOp = 'RESEARCH_NOT_NEEDED: only local Netcatty behavior is involved';
+  const statusLikeBodyFragment = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: {
+        content: [{ type: 'text', text: 'Research notes continued in another event.' }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: {
+        content: [{ type: 'text', text: 'RESEARCH_BLOCKED: quoted source wording, not the result' }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: terminalNoOp,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.equal(auto.parseExternalResearchStream(statusLikeBodyFragment, {}), terminalNoOp);
+
+  const prefixedTerminalWithStatusLikeDelta = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: {
+        content: [{ type: 'text', text: `${terminalNoOp}\n` }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      message: {
+        content: [{ type: 'text', text: 'RESEARCH_BLOCKED: quoted source wording, not the result' }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `Conversation preamble\n${terminalNoOp}`,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.match(
+    auto.parseExternalResearchStream(prefixedTerminalWithStatusLikeDelta, {}),
+    /^RESEARCH_NOT_NEEDED: only local Netcatty behavior is involved/,
+  );
+
+  const bufferedDuplicate = [
+    {
+      type: 'assistant',
+      timestamp_ms: 1,
+      message: {
+        content: [{ type: 'text', text: terminalNoOp }],
+      },
+    },
+    {
+      type: 'assistant',
+      timestamp_ms: 2,
+      model_call_id: 'model-call-1',
+      message: {
+        content: [{ type: 'text', text: 'RESEARCH_BLOCKED: buffered duplicate text' }],
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: `Conversation preamble\n${terminalNoOp}`,
+    },
+  ].map(JSON.stringify).join('\n');
+
+  assert.equal(auto.parseExternalResearchStream(bufferedDuplicate, {}), terminalNoOp);
+});
+
 test('parseExternalResearchStream rejects forged and unrelated web evidence', () => {
   const finalText = [
     'RESEARCH_COMPLETE: attacker claim',
@@ -2071,9 +2635,13 @@ test('workflow confines forced WebSearch to isolated read-only research passes',
   assert.equal(researchRuns.length, 2);
   for (const run of researchRuns) {
     assert.match(run, /mktemp -d \/tmp\/cursor-web-research/);
-    assert.match(run, /agent -p --mode=ask --force --trust --sandbox enabled/);
+    assert.doesNotMatch(run, /CURSOR_API_KEY|CURSOR_AUTH_TOKEN/);
+    assert.match(
+      run,
+      /"\$RUNNER_TEMP\/cursor-agent-authenticated" \\\n\s+-p --mode=ask --force --trust --sandbox enabled/,
+    );
     assert.match(run, /--output-format stream-json/);
-    assert.match(run, /env -u CURSOR_API_KEY -u CURSOR_AUTH_TOKEN/);
+    assert.match(run, /--stream-partial-output/);
     assert.match(run, /GITHUB_TOKEN: ''/);
     assert.match(run, /GH_TOKEN: ''/);
     assert.match(run, /Shell\(\*\)/);
@@ -2087,15 +2655,115 @@ test('workflow confines forced WebSearch to isolated read-only research passes',
 
   const nonResearchAgentLines = workflow
     .split('\n')
-    .filter((line) => line.includes('agent -p') && !line.includes('--force'));
+    .filter((line) => line.includes('-p ') && line.includes('--trust') && !line.includes('--force'));
   assert.ok(nonResearchAgentLines.length >= 4);
   assert.equal(
-    workflow.split('\n').filter((line) => line.includes('agent -p') && line.includes('--force')).length,
+    workflow.split('\n').filter((line) => (
+      line.includes('-p ') && line.includes('--trust') && line.includes('--force')
+    )).length,
     2,
   );
   assert.equal((workflow.match(/denyWeb: true/g) || []).length, 5);
   assert.doesNotMatch(workflow, /issue-research-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/);
   assert.match(workflow, /name: issue-research-\$\{\{ github\.run_id \}\}[\s\S]*?overwrite: true/);
+});
+
+test('workflow sanitizes GitHub screenshots through pinned imgproxy before research', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
+    'utf8',
+  );
+  const attachmentProxy = fs.readFileSync(
+    path.join(__dirname, 'prepare-cursor-research-input.sh'),
+    'utf8',
+  );
+  const researchRuns = [...workflow.matchAll(
+    /- name: Research external context[\s\S]*?(?=\n\s{6}- name:)/g,
+  )].map((match) => match[0]);
+
+  assert.equal(researchRuns.length, 2);
+  assert.match(
+    workflow,
+    /CURSOR_RESEARCH_IMGPROXY_IMAGE: ghcr\.io\/imgproxy\/imgproxy@sha256:[a-f0-9]{64}/,
+  );
+  for (const run of researchRuns) {
+    assert.match(run, /"\$RUNNER_TEMP\/prepare-cursor-research-input\.sh"/);
+    assert.doesNotMatch(run, /(?:^|\s)scripts\/prepare-cursor-research-input\.sh/);
+    assert.match(run, /Read\(attachments\/\*\*\)/);
+  }
+  assert.match(
+    workflow,
+    /cp scripts\/prepare-cursor-research-input\.sh "\$RUNNER_TEMP\/prepare-cursor-research-input\.sh"/,
+  );
+  assert.match(
+    workflow,
+    /git show "FETCH_HEAD:scripts\/prepare-cursor-research-input\.sh" > "\$RUNNER_TEMP\/prepare-cursor-research-input\.sh"/,
+  );
+  assert.match(attachmentProxy, /extractGithubUserAttachmentAssetUrls/);
+  assert.match(attachmentProxy, /rewriteExternalResearchInputAttachments/);
+  assert.match(attachmentProxy, /attachment_count > 4/);
+  assert.match(
+    attachmentProxy,
+    /IMGPROXY_ALLOWED_SOURCES=https:\/\/github\.com\/user-attachments\/assets\//,
+  );
+  assert.match(attachmentProxy, /IMGPROXY_ALLOW_LOOPBACK_SOURCE_ADDRESSES=false/);
+  assert.match(attachmentProxy, /IMGPROXY_ALLOW_LINK_LOCAL_SOURCE_ADDRESSES=false/);
+  assert.match(attachmentProxy, /IMGPROXY_ALLOW_PRIVATE_SOURCE_ADDRESSES=false/);
+  assert.match(attachmentProxy, /IMGPROXY_MAX_SRC_FILE_SIZE=10485760/);
+  assert.match(attachmentProxy, /IMGPROXY_MAX_REDIRECTS=2/);
+  assert.match(attachmentProxy, /IMGPROXY_MAX_ANIMATION_FRAMES=1/);
+  assert.match(attachmentProxy, /127\.0\.0\.1:/);
+  assert.match(attachmentProxy, /attachments\/issue-image-/);
+});
+
+test('every Cursor agent invocation uses the one-shot credential descriptor bridge', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'cursor-automation.yml'),
+    'utf8',
+  );
+  const agentCalls = workflow
+    .split('\n')
+    .filter((line) => (
+      line.includes('"$RUNNER_TEMP/cursor-agent-authenticated"') && line.trimEnd().endsWith('\\')
+    ));
+
+  assert.equal(agentCalls.length, 8);
+  assert.doesNotMatch(workflow, /env -u CURSOR_API_KEY -u CURSOR_AUTH_TOKEN/);
+  assert.doesNotMatch(workflow, /agent --api-key/);
+  assert.doesNotMatch(workflow, /cursor_api_key="\$CURSOR_API_KEY"/);
+  assert.doesNotMatch(workflow, /3<<<"\$cursor_api_key"/);
+  assert.equal((workflow.match(/prepare_cursor_credential_bridge/g) || []).length, 5);
+  assert.equal((workflow.match(/run: &stage_cursor_api_key \|/g) || []).length, 1);
+  assert.equal((workflow.match(/run: \*stage_cursor_api_key/g) || []).length, 6);
+  assert.equal((workflow.match(/- name: Stage Cursor API key/g) || []).length, 7);
+  const keyedRunSteps = [...workflow.matchAll(
+    /      - name: (?:Research external context for classification|Classify with Cursor CLI|Run authenticated Cursor agent smoke|Research external context for follow-up|Review follow-up with Cursor CLI|Implement with Cursor CLI|Fix with Cursor CLI)\n[\s\S]*?(?=\n      - name:|\n  [a-zA-Z0-9_]+:)/g,
+  )].map((match) => match[0]);
+  assert.equal(keyedRunSteps.length, 7);
+  for (const step of keyedRunSteps) {
+    assert.doesNotMatch(step, /CURSOR_API_KEY|CURSOR_AUTH_TOKEN/);
+    assert.match(step, /"\$RUNNER_TEMP\/cursor-agent-authenticated"/);
+    assert.match(step, /sudo --preserve-env=HOME,RUNNER_TEMP,GITHUB_WORKSPACE/);
+  }
+  assert.match(workflow, /AGENT_CLI_CREDENTIAL_STORE=memory/);
+  assert.match(workflow, /CURSOR_INVOKED_AS=agent/);
+  assert.match(workflow, /CURSOR_TOOL_PATH="\$runner_node_dir:/);
+  assert.match(workflow, /export PATH=\$\{JSON\.stringify\(toolPath\)\}/);
+  assert.match(workflow, /"\$RUNNER_TOOL_CACHE"\/node\/\*\/bin/);
+  assert.match(workflow, /official install directory/);
+  assert.match(workflow, /CURSOR_API_KEY_FD=3/);
+  assert.match(workflow, /process\.argv\.splice\(2, 0, '--api-key', value\)/);
+  assert.match(workflow, /delete process\.env\.CURSOR_API_KEY/);
+  assert.match(workflow, /delete process\.env\.CURSOR_AUTH_TOKEN/);
+  assert.match(workflow, /delete process\.env\.NODE_OPTIONS/);
+  assert.match(workflow, /secret\.fill\(0\)/);
+  assert.match(workflow, /sudo install -o root -g root -m 0400/);
+  assert.match(workflow, /exec 3<"\$key_file"/);
+  assert.match(workflow, /rm -f "\$key_file"/);
+  assert.match(workflow, /XDG_CONFIG_HOME="\$auth_config"/);
+  assert.match(workflow, /\/usr\/bin\/setpriv --reuid/);
+  assert.match(workflow, /"\$CURSOR_AGENT_DIR\/node" --use-system-ca/);
+  assert.match(workflow, /sudo chown root:root/);
 });
 
 test('workflow denies WebSearch only after isolated research, not before it', () => {

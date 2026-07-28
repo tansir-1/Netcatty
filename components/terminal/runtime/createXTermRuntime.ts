@@ -38,6 +38,7 @@ import {
   resolveHostTerminalFontWeight,
 } from "../../../domain/terminalAppearance";
 import { resolveFontWeightBold } from "../../../lib/fontWeightAvailability";
+import { isPluginHostProtocol } from "../../../domain/pluginConnection";
 import { resolveTerminalFontFamilyId } from "../../../infrastructure/config/fonts";
 import { logger } from "../../../lib/logger";
 import { isMacPlatform } from "../../../lib/utils";
@@ -118,6 +119,7 @@ import {
 import { clearTerminalInputStateForInterrupt } from "./terminalInterruptInputState";
 import { getFlowControllerForTerm } from "./terminalSessionAttachment";
 import { createTerminalResizeScheduler } from "./terminalResizeScheduler";
+import { createTerminalLinkHandler } from "./terminalLinkHandler";
 import { writeLocalTerminalDataInOrder } from "./terminalUnfocusedRepaint";
 import {
   prioritizeTerminalInput,
@@ -158,6 +160,10 @@ type TerminalBackendApi = {
   openExternal: (url: string) => Promise<void>;
   writeToSession: (sessionId: string, data: string) => void;
   interruptSession?: (sessionId: string, trace?: NetcattyTerminalInterruptTrace) => void;
+  signalPluginConnection?: (
+    sessionId: string,
+    signal?: "interrupt" | "terminate" | "kill" | "eof" | "break",
+  ) => Promise<unknown>;
   resizeSession: (sessionId: string, cols: number, rows: number) => void;
   clearSessionPtyBuffer?: (sessionId: string) => void;
   setSessionFlowPaused?: (sessionId: string, paused: boolean) => void;
@@ -248,6 +254,7 @@ export type CreateXTermRuntimeContext = {
     ((action: string, event: KeyboardEvent) => void) | undefined
   >;
   onTerminalFontSizeChange?: (fontSize: number) => void;
+  onOpenExternalError?: (error: unknown) => void;
 
   isBroadcastEnabledRef: RefObject<boolean | undefined>;
   onBroadcastInputRef: RefObject<
@@ -457,6 +464,31 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     fontSize: effectiveFontSize,
   });
 
+  const canActivateTerminalLink = (event: MouseEvent): boolean => {
+    const currentLinkModifier = ctx.terminalSettingsRef.current?.linkModifier ?? "none";
+    switch (currentLinkModifier) {
+      case "none":
+        return true;
+      case "ctrl":
+        return event.ctrlKey;
+      case "alt":
+        return event.altKey;
+      case "meta":
+        return event.metaKey;
+    }
+    return false;
+  };
+  const terminalLinkHandler = createTerminalLinkHandler({
+    canActivate: canActivateTerminalLink,
+    openExternalAvailable: ctx.terminalBackend.openExternalAvailable,
+    openExternal: ctx.terminalBackend.openExternal,
+    confirmOscLink: (uri) => window.confirm(
+      `Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`,
+    ),
+    onError: ctx.onOpenExternalError,
+    warn: (...args) => logger.warn(...args),
+  });
+
   const term = new XTerm({
     ...performanceConfig.options,
     ...(windowsPty ? { windowsPty } : {}),
@@ -501,6 +533,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     smoothScrollDuration,
     scrollOnUserInput,
     macOptionClickForcesSelection: true,
+    linkHandler: {
+      activate: terminalLinkHandler.activateOsc,
+    },
     ...terminalAltKeyOptions(altIsMeta),
     wordSeparator,
     theme: {
@@ -758,34 +793,8 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     });
   }
 
-  const canActivateTerminalLink = (event: MouseEvent): boolean => {
-    const currentLinkModifier = ctx.terminalSettingsRef.current?.linkModifier ?? "none";
-    switch (currentLinkModifier) {
-      case "none":
-        return true;
-      case "ctrl":
-        return event.ctrlKey;
-      case "alt":
-        return event.altKey;
-      case "meta":
-        return event.metaKey;
-    }
-    return false;
-  };
-  const openTerminalLink = async (uri: string): Promise<void> => {
-    if (!/^https?:\/\//iu.test(String(uri || ""))) {
-      logger.warn("[XTerm] Refusing to open non-http(s) link:", uri);
-      return;
-    }
-
-    if (ctx.terminalBackend.openExternalAvailable()) {
-      await ctx.terminalBackend.openExternal(uri);
-    } else {
-      window.open(uri, "_blank", "noopener,noreferrer");
-    }
-  };
   const webLinksAddon = new WebLinksAddon((event, uri) => {
-    if (canActivateTerminalLink(event)) void openTerminalLink(uri);
+    terminalLinkHandler.activate(event, uri);
   });
   term.loadAddon(webLinksAddon);
   const pluginLinkProviderHost = ctx.requestPluginTerminalProviders
@@ -793,7 +802,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         term,
         request: ctx.requestPluginTerminalProviders,
         canActivate: canActivateTerminalLink,
-        openExternal: openTerminalLink,
+        openExternal: terminalLinkHandler.open,
         isProviderAvailable: ctx.isPluginTerminalProviderAvailable,
         active: ctx.statusRef.current === 'connected',
         visible: ctx.pluginProviderVisible ?? true,
@@ -1376,7 +1385,15 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         if (ctx.passwordPromptActiveRef) {
           ctx.passwordPromptActiveRef.current = false;
         }
-        if (ctx.terminalBackend.interruptSession) {
+        if (isPluginHostProtocol(ctx.host.protocol) && ctx.terminalBackend.signalPluginConnection) {
+          void ctx.terminalBackend.signalPluginConnection(id, "interrupt").catch(() => {
+            if (ctx.terminalBackend.interruptSession) {
+              ctx.terminalBackend.interruptSession(id, interruptTrace);
+            } else {
+              ctx.terminalBackend.writeToSession(id, "\x03");
+            }
+          });
+        } else if (ctx.terminalBackend.interruptSession) {
           ctx.terminalBackend.interruptSession(id, interruptTrace);
         } else {
           ctx.terminalBackend.writeToSession(id, "\x03");

@@ -76,7 +76,6 @@ test("disconnected terminal reconnects on plain Enter when input is not claimed 
       key: "Enter",
       status: "disconnected",
       hasRetryHandler: true,
-      isSearchOpen: false,
       isComposeBarOpen: false,
       needsAuth: false,
       needsHostKeyVerification: false,
@@ -91,7 +90,6 @@ test("terminal enter reconnect ignores active controls and non-disconnected stat
     key: "Enter",
     status: "disconnected" as const,
     hasRetryHandler: true,
-    isSearchOpen: false,
     isComposeBarOpen: false,
     needsAuth: false,
     needsHostKeyVerification: false,
@@ -101,7 +99,8 @@ test("terminal enter reconnect ignores active controls and non-disconnected stat
   assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, status: "connected" }), false);
   assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, key: "a" }), false);
   assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, hasRetryHandler: false }), false);
-  assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, isSearchOpen: true }), false);
+  // Open search must not globally suppress Enter reconnect / the hint (#2546).
+  assert.equal(shouldReconnectTerminalOnEnterKey({ ...base }), true);
   assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, isComposeBarOpen: true }), false);
   assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, needsAuth: true }), false);
   assert.equal(shouldReconnectTerminalOnEnterKey({ ...base, needsHostKeyVerification: true }), false);
@@ -131,6 +130,16 @@ test("terminal enter reconnect ignores interactive controls outside xterm only",
     }),
     false,
   );
+  // An open terminal search input is interactive, but disconnected Enter must
+  // still reconnect rather than find-next (#2546).
+  assert.equal(
+    shouldBlockTerminalReconnectForTarget({
+      isWithinXterm: false,
+      hasInteractiveAncestor: true,
+      isTerminalSearchInput: true,
+    }),
+    false,
+  );
 });
 
 test("terminal title formats the connection address for remote sessions", () => {
@@ -144,6 +153,11 @@ test("terminal title formats the connection address for remote sessions", () => 
     "root@10.1.2.34:2222",
   );
   assert.equal(formatTerminalTitleConnectionAddress({ protocol: "local", hostname: "localhost" }), null);
+  assert.equal(formatTerminalTitleConnectionAddress({
+    protocol: "plugin:com.example.transport.connection",
+    hostname: "com.example.transport.connection",
+    port: 22,
+  }), null);
 });
 
 test("terminal title row does not render a status dot beside the address", () => {

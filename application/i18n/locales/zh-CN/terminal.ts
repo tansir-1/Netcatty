@@ -28,6 +28,7 @@ export const zhCNTerminalMessages: Messages = {
   'terminal.progress.autoReconnectScheduled': '连接已断开，将在 {seconds} 秒后自动重连（第 {attempt} 次）。',
   'terminal.progress.autoReconnectAttempt': '正在自动重连（第 {attempt} 次）...',
   'terminal.connection.protocol.et': 'EternalTerminal',
+  'terminal.connection.protocol.plugin': '插件连接',
   'terminal.et.proxyUnsupported': 'EternalTerminal 目前不支持 Netcatty 的代理设置。请改用 SSH，或移除该主机的代理。',
   'terminal.et.multiJumpUnsupported': 'EternalTerminal 目前在 Netcatty 中最多支持一个跳板机。',
   // Command history side panel
@@ -306,7 +307,7 @@ export const zhCNTerminalMessages: Messages = {
     '当命令输出的最后一行未以换行符结束时，将识别到的 shell 提示符移动到下一行显示。',
   'settings.terminal.behavior.dynamicTabTitle': '动态标签页标题',
   'settings.terminal.behavior.dynamicTabTitle.desc':
-    '选择标签页什么时候跟随 Shell 报告的窗口标题。',
+    '选择标签页什么时候跟随 Shell 报告的窗口标题，并更新编程 CLI 图标。关闭时也会停止实时图标识别。',
   'settings.terminal.behavior.dynamicTabTitle.off': '关闭',
   'settings.terminal.behavior.dynamicTabTitle.agent': '仅 Agent',
   'settings.terminal.behavior.dynamicTabTitle.all': '全部会话',

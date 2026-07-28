@@ -35,6 +35,7 @@ const {
   createSessionTopTabDoubleClickHandler,
   formatSessionTopTabLabel,
   formatSessionTopTabTooltip,
+  resolveSessionTabCodingCliIconState,
   stopCloseButtonDoubleClickPropagation,
 } = await import("./top-tabs/TopTabItems.tsx");
 const { activeTabStore } = await import("../application/state/activeTabStore.ts");
@@ -123,17 +124,18 @@ test("top tabs keep cloud sync separate from quick controls", () => {
   assert.match(topTabsSource, /onOpenSettings=\{onOpenSettings\}/);
   assert.match(topTabsSource, /onSyncNow=\{onSyncNow\}/);
   assert.match(topTabsSource, /theme=\{theme\}/);
-  assert.match(topTabsSource, /onToggleTheme=\{onToggleTheme\}/);
+  assert.match(topTabsSource, /themePreference=\{themePreference\}/);
+  assert.match(topTabsSource, /onThemeChange=\{onThemeChange\}/);
   assert.match(topTabsSource, /externalMcpEnabled=\{externalMcpEnabled\}/);
   assert.match(topTabsSource, /windowOpacity=\{windowOpacity\}/);
   assert.match(topTabsSource, /showExternalMcpToggle=\{showExternalMcpToggle\}/);
   assert.doesNotMatch(topTabsSource, /WindowOpacityButton/);
-  assert.doesNotMatch(topTabsSource, /onClick=\{onToggleTheme\}/);
+  assert.doesNotMatch(topTabsSource, /onToggleTheme/);
   const syncButtonUsage = topTabsSource.match(/<SyncStatusButton[\s\S]*?\/>/);
   assert.ok(syncButtonUsage, 'expected a SyncStatusButton usage');
   assert.doesNotMatch(syncButtonUsage[0], /externalMcpEnabled=/);
   assert.doesNotMatch(syncButtonUsage[0], /windowOpacity=/);
-  assert.doesNotMatch(syncButtonUsage[0], /onToggleTheme=/);
+  assert.doesNotMatch(syncButtonUsage[0], /onThemeChange=/);
   const quickControlsUsage = topTabsSource.match(/<TopTabsQuickControls[\s\S]*?\/>/);
   assert.ok(quickControlsUsage, 'expected a TopTabsQuickControls usage');
   assert.match(quickControlsUsage[0], /showExternalMcpToggle=\{showExternalMcpToggle\}/);
@@ -142,13 +144,18 @@ test("top tabs keep cloud sync separate from quick controls", () => {
 
 test("quick controls panel hosts External MCP, opacity, and theme", () => {
   assert.match(topTabsQuickControlsSource, /data-section="top-tabs-quick-controls"/);
+  assert.match(topTabsQuickControlsSource, /className="w-72 p-0 app-no-drag"/);
   assert.match(topTabsQuickControlsSource, /topTabs\.controlPanel/);
   assert.doesNotMatch(topTabsQuickControlsSource, /topTabs\.controlPanel\.description/);
   assert.match(topTabsQuickControlsSource, /externalMcpEnabled/);
   assert.match(topTabsQuickControlsSource, /onToggleExternalMcp/);
   assert.match(topTabsQuickControlsSource, /windowOpacity/);
   assert.match(topTabsQuickControlsSource, /setWindowOpacity/);
-  assert.match(topTabsQuickControlsSource, /onToggleTheme/);
+  assert.match(topTabsQuickControlsSource, /themePreference/);
+  assert.match(topTabsQuickControlsSource, /onThemeChange/);
+  assert.match(topTabsQuickControlsSource, /topTabs\.controlPanel\.theme\.system/);
+  assert.match(topTabsQuickControlsSource, /aria-pressed=\{themePreference === option\.value\}/);
+  assert.match(topTabsQuickControlsSource, /onClick=\{\(\) => onThemeChange\(option\.value\)\}/);
   assert.match(topTabsQuickControlsSource, /<Plug size=\{14\}/);
   assert.match(topTabsQuickControlsSource, /OPACITY_PRESETS/);
   assert.match(topTabsQuickControlsSource, /isOpacityExpanded/);
@@ -196,6 +203,43 @@ test("SessionTabIcon checks custom host icon appearance before distro logos", ()
   assert.ok(
     topTabItemsSource.indexOf("resolveHostIconAppearance(host)") < topTabItemsSource.indexOf("getEffectiveHostDistro(host)"),
     "custom host icon should be checked before distro fallback",
+  );
+});
+
+test("disabling dynamic titles freezes a stored coding CLI icon and stops title fallback", () => {
+  assert.deepEqual(
+    resolveSessionTabCodingCliIconState({
+      codingCliProviderId: "claude",
+      dynamicTitle: "⠋ Reading files",
+    }, undefined, "off"),
+    {
+      provider: {
+        id: "claude",
+        label: "Claude Code",
+        command: "claude",
+        titleHints: ["claude code", "claude"],
+        iconKey: "claude",
+      },
+      activityPhase: "idle",
+    },
+  );
+  assert.equal(
+    resolveSessionTabCodingCliIconState({
+      dynamicTitle: "OpenAI Codex",
+    }, undefined, "off"),
+    null,
+  );
+  assert.equal(
+    resolveSessionTabCodingCliIconState({
+      startupCommand: "claude",
+    }, undefined, "off")?.provider.id,
+    "claude",
+  );
+  assert.equal(
+    resolveSessionTabCodingCliIconState({
+      dynamicTitle: "OpenAI Codex",
+    }, undefined, "agent")?.provider.id,
+    "codex",
   );
 });
 

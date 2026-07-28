@@ -11,13 +11,13 @@ import {
   shouldMarkSessionActivity,
 } from '../application/state/sessionActivity';
 import { sessionActivityStore } from '../application/state/sessionActivityStore';
-import { matchCodingCliProviderFromCommand } from '../domain/codingCliProviderMatch';
-import { createCodingCliOutputScanner, type CodingCliOutputScanner } from '../domain/codingCliOutputDetect';
-import type { CodingCliProviderId } from '../domain/codingCliProviders';
-import { inferCodingCliProviderFromTitleSignals, shouldClearCodingCliProviderForTitle } from '../domain/codingCliTitleParse';
 import { sessionCapabilitiesStore } from '../application/state/sessionCapabilitiesStore';
 import { useTerminalBackend } from '../application/state/useTerminalBackend';
+import {
+  useCodingCliSessionSignals,
+} from '../application/state/codingCliSessionSignalController';
 import { collectSessionIds } from '../domain/workspace';
+import { isPluginHostProtocol } from '../domain/pluginConnection';
 
 import { cn, normalizeLineEndings } from '../lib/utils';
 import { detectLocalOs } from '../lib/localShell';
@@ -300,99 +300,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     setTerminalCwdRevision(terminalCwdRevisionRef.current);
   }, [onUpdateSessionRestoreCwd]);
 
-  const codingCliOutputScannersRef = useRef<Map<string, CodingCliOutputScanner>>(new Map());
-  const codingCliOutputScanDisabledRef = useRef<Set<string>>(new Set());
-
-  const applySessionCodingCliProvider = useCallback((
-    sessionId: string,
-    providerId: CodingCliProviderId,
-  ) => {
-    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
-    if (!session || session.codingCliProviderId === providerId) return;
-    onUpdateSessionCodingCliProvider?.(sessionId, providerId);
-  }, [onUpdateSessionCodingCliProvider]);
-
-  const applySessionCodingCliProviderFromCommand = useCallback((
-    sessionId: string,
-    commandLine: string,
-  ) => {
-    const provider = matchCodingCliProviderFromCommand(commandLine);
-    if (provider) {
-      codingCliOutputScannersRef.current.delete(sessionId);
-      codingCliOutputScanDisabledRef.current.delete(sessionId);
-      applySessionCodingCliProvider(sessionId, provider.id);
-    }
-  }, [applySessionCodingCliProvider]);
-
-  const handleTerminalTitleChange = useCallback((sessionId: string, title: string | null) => {
-    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
-    if (!session) return;
-    const dynamicTabTitleMode = terminalSettings?.dynamicTabTitleMode ?? 'agent';
-
-    const trimmedTitle = title?.trim();
-    const providerId = trimmedTitle
-      ? inferCodingCliProviderFromTitleSignals(trimmedTitle)
-      : undefined;
-    const shouldStoreDynamicTitle =
-      dynamicTabTitleMode === 'all' ||
-      (
-        dynamicTabTitleMode === 'agent' &&
-        Boolean(session.codingCliProviderId || providerId)
-      );
-    onUpdateSessionDynamicTitle?.(sessionId, shouldStoreDynamicTitle ? title : null);
-
-    if (!trimmedTitle) {
-      if (session.codingCliProviderId) {
-        codingCliOutputScannersRef.current.delete(sessionId);
-        codingCliOutputScanDisabledRef.current.delete(sessionId);
-        onUpdateSessionCodingCliProvider?.(sessionId, null);
-      }
-      return;
-    }
-
-    if (providerId && dynamicTabTitleMode !== 'off') {
-      if (!session.codingCliProviderId || session.codingCliProviderId !== providerId) {
-        codingCliOutputScannersRef.current.delete(sessionId);
-        codingCliOutputScanDisabledRef.current.delete(sessionId);
-        applySessionCodingCliProvider(sessionId, providerId);
-      }
-      return;
-    }
-
-    if (
-      session.codingCliProviderId
-      && shouldClearCodingCliProviderForTitle(trimmedTitle, session.codingCliProviderId)
-    ) {
-      codingCliOutputScannersRef.current.delete(sessionId);
-      codingCliOutputScanDisabledRef.current.delete(sessionId);
-      onUpdateSessionCodingCliProvider?.(sessionId, null);
-    }
-  }, [applySessionCodingCliProvider, onUpdateSessionCodingCliProvider, onUpdateSessionDynamicTitle, terminalSettings?.dynamicTabTitleMode]);
-
-  const handleTerminalOutput = useCallback((sessionId: string, chunk: string) => {
-    if (!chunk || codingCliOutputScanDisabledRef.current.has(sessionId)) return;
-
-    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
-    if (session?.codingCliProviderId) return;
-
-    let scanner = codingCliOutputScannersRef.current.get(sessionId);
-    if (!scanner) {
-      scanner = createCodingCliOutputScanner();
-      codingCliOutputScannersRef.current.set(sessionId, scanner);
-    }
-
-    const providerId = scanner.feed(chunk);
-    if (providerId) {
-      applySessionCodingCliProvider(sessionId, providerId);
-      return;
-    }
-
-    if (scanner.isExhausted()) {
-      codingCliOutputScannersRef.current.delete(sessionId);
-      codingCliOutputScanDisabledRef.current.delete(sessionId);
-      codingCliOutputScanDisabledRef.current.add(sessionId);
-    }
-  }, [applySessionCodingCliProvider]);
+  const codingCliSignalController = useCodingCliSessionSignals({
+    dynamicTabTitleMode: terminalSettings?.dynamicTabTitleMode ?? 'agent',
+    sessionIds: sessions.map((session) => session.id),
+    getSession: (sessionId) => sessionsRef.current.find((candidate) => candidate.id === sessionId),
+    onUpdateSessionCodingCliProvider,
+    onUpdateSessionDynamicTitle,
+  });
+  const handleTerminalTitleChange = codingCliSignalController.handleTerminalTitleChange;
+  const handleTerminalOutput = codingCliSignalController.handleTerminalOutput;
 
   const handleTerminalBell = useCallback((sessionId: string) => {
     const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
@@ -403,11 +319,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   // Stable callback references for Terminal components
   const handleCloseSession = useCallback((sessionId: string) => {
-    codingCliOutputScannersRef.current.delete(sessionId);
-    codingCliOutputScanDisabledRef.current.delete(sessionId);
+    codingCliSignalController.forgetSession(sessionId);
     sessionCapabilitiesStore.delete(sessionId);
     onCloseSession(sessionId);
-  }, [onCloseSession]);
+  }, [codingCliSignalController, onCloseSession]);
 
   const sftpAutoOpenSidebarRef = useRef(sftpAutoOpenSidebar);
   sftpAutoOpenSidebarRef.current = sftpAutoOpenSidebar;
@@ -491,11 +406,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       terminalSettings?.autoCloseOnExit ?? true,
     );
     if (intent.kind === "closeSession") {
-      onCloseSession(sessionId);
+      handleCloseSession(sessionId);
     } else {
       onUpdateSessionStatus(sessionId, 'disconnected');
     }
-  }, [onCloseSession, onUpdateSessionStatus, terminalSettings?.autoCloseOnExit]);
+  }, [handleCloseSession, onUpdateSessionStatus, terminalSettings?.autoCloseOnExit]);
 
   const handleOsDetected = useCallback((hostId: string, distro: string) => {
     onUpdateHostDistro(hostId, distro);
@@ -959,6 +874,16 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       }
 
       const lineDelayMs = options?.lineDelayMs;
+      if (data === "\x03"
+        && isPluginHostProtocol(session.protocol)
+        && terminalBackend.signalPluginConnection) {
+        broadcastInterruptPrioritizersRef.current.get(session.id)?.();
+        void terminalBackend.signalPluginConnection(session.id, "interrupt").catch(() => {
+          terminalBackend.interruptSession(session.id);
+        });
+        deliveredSessionIds.push(session.id);
+        continue;
+      }
       if (data === "\x03" && terminalBackend.interruptSession) {
         broadcastInterruptPrioritizersRef.current.get(session.id)?.();
         terminalBackend.interruptSession(session.id);
@@ -976,7 +901,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [terminalBackend]);
 
   const handleCommandSubmitted = useCallback((command: string, _hostId: string, _hostLabel: string, sessionId: string) => {
-    applySessionCodingCliProviderFromCommand(sessionId, command);
+    codingCliSignalController.handleCommandSubmitted(sessionId, command);
 
     const tabId = activeTabIdRef.current;
     const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
@@ -1022,7 +947,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       },
     });
     cwdProbeCancelersRef.current.set(sessionId, cancelProbe);
-  }, [applySessionCodingCliProviderFromCommand, handleTerminalCwdChange, restoreTerminalCwd, terminalBackend]);
+  }, [codingCliSignalController, handleTerminalCwdChange, restoreTerminalCwd, terminalBackend]);
 
   const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
     onCommandExecuted?.(command, hostId, hostLabel, sessionId);
@@ -1609,7 +1534,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   const handleRunScriptFromPanel = useCallback(async (snippet: Snippet) => {
     const sessionId = getActiveTerminalSessionId();
-    if (!sessionId) return;
+    if (!sessionId) {
+      toast.error(t('scripts.recording.noSession'));
+      return;
+    }
     try {
       await runAutomationScript({
         snippet,
@@ -1622,15 +1550,77 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
   }, [getActiveTerminalSessionId, hosts, t]);
 
+  const sendCommandSnippetToSession = useCallback(async (
+    sessionId: string,
+    command: string,
+    snippet: Snippet,
+    options?: { focus?: boolean },
+  ): Promise<boolean> => {
+    // Never inject into a peer tab sitting on a password/sensitive prompt.
+    if (isTerminalSensitiveInputActive(sessionId)) return false;
+
+    const executor = snippetExecutorsRef.current.get(sessionId);
+    if (executor) {
+      // Executor may wake a hibernated pane first so bracketed-paste mode and
+      // encoding match the normal single-pane path.
+      const wrote = await executor(command, snippet.noAutoRun, {
+        multiLineRunMode: snippet.multiLineRunMode,
+        broadcast: false,
+        // Multi-tab fan-out must not call term.focus() on every peer.
+        focus: options?.focus !== false,
+      });
+      // Wake can surface a password prompt from buffered output — recheck.
+      if (isTerminalSensitiveInputActive(sessionId)) return false;
+      if (wrote) return true;
+    }
+
+    // Recheck before last-resort backend write as well.
+    if (isTerminalSensitiveInputActive(sessionId)) return false;
+
+    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
+    if (!session || !canUseDirectSessionWriteFallback(session)) return false;
+
+    // Last-resort fallback when the executor could not write (rare). Prefer the
+    // executor path so terminal modes (bracketed paste) stay authoritative.
+    // Do not invent bracketed-paste markers without live term.modes.
+    let data = normalizeLineEndings(command);
+    const lineDelayMs = shouldDelayAutoRunSnippetInput(data, {
+      noAutoRun: snippet.noAutoRun,
+      multiLineRunMode: snippet.multiLineRunMode,
+    })
+      ? AUTO_RUN_SNIPPET_LINE_DELAY_MS
+      : undefined;
+    if (!snippet.noAutoRun) data = `${data}\r`;
+    terminalBackend.writeToSession(sessionId, data, {
+      automated: true,
+      sensitive: false,
+      ...(lineDelayMs ? { lineDelayMs } : {}),
+    });
+    return true;
+  }, [terminalBackend]);
+
   const handleRunScriptOnWorkspace = useCallback(async (
     snippet: Snippet,
     mode: 'sequential' | 'parallel' = 'parallel',
   ) => {
     const workspace = activeWorkspaceRef.current;
     if (!workspace) {
+      // Single terminal tab (no workspace): fall back to focused session.
       const sessionId = getActiveTerminalSessionId();
       if (!sessionId) {
         toast.error(t('scripts.recording.noSession'));
+        return;
+      }
+      if (isTerminalSensitiveInputActive(sessionId)) {
+        toast.info(t('scripts.actions.skippedSensitiveSessions', { count: 1 }));
+        return;
+      }
+      if (!isScriptSnippet(snippet)) {
+        const command = await resolveSnippetCommand(snippet);
+        if (command === null) return;
+        handleSnippetClickForFocusedSession(command, snippet.noAutoRun, {
+          multiLineRunMode: snippet.multiLineRunMode,
+        });
         return;
       }
       try {
@@ -1661,6 +1651,47 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (skippedConnecting > 0) {
       toast.info(t('scripts.actions.skippedConnectingSessions', { count: skippedConnecting }));
     }
+
+    // Code snippets: paste/send the resolved command to every connected tab.
+    // Sequential vs parallel only affects automation scripts (which await run
+    // completion); plain snippets are fire-and-forget writes.
+    if (!isScriptSnippet(snippet)) {
+      const command = await resolveSnippetCommand(snippet);
+      if (command === null) return;
+      const focusedBefore = workspace.focusedSessionId
+        ?? getActiveTerminalSessionId()
+        ?? null;
+      let sent = 0;
+      let skippedSensitive = 0;
+      for (const sid of sessionIds) {
+        if (isTerminalSensitiveInputActive(sid)) {
+          skippedSensitive += 1;
+          continue;
+        }
+        // Never steal focus from peer panes during fan-out; restore below.
+        if (await sendCommandSnippetToSession(sid, command, snippet, { focus: false })) sent += 1;
+      }
+      if (skippedSensitive > 0) {
+        toast.info(t('scripts.actions.skippedSensitiveSessions', { count: skippedSensitive }));
+      }
+      if (sent === 0 && skippedSensitive === 0) {
+        toast.error(t('scripts.recording.noSession'));
+      } else if (focusedBefore) {
+        focusTerminalSessionInput(focusedBefore);
+      }
+      return;
+    }
+
+    const runnableSessionIds = sessionIds.filter((sid) => !isTerminalSensitiveInputActive(sid));
+    const skippedSensitive = sessionIds.length - runnableSessionIds.length;
+    if (skippedSensitive > 0) {
+      toast.info(t('scripts.actions.skippedSensitiveSessions', { count: skippedSensitive }));
+    }
+    if (runnableSessionIds.length === 0) {
+      // Connected sessions all sensitive — do not claim "no session".
+      return;
+    }
+
     try {
       const runOnSession = (sid: string) => runAutomationScript({
         snippet,
@@ -1668,18 +1699,18 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         sessionMeta: buildScriptSessionMeta(sid, sessionsRef.current, hosts),
       });
       if (mode === 'sequential') {
-        for (const sid of sessionIds) {
+        for (const sid of runnableSessionIds) {
           const { runId } = await runOnSession(sid);
           await waitForScriptRun(runId);
         }
       } else {
-        await Promise.all(sessionIds.map((sid) => runOnSession(sid)));
+        await Promise.all(runnableSessionIds.map((sid) => runOnSession(sid)));
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error(message.includes('Observer mode') ? t('scripts.observer.blocked') : message);
     }
-  }, [getActiveTerminalSessionId, hosts, t]);
+  }, [getActiveTerminalSessionId, handleSnippetClickForFocusedSession, hosts, sendCommandSnippetToSession, t]);
 
   useEffect(() => {
     const handler = (event: Event) => {

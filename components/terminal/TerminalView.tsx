@@ -5,6 +5,7 @@ import { ChevronsLeft, GripVertical, X as XIcon } from 'lucide-react';
 import { shouldKeepTerminalBackgroundWorkActive } from '../../domain/terminalHibernate';
 import { resolveEffectiveTerminalProtocol } from '../../domain/terminalProtocol';
 import { classifyDistroId } from '../../domain/host';
+import { isPluginHostProtocol } from '../../domain/pluginConnection';
 import { OSC7_SETUP_TARGETS } from './osc7Setup';
 import PasswordCredentialPicker from './PasswordCredentialPicker';
 import { TerminalServerStats } from './TerminalServerStats';
@@ -81,7 +82,6 @@ export function shouldReconnectTerminalOnEnterKey({
   key,
   status,
   hasRetryHandler,
-  isSearchOpen,
   isComposeBarOpen,
   needsAuth,
   needsHostKeyVerification,
@@ -95,7 +95,6 @@ export function shouldReconnectTerminalOnEnterKey({
   key: string;
   status?: string;
   hasRetryHandler: boolean;
-  isSearchOpen: boolean;
   isComposeBarOpen: boolean;
   needsAuth: boolean;
   needsHostKeyVerification: boolean;
@@ -106,10 +105,14 @@ export function shouldReconnectTerminalOnEnterKey({
   shiftKey?: boolean;
   isComposing?: boolean;
 }): boolean {
+  // Search-bar open state is intentionally not a global gate. While disconnected,
+  // find-next is less useful than reconnect; the capture handler still refuses
+  // Enter only when a real interactive control outside xterm owns the event
+  // (compose/auth/buttons). The terminal search input is allow-listed so an open
+  // search bar cannot hide the hint or swallow reconnect (#2544 / #2546).
   return key === "Enter"
     && status === "disconnected"
     && hasRetryHandler
-    && !isSearchOpen
     && !isComposeBarOpen
     && !needsAuth
     && !needsHostKeyVerification
@@ -124,10 +127,14 @@ export function shouldReconnectTerminalOnEnterKey({
 export function shouldBlockTerminalReconnectForTarget({
   isWithinXterm,
   hasInteractiveAncestor,
+  isTerminalSearchInput = false,
 }: {
   isWithinXterm: boolean;
   hasInteractiveAncestor: boolean;
+  /** Open search may keep focus; disconnected Enter reconnect must still win. */
+  isTerminalSearchInput?: boolean;
 }): boolean {
+  if (isTerminalSearchInput) return false;
   return !isWithinXterm && hasInteractiveAncestor;
 }
 
@@ -136,6 +143,7 @@ function isTerminalReconnectControlTarget(target: EventTarget | null): boolean {
   return shouldBlockTerminalReconnectForTarget({
     isWithinXterm: target.classList.contains("xterm-helper-textarea") || Boolean(target.closest(".xterm")),
     hasInteractiveAncestor: Boolean(target.closest("button, a, input, textarea, select, [contenteditable='true'], [role='button'], [role='menuitem'], [role='textbox']")),
+    isTerminalSearchInput: Boolean(target.closest("[data-terminal-search-input]")),
   });
 }
 
@@ -148,7 +156,8 @@ type TerminalTitleAddressHost = {
 };
 
 export function formatTerminalTitleConnectionAddress(host?: TerminalTitleAddressHost): string | null {
-  if (!host || host.protocol === 'local' || host.id?.startsWith('local-') || !host.hostname || host.hostname === 'localhost') {
+  if (!host || host.protocol === 'local' || isPluginHostProtocol(host.protocol)
+    || host.id?.startsWith('local-') || !host.hostname || host.hostname === 'localhost') {
     return null;
   }
   const isSerial = host.protocol === 'serial' || host.id?.startsWith('serial-');
@@ -215,7 +224,7 @@ function terminalViewCtxEqual(
 }
 
 function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
-  const { Activity, Button, Clock3, Copy, Maximize2, Radio, Sparkles, SquareArrowOutUpRight, TerminalAutocomplete, TerminalComposeBar, TerminalConnectionDialog, TerminalContextMenu, TerminalSearchBar, Tooltip, TooltipContent, TooltipTrigger, ZmodemOverwriteDialog, ZmodemProgressIndicator, auth, autocompleteAcceptTextRef, autocompleteCloseRef, autocompleteHostOs, autocompleteInputRef, autocompleteKeyEventRef, autocompleteRepositionRef, autocompleteSettings, chainProgress, cn, compactToolbar, lineTimestampsAvailable, containerRef, effectiveFontSize, effectiveFontWeight, effectiveTerminalProtocol, effectiveTheme, error, executeSnippet, executeSnippetCommand, handleAddSelectionToAI, handleCancelConnect, handleCloseDisconnectedSession, handleCloseSearch, handleDismissDisconnectedDialog, handleDragEnter, handleDragLeave, handleDragOver, handleDrop, handleFindNext, handleFindPrevious, handleHostKeyAddAndContinue, handleHostKeyClose, handleHostKeyContinue, handleOsc52ReadResponse, handleOsc7SetupConfirm, handleOsc7SetupOpenChange, handleReceiveYmodem, handleRetry, handleSearch, handleSendYmodem, handleTopOverlayMouseDownCapture, hasMouseTracking, hasSelection, host, hotkeyScheme, inWorkspace, isBroadcastEnabled, isCancelling, isComposeBarOpen, isConnectionAwaitingUserInput, isDraggingOver, isFocusMode, isLocalConnection, remoteDragDropUsesZmodem, isPluginTerminalProviderAvailable, isSerialConnection, isSearchOpen, isSupportedOs, isSystemSidebarEligible, isVisible, keyBindings, keys, knownCwdRef, needsHostKeyVerification, onCloseSession, onDetach, onDetachPointerDown, onExpandToFocus, onOpenSystem, onRename, onSplitHorizontal, onSplitVertical, onToggleBroadcast, onUpdateHost, osc52ReadPromptVisible, osc7SetupOpen, osc7SetupRunning, passwordPromptActiveRef, pendingHostKeyInfo, progressLogs, progressValue, renderControls, resolvedFontFamily, restoreState, scriptExecutionOverlay, searchMatchCount, searchFocusToken, selectionOverlayPosition, sessionDisplayName, sessionId, workspaceId, sessionRef, setIsComposeBarOpen, setShowLogs, shouldShowConnectionDialog, showLogs, showSelectionAIAction, snippets, status, sudoHintRef, sudoHintText, passwordPickerState, onPasswordPickerSelect, passwordPickerTitle, passwordPickerEmptyText, t, termRef, terminalContextActions, terminalCwdTracker, terminalPreviewVars, terminalSettings, timeLeft, toast, zmodem } = ctx;
+  const { Activity, Button, Clock3, Copy, Maximize2, Radio, Sparkles, SquareArrowOutUpRight, TerminalAutocomplete, TerminalComposeBar, TerminalConnectionDialog, TerminalContextMenu, TerminalSearchBar, Tooltip, TooltipContent, TooltipTrigger, ZmodemOverwriteDialog, ZmodemProgressIndicator, auth, autocompleteAcceptTextRef, autocompleteCloseRef, autocompleteHostOs, autocompleteInputRef, autocompleteKeyEventRef, autocompleteRepositionRef, autocompleteSettings, chainProgress, cn, compactToolbar, lineTimestampsAvailable, containerRef, effectiveFontSize, effectiveFontWeight, effectiveTerminalProtocol, effectiveTheme, error, executeSnippet, executeSnippetCommand, handleAddSelectionToAI, handleCancelConnect, handleCloseDisconnectedSession, handleCloseSearch, handleDismissDisconnectedDialog, handleDragEnter, handleDragLeave, handleDragOver, handleDrop, handleFindNext, handleFindPrevious, handleHostKeyAddAndContinue, handleHostKeyClose, handleHostKeyContinue, handleOsc52ReadResponse, handleOsc7SetupConfirm, handleOsc7SetupOpenChange, handleReceiveYmodem, handleRetry, handleSearch, handleSendYmodem, handleTopOverlayMouseDownCapture, hasMouseTracking, hasSelection, host, hotkeyScheme, inWorkspace, isBroadcastEnabled, isCancelling, isComposeBarOpen, isConnectionAwaitingUserInput, isDraggingOver, isFocusMode, isFocusedPane, isLocalConnection, remoteDragDropUsesZmodem, isPluginTerminalProviderAvailable, isSerialConnection, isSearchOpen, isSupportedOs, isSystemSidebarEligible, isVisible, keyBindings, keys, knownCwdRef, needsHostKeyVerification, onCloseSession, onDetach, onDetachPointerDown, onExpandToFocus, onOpenSystem, onRename, onSplitHorizontal, onSplitVertical, onToggleBroadcast, onUpdateHost, osc52ReadPromptVisible, osc7SetupOpen, osc7SetupRunning, passwordPromptActiveRef, pendingHostKeyInfo, progressLogs, progressValue, renderControls, resolvedFontFamily, restoreState, scriptExecutionOverlay, searchMatchCount, searchFocusToken, selectionOverlayPosition, sessionDisplayName, sessionId, workspaceId, sessionRef, setIsComposeBarOpen, setShowLogs, shouldShowConnectionDialog, showLogs, showSelectionAIAction, snippets, status, sudoHintRef, sudoHintText, passwordPickerState, onPasswordPickerSelect, passwordPickerTitle, passwordPickerEmptyText, t, termRef, terminalContextActions, terminalCwdTracker, terminalPreviewVars, terminalSettings, timeLeft, toast, zmodem } = ctx;
   const isNetworkDevice = host.deviceType === 'network'
     || classifyDistroId(host.distro) === 'network-device';
   const ymodemActionEnabled = shouldEnableYmodemAction({
@@ -285,7 +294,6 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
     key: "Enter",
     status,
     hasRetryHandler: Boolean(handleRetry),
-    isSearchOpen,
     isComposeBarOpen,
     needsAuth: Boolean(auth.needsAuth),
     needsHostKeyVerification: Boolean(needsHostKeyVerification),
@@ -296,7 +304,6 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
       key: event.key,
       status,
       hasRetryHandler: Boolean(handleRetry),
-      isSearchOpen,
       isComposeBarOpen,
       needsAuth: Boolean(auth.needsAuth),
       needsHostKeyVerification: Boolean(needsHostKeyVerification),
@@ -320,7 +327,6 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
     handleRetry,
     hasBlockingReconnectOverlay,
     isComposeBarOpen,
-    isSearchOpen,
     needsHostKeyVerification,
     status,
   ]);
@@ -890,6 +896,7 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
                 keys={keys}
                 onDismissDisconnected={handleDismissDisconnectedDialog}
                 showEnterReconnectHint={showEnterReconnectHint}
+                isFocusedPane={isFocusedPane}
                 hostKeyVerification={needsHostKeyVerification && pendingHostKeyInfo ? {
                   hostKeyInfo: pendingHostKeyInfo,
                   onClose: handleHostKeyClose,
