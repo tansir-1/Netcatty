@@ -1168,10 +1168,11 @@ test("fast resumable uploads pause only after in-flight ranges are durable", asy
   assert.equal(paused.success, true);
   assert.equal(paused.checkpointBytes, UPLOAD_TRANSFER_CONCURRENCY * TRANSFER_CHUNK_SIZE);
 
-  assert.deepEqual(
-    await transferBridge.resumeTransfer(null, { transferId: "upload-fast-paused" }),
-    { success: true },
-  );
+  {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "upload-fast-paused" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
   assert.equal((await running).error, undefined);
   assert.equal(durableBytes, payload.length);
 });
@@ -1275,10 +1276,9 @@ test("pause soft-drains concurrent ranges but resume waits before truncating", a
 
   holdWrites = false;
   for (const { complete } of pendingWrites.splice(0)) complete();
-  assert.deepEqual(
-    await resuming,
-    { success: true },
-  );
+  const resumeResult = await resuming;
+  assert.equal(resumeResult.success, true);
+  assert.ok(Number.isFinite(resumeResult.lifecycleEpoch));
   assert.equal((await running).error, undefined);
   assert.equal(truncatedBeforeDrain, false, "must not truncate while range writes are active");
   assert.equal(resumedBeforeDrain, false, "resume must wait for active range writes to settle");
@@ -1436,10 +1436,11 @@ test("resuming while a fast pause is pending settles the pause request", async (
   assert.equal(typeof finishWrite, "function");
 
   const pausing = transferBridge.pauseTransfer(null, { transferId: "pause-resume-race" });
-  assert.deepEqual(
-    await transferBridge.resumeTransfer(null, { transferId: "pause-resume-race" }),
-    { success: true },
-  );
+  {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "pause-resume-race" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
   assert.deepEqual(await pausing, {
     success: false,
     reason: "Pause was superseded by resume",
@@ -1543,10 +1544,11 @@ test("pause acknowledges quickly then publishes a full source identity", async (
       `sha256:${crypto.createHash("sha256").update(payload).digest("hex")}`,
     );
 
-    assert.deepEqual(
-      await transferBridge.resumeTransfer(null, { transferId: "late-pause-race" }),
-      { success: true },
-    );
+    {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "late-pause-race" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
   }
 
   assert.equal((await running).error, undefined);
@@ -2469,6 +2471,142 @@ test("resumable concurrent uploads reject a source rewritten mid-transfer", asyn
   assert.match(result.error || "", /source|content|changed|fingerprint|mismatch/i);
   assert.equal(promoted, false);
   assert.equal(stagedDeleted, true);
+});
+
+test("assertSourceMetadataUnchanged ignores ctime drift when content is verified separately", () => {
+  const initial = {
+    size: 100,
+    mtimeMs: 1,
+    ctimeMs: 1,
+    mtime: 0.001,
+    ctime: 0.001,
+    ino: 42,
+  };
+  const drifted = {
+    ...initial,
+    ctimeMs: 999,
+    ctime: 0.999,
+  };
+  // Without a separate content proof, timestamp drift is a hard fail (download path).
+  assert.throws(
+    () => transferBridge._assertSourceMetadataUnchangedForTests(initial, drifted, 100),
+    /source content changed/i,
+  );
+  // With digest / per-range verification, macOS xattr ctime bumps must not abort.
+  assert.doesNotThrow(() => transferBridge._assertSourceMetadataUnchangedForTests(
+    initial,
+    drifted,
+    100,
+    { contentVerifiedSeparately: true },
+  ));
+  // Size still fails hard even when content is verified separately.
+  assert.throws(
+    () => transferBridge._assertSourceMetadataUnchangedForTests(
+      initial,
+      { ...drifted, size: 99 },
+      100,
+      { contentVerifiedSeparately: true },
+    ),
+    /source size changed/i,
+  );
+});
+
+test("resumable upload succeeds when only source ctime drifts (pause/resume false positive)", async (t) => {
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-upload-ctime-drift-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  // Reproduce the user-facing finish-path false positive: content bytes are
+  // stable (digest matches) but ctime moved — common on macOS after long
+  // pause/resume cycles (Spotlight / quarantine / xattr).
+  const payload = Buffer.alloc(16 * 1024, 43);
+  const localPath = path.join(tempDir, "ChatGPT.dmg");
+  await fs.promises.writeFile(localPath, payload);
+  const baseline = await fs.promises.stat(localPath);
+  let allowCtimeDrift = false;
+  const driftedStat = () => {
+    if (!allowCtimeDrift) return baseline;
+    return {
+      ...baseline,
+      ctimeMs: baseline.ctimeMs + 60_000,
+      ctime: (baseline.ctimeMs + 60_000) / 1000,
+      // mtime intentionally stable — content not rewritten.
+    };
+  };
+  const realStat = fs.promises.stat.bind(fs.promises);
+  const realOpen = fs.promises.open.bind(fs.promises);
+  fs.promises.stat = async (p, ...args) => {
+    if (path.resolve(String(p)) === path.resolve(localPath)) return driftedStat();
+    return realStat(p, ...args);
+  };
+  fs.promises.open = async (p, flags, ...args) => {
+    const handle = await realOpen(p, flags, ...args);
+    if (path.resolve(String(p)) === path.resolve(localPath) && String(flags).includes("r")) {
+      handle.stat = async () => driftedStat();
+    }
+    return handle;
+  };
+  t.after(() => {
+    fs.promises.stat = realStat;
+    fs.promises.open = realOpen;
+  });
+
+  let remoteBytes = 0;
+  let promoted = false;
+  const fastSftp = createFastSftp({
+    open(_remotePath, _flags, callback) {
+      callback(null, Buffer.from("remote-handle"));
+    },
+    write(_handle, _buffer, _offset, length, position, callback) {
+      remoteBytes = Math.max(remoteBytes, position + length);
+      // After the first remote WRITE, simulate metadata-only drift as if the
+      // transfer had been pause/resumed for a long wall-clock time.
+      allowCtimeDrift = true;
+      callback(null);
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+  });
+  const client = {
+    sftp: createFastSftp({}),
+    stat() {
+      return Promise.resolve({ size: remoteBytes });
+    },
+    rename() {
+      promoted = true;
+      return Promise.resolve();
+    },
+    delete() {
+      return Promise.resolve();
+    },
+    client: {
+      sftp(callback) {
+        callback(null, fastSftp);
+      },
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const result = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "upload-ctime-drift-ok",
+      sourcePath: localPath,
+      targetPath: "/tmp/ChatGPT.dmg",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  assert.equal(result.error, undefined, `expected success, got: ${result.error}`);
+  assert.equal(allowCtimeDrift, true);
+  assert.equal(promoted, true);
+  assert.equal(remoteBytes, payload.length);
 });
 
 test("non-resumable shared range uploads reject a same-size source rewrite", async (t) => {
@@ -3931,10 +4069,11 @@ test("fast resumable downloads pause only at a complete checkpoint", async (t) =
   assert.equal(paused.success, true);
   assert.equal(paused.checkpointBytes, 2 * 1024 * 1024);
 
-  assert.deepEqual(
-    await transferBridge.resumeTransfer(null, { transferId: "download-fast-paused" }),
-    { success: true },
-  );
+  {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "download-fast-paused" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
   assert.equal((await running).error, undefined);
   assert.deepEqual(await fs.promises.readFile(targetPath), payload);
 });
@@ -4715,7 +4854,9 @@ test("resumable stream transfers pause without losing their checkpoint and conti
   assert.equal(pausedAgain.checkpointBytes, 3);
   assert.equal(pausedAgain.resumeStage, "direct");
 
-  assert.deepEqual(await transferBridge.resumeTransfer(null, { transferId: "download-paused" }), { success: true });
+  const resumed = await transferBridge.resumeTransfer(null, { transferId: "download-paused" });
+  assert.equal(resumed.success, true);
+  assert.ok(Number.isFinite(resumed.lifecycleEpoch), "soft-resume must return bridge lifecycleEpoch");
   assert.deepEqual(
     lifecycleEvents.findLast((event) => event.type === "resumed"),
     { type: "resumed", transferId: "download-paused", lifecycleEpoch: 2 },
@@ -4816,10 +4957,11 @@ test("stream local-copy pause survives write-stream drain without auto-resuming 
     "paused stream copy must not keep writing after drain",
   );
 
-  assert.deepEqual(
-    await transferBridge.resumeTransfer(null, { transferId: "local-pipe-pause" }),
-    { success: true },
-  );
+  {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "local-pipe-pause" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
   assert.equal((await running).error, undefined);
   assert.equal(durableBytes, payload.length);
 });
@@ -4908,14 +5050,16 @@ test("repeated resume does not double-pipe the same stream pair", async (t) => {
   assert.equal(paused.success, true, paused.reason);
   const pipesAfterPause = pipeCount;
 
-  assert.deepEqual(
-    await transferBridge.resumeTransfer(null, { transferId: "local-double-resume" }),
-    { success: true },
-  );
-  assert.deepEqual(
-    await transferBridge.resumeTransfer(null, { transferId: "local-double-resume" }),
-    { success: true },
-  );
+  {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "local-double-resume" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
+  {
+    const resumed = await transferBridge.resumeTransfer(null, { transferId: "local-double-resume" });
+    assert.equal(resumed.success, true);
+    assert.ok(Number.isFinite(resumed.lifecycleEpoch));
+  }
   assert.equal(
     pipeCount,
     pipesAfterPause + 1,

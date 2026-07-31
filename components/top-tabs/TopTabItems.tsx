@@ -1,7 +1,15 @@
-import { Copy, FileCode, FileText, LayoutGrid, Minus, Server, Square, TerminalSquare, Usb, X } from 'lucide-react';
+import { Copy, FileCode, FileText, LayoutGrid, Minus, Server, Square, Terminal, TerminalSquare, Usb, X } from 'lucide-react';
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
 import { activeTabStore, useActiveTabId, useIsTabActive } from '../../application/state/activeTabStore';
-import type { EditorTab } from '../../application/state/editorTabStore';
+import {
+  useAnySessionActivity,
+  useSessionActivity,
+} from '../../application/state/sessionActivityStore';
+import { usePresentedSession } from '../../application/state/sessionPresentationStore';
+import {
+  useEditorTabDirty,
+  type EditorTabChrome,
+} from '../../application/state/editorTabStore';
 import type { LogView } from '../../application/state/logViewState';
 import { useWindowControls } from '../../application/state/useWindowControls';
 import { terminalReconnectRegistry } from '../../application/state/terminalReconnectRegistry';
@@ -146,7 +154,7 @@ const SessionTabIcon: React.FC<{
       </div>
     );
   }
-  return <TerminalSquare className={iconSize} style={fallbackStyle} />;
+  return <Terminal className={iconSize} style={fallbackStyle} />;
 });
 SessionTabIcon.displayName = 'SessionTabIcon';
 
@@ -527,7 +535,7 @@ PluginViewTopTab.displayName = 'PluginViewTopTab';
 
 interface EditorTopTabProps {
   tabId: string;
-  editorTab: EditorTab;
+  editorTab: EditorTabChrome;
   host: Host | undefined;
   suffix: string;
   onRequestCloseEditorTab: (editorTabId: string) => void;
@@ -563,7 +571,8 @@ export const EditorTopTab: React.FC<EditorTopTabProps> = memo(({
   tabAnimationClass,
 }) => {
   const isActive = useIsTabActive(tabId);
-  const dirty = editorTab.content !== editorTab.baselineContent;
+  // Dirty is store-driven so App/TopTabs structure can stay presence-only.
+  const dirty = useEditorTabDirty(editorTab.id);
   const tooltip = `${host?.label ?? editorTab.hostId}@${host?.hostname ?? ''}:${editorTab.remotePath}`;
   const FileIcon = CODE_EXTENSIONS_RE.test(editorTab.fileName) ? FileCode : FileText;
   const handleClick = useCallback(() => {
@@ -660,7 +669,6 @@ EditorTopTab.displayName = 'EditorTopTab';
 interface SessionTopTabProps {
   session: TerminalSession;
   host: Host | undefined;
-  hasActivity: boolean;
   isBeingDragged: boolean;
   isDraggingForReorder: boolean;
   shiftStyle: React.CSSProperties;
@@ -682,9 +690,8 @@ interface SessionTopTabProps {
 }
 
 export const SessionTopTab: React.FC<SessionTopTabProps> = memo(({
-  session,
+  session: sessionProp,
   host,
-  hasActivity,
   isBeingDragged,
   isDraggingForReorder,
   shiftStyle,
@@ -704,7 +711,11 @@ export const SessionTopTab: React.FC<SessionTopTabProps> = memo(({
   t,
   tabAnimationClass,
 }) => {
+  // Per-session presentation: sibling title/provider updates do not re-render this tab.
+  const session = usePresentedSession(sessionProp);
   const isActive = useIsTabActive(session.id);
+  // Per-session store snapshot so sibling activity dots do not re-render this tab.
+  const hasActivity = useSessionActivity(session.id);
   const handleClick = useCallback(() => {
     activeTabStore.setActiveTabId(session.id);
   }, [session.id]);
@@ -833,7 +844,7 @@ SessionTopTab.displayName = 'SessionTopTab';
 interface WorkspaceTopTabProps {
   workspace: Workspace;
   paneCount: number;
-  hasActivity: boolean;
+  workspaceSessionIds: readonly string[];
   isBeingDragged: boolean;
   isDraggingForReorder: boolean;
   shiftStyle: React.CSSProperties;
@@ -848,16 +859,41 @@ interface WorkspaceTopTabProps {
   onCopyWorkspace: (workspaceId: string) => void;
   onCloseWorkspace: (workspaceId: string) => void;
   onDetachSessionFromWorkspace?: (workspaceId: string, sessionId: string) => void;
-  workspaceSessionLabels?: Record<string, string>;
+  /** Sessions for Detach menu; each menu item applies live presentation itself. */
+  workspaceSessions?: TerminalSession[];
+  dynamicTabTitleMode?: DynamicTabTitleMode;
   renderBulkCloseItems: RenderBulkCloseItems;
   t: TranslateFn;
   tabAnimationClass?: string;
 }
 
+/**
+ * Detach-menu row that subscribes to presentation for one session only, so
+ * agent title updates stay live without remapping the whole TopTabs bar.
+ */
+const WorkspaceDetachSessionMenuItem: React.FC<{
+  session: TerminalSession;
+  workspaceId: string;
+  dynamicTabTitleMode?: DynamicTabTitleMode;
+  onDetach: (workspaceId: string, sessionId: string) => void;
+  t: TranslateFn;
+}> = memo(({ session: sessionProp, workspaceId, dynamicTabTitleMode, onDetach, t }) => {
+  const session = usePresentedSession(sessionProp);
+  const label = resolveSessionTabTitle(session, dynamicTabTitleMode);
+  return (
+    <ContextMenuItem onClick={() => onDetach(workspaceId, session.id)}>
+      {t('terminal.menu.detachSession', { name: label })}
+    </ContextMenuItem>
+  );
+});
+WorkspaceDetachSessionMenuItem.displayName = 'WorkspaceDetachSessionMenuItem';
+
 export const WorkspaceTopTab: React.FC<WorkspaceTopTabProps> = memo(({
   workspace,
   paneCount,
-  hasActivity,
+  workspaceSessionIds,
+  workspaceSessions,
+  dynamicTabTitleMode,
   isBeingDragged,
   isDraggingForReorder,
   shiftStyle,
@@ -872,12 +908,12 @@ export const WorkspaceTopTab: React.FC<WorkspaceTopTabProps> = memo(({
   onCopyWorkspace,
   onCloseWorkspace,
   onDetachSessionFromWorkspace,
-  workspaceSessionLabels,
   renderBulkCloseItems,
   t,
   tabAnimationClass,
 }) => {
   const isActive = useIsTabActive(workspace.id);
+  const hasActivity = useAnySessionActivity(workspaceSessionIds);
   const handleClick = useCallback(() => {
     activeTabStore.setActiveTabId(workspace.id);
   }, [workspace.id]);
@@ -885,6 +921,7 @@ export const WorkspaceTopTab: React.FC<WorkspaceTopTabProps> = memo(({
     () => createTopTabCopyDoubleClickHandler(onCopyWorkspace, workspace.id),
     [onCopyWorkspace, workspace.id],
   );
+  const detachSessions = workspaceSessions ?? [];
 
   return (
     <ContextMenu>
@@ -972,15 +1009,17 @@ export const WorkspaceTopTab: React.FC<WorkspaceTopTabProps> = memo(({
         <ContextMenuItem onClick={() => onCopyWorkspace(workspace.id)}>
           {t('tabs.copyTab')}
         </ContextMenuItem>
-        {onDetachSessionFromWorkspace && workspaceSessionLabels && Object.entries(workspaceSessionLabels).map(([sessionId, label]) => (
-          <ContextMenuItem
-            key={sessionId}
-            onClick={() => onDetachSessionFromWorkspace(workspace.id, sessionId)}
-          >
-            {t('terminal.menu.detachSession', { name: label })}
-          </ContextMenuItem>
+        {onDetachSessionFromWorkspace && detachSessions.map((session) => (
+          <WorkspaceDetachSessionMenuItem
+            key={session.id}
+            session={session}
+            workspaceId={workspace.id}
+            dynamicTabTitleMode={dynamicTabTitleMode}
+            onDetach={onDetachSessionFromWorkspace}
+            t={t}
+          />
         ))}
-        {onDetachSessionFromWorkspace && workspaceSessionLabels && Object.keys(workspaceSessionLabels).length > 0 && (
+        {onDetachSessionFromWorkspace && detachSessions.length > 0 && (
           <ContextMenuSeparator />
         )}
         <ContextMenuItem className="text-destructive" onClick={() => onCloseWorkspace(workspace.id)}>

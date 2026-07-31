@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { aiPanelContextsEqual } from '../../domain/aiPanelContextsEqual';
 import { sftpPickerSessionsEqual } from '../../domain/sftpConnectedHosts';
 
 type Ctx = Record<string, any>;
@@ -170,16 +171,43 @@ function sidePanelCtxKeyEqual(prev: Ctx, next: Ctx, key: string): boolean {
       session.workspaceId === next.sessions[index]?.workspaceId
     ));
   }
+  if (key === 'workspaceById') {
+    // Focus-only workspace map identity changes must not invalidate every mounted
+    // side-panel slot; System reads focused session from sidePanelLiveStore.
+    return sidePanelWorkspaceByIdEqual(prev.workspaceById, next.workspaceById);
+  }
+  if (key === 'aiContextsByTabId') {
+    return aiPanelContextsEqual(prev.aiContextsByTabId, next.aiContextsByTabId);
+  }
   return prev[key] === next[key];
 }
 
+function sidePanelWorkspaceByIdEqual(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (!(a instanceof Map) || !(b instanceof Map)) return false;
+  if (a.size !== b.size) return false;
+  for (const [workspaceId, prevWorkspace] of a) {
+    const nextWorkspace = b.get(workspaceId);
+    if (!nextWorkspace) return false;
+    if (prevWorkspace === nextWorkspace) continue;
+    if (prevWorkspace.id !== nextWorkspace.id) return false;
+    if (prevWorkspace.title !== nextWorkspace.title) return false;
+    if (prevWorkspace.viewMode !== nextWorkspace.viewMode) return false;
+    if (prevWorkspace.snippetId !== nextWorkspace.snippetId) return false;
+    if (!workspaceNodeEqual(prevWorkspace.root, nextWorkspace.root)) return false;
+  }
+  return true;
+}
+
+// Live fields that are also published via sidePanelLiveStore (or dedicated
+// stores like scriptRunsStore). Slots subscribe to those stores directly, so
+// TerminalLayerView must NOT re-render on these ticks — only chrome-stable keys.
 const SIDE_PANEL_LIVE_CTX_KEYS = [
   'activeTerminalSessionForSystem',
   'activeSystemSessionHost',
   'focusedHost',
   'focusedSessionId',
   'historySessionId',
-  'scriptRuns',
   'resolvedPreviewTheme',
   'previewedOrVisibleThemeId',
   'sftpActiveHost',
@@ -203,8 +231,6 @@ const SIDE_PANEL_STABLE_CTX_KEYS = [
   'scriptsMountedTabIds',
   'systemMountedTabIds',
   'themeMountedTabIds',
-  'remoteHistory',
-  'shellHistory',
   'handleHistoryPaste',
   'handleHistoryRun',
   'handleOpenHistory',
@@ -222,13 +248,16 @@ const SIDE_PANEL_STABLE_CTX_KEYS = [
   'workspaceById',
   'keys',
   'identities',
+  'knownHosts',
   'updateHosts',
+  'handleAddKnownHost',
   'updateSnippets',
   'updateSnippetPackages',
   'sftpDefaultViewMode',
   'sftpInitialLocationForTab',
   'sftpPendingUploadsForTab',
   'handleSftpCurrentPathChange',
+  'handleSftpActiveTransfersChange',
   'sftpDoubleClickBehavior',
   'sftpAutoSync',
   'sftpShowHiddenFiles',
@@ -368,10 +397,11 @@ const WORKSPACE_CTX_KEYS = [
   'handleProgrammaticCommandLogRewriteChange',
   'handleAddSelectionToAI',
   'activeResizers',
-  'activeWorkspace',
+  // activeWorkspace / focusedSessionId: TerminalLayerWorkspaceSection reads
+  // these from sidePanelLiveStore so tab switches do not invalidate workspace
+  // chrome solely because the active tab id changed.
   'composeBarThemeColors',
   'findSplitNode',
-  'focusedSessionId',
   'handleComposeSend',
   'handleSnippetFromPanel',
   'refocusTerminalSession',
@@ -413,15 +443,18 @@ export function terminalLayerViewCtxEqual(prev: Ctx, next: Ctx): boolean {
   if (prev.isTerminalLayerVisible !== next.isTerminalLayerVisible) return false;
   if (prev.hibernateHiddenTabs !== next.hibernateHiddenTabs) return false;
   if (prev.isComposeBarOpen !== next.isComposeBarOpen) return false;
-  if (!activeWorkspaceEqual(prev.activeWorkspace, next.activeWorkspace)) return false;
-  if (prev.focusedSessionId !== next.focusedSessionId) return false;
+  // activeWorkspace / focusedSessionId intentionally omitted: live store +
+  // focus-sidebar equal handle those without forcing a full layer rebuild on
+  // every top-tab switch between terminal sessions.
   if (prev.handleComposeSend !== next.handleComposeSend) return false;
   if (prev.refocusTerminalSession !== next.refocusTerminalSession) return false;
   if (prev.setIsComposeBarOpen !== next.setIsComposeBarOpen) return false;
   if (prev.isBroadcastEnabled !== next.isBroadcastEnabled) return false;
   if (prev.composeBarThemeColors !== next.composeBarThemeColors) return false;
   if (prev.workspaceOuterRef !== next.workspaceOuterRef) return false;
-  return terminalLayerSidePanelCtxEqual(prev, next)
+  // Use stable side-panel equal only: LIVE fields (cwd, theme focus, etc.) flow
+  // through sidePanelLiveStore and must not rebuild side-panel chrome.
+  return terminalLayerSidePanelStableCtxEqual(prev, next)
     && terminalLayerFocusSidebarPropsEqual(prev, next)
     && terminalLayerWorkspaceCtxEqual(prev, next);
 }

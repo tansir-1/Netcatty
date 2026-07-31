@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import React, { Suspense, lazy, useCallback, useEffect, useMemo } from 'react';
+import React, { Suspense, lazy, memo, useCallback, useEffect, useMemo } from 'react';
 import { AlertTriangle, Download, Trash2 } from 'lucide-react';
-import { activeTabStore, toEditorTabId, useActiveTabId, useIsEditorTabActive } from '../state/activeTabStore';
+import { activeTabStore, toEditorTabId, useIsEditorTabActive } from '../state/activeTabStore';
 import { editorTabStore } from '../state/editorTabStore';
 import { releaseEditorTabSaveCoordinator, saveEditorTab } from '../state/editorTabSave';
 import { useTerminalHostTreeLayoutWidth } from '../state/terminalHostTreeStore';
@@ -22,18 +22,21 @@ import { LazyLoadBoundary } from '../../components/ui/lazy-load-boundary';
 import { toast } from '../../components/ui/toast';
 import { AppHostTreeLayer } from './AppHostTreeLayer';
 import { AppHostEditorLayer } from './AppHostEditorLayer';
+import { AppPluginKeybindingHost } from './AppPluginKeybindingHost';
 import { getUiThemeById } from '../../infrastructure/config/uiThemes';
 import { buildAppThemeCssVars } from '../state/settingsStateDefaults';
 import { useMainWindowInputFocusRecovery } from '../state/useMainWindowInputFocusRecovery';
 import { useExternalMcpToggleState } from '../state/useExternalMcpToggleState';
-import { PluginContributionHost } from '../../components/plugins/PluginContributionHost';
-import { resolveActivePluginKeybindingContext } from '../state/pluginContributionContexts';
 import { selectPluginThemeTokens } from '../state/pluginContributionEnvironment';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
 import { pluginViewTabStore, usePluginViewTabs } from '../state/pluginViewTabStore';
 import { buildPluginSettingScopeCatalog } from '../state/usePluginSettingScopeCatalog';
 import { useWorkSurfaceHostEditor } from '../state/useWorkSurfaceHostEditor';
-import { isHostTreeWorkTabSurface } from './workTabSurface';
+import {
+  appViewDomainsEqual,
+  mergeAppViewDomains,
+  type AppViewDomains,
+} from './appViewDomains';
 
 const LazyProtocolSelectDialog = lazy(() => import('../../components/ProtocolSelectDialog'));
 const LazyQuickSwitcher = lazy(() =>
@@ -62,11 +65,23 @@ const TextEditorTabFallback = ({ tabId }: { tabId: string }) => {
   );
 };
 
-type AppViewContext = Record<string, any>;
+export type AppViewProps = {
+  domains: AppViewDomains;
+};
 
-export function AppView({ ctx }: { ctx: AppViewContext }) {
-  const activeTabId = useActiveTabId();
+function AppViewInner({ domains }: AppViewProps) {
+  // Intentionally does NOT subscribe to activeTabId — leaf surfaces
+  // (TopTabs items, mounts, host tree, chrome, plugin keybindings) own that
+  // subscription so top-tab switches do not rebuild the App shell.
   const pluginViewTabs = usePluginViewTabs();
+  // Merge domain slices once per AppView render. AppView only re-renders when a
+  // domain slice identity changes (see appViewDomainsEqual). Depend on the
+  // domain bag so the hook graph stays honest; bag identity only changes when
+  // App rebuilds a domain slice.
+  const ctx = useMemo(
+    () => mergeAppViewDomains(domains),
+    [domains],
+  ) as Record<string, any>;
   const {
     resetSessionRename,
     resetWorkspaceRename,
@@ -114,7 +129,7 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
     sessionRenameValue, sessions, setActiveTabId, setDeepLinkHostDraft, setDraggingSessionId, setEditorWordWrap,
     setNavigateToSection, setSessionRenameValue, setTerminalFontFamilyId, setTerminalFontSize, setVaultFocusRequest, updateSessionFontSize, updateSessionRestoreCwd, updateSessionDynamicTitle, updateSessionCodingCliProvider, clearSessionFontSizeOverride,
     setWorkspaceFocusedSession, setWorkspaceRenameValue, settings, sftpAutoOpenSidebar, sftpFollowTerminalCwd, setSftpFollowTerminalCwd, sftpAutoSync, sftpDefaultViewMode, sftpDoubleClickBehavior,
-    sftpShowHiddenFiles, sftpUseCompressedUpload, shellHistory, snippetPackages, snippets, splitSessionWithCurrentShell, startSessionRename,
+    sftpShowHiddenFiles, sftpUseCompressedUpload, snippetPackages, snippets, splitSessionWithCurrentShell, startSessionRename,
     startWorkspaceRename, submitSessionRename, submitWorkspaceRename, t, terminalFontFamilyId, terminalFontSize, terminalSettings, terminalThemeId, themeById,
     toggleBroadcast, toggleConnectionLogSaved, toggleScriptsSidePanelRef, toggleSidePanelRef, toggleWorkspaceViewMode, unmanageSource, updateConnectionLog,
     readPersistedHosts, readPersistedManagedSources, updateCustomGroups, updateGroupConfigs, updateHostDistro, updateHosts, updateIdentities, updateKeys, updateKnownHosts, updateManagedSources,
@@ -122,12 +137,22 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
     VaultViewContainer, SftpViewMount, TerminalLayerMount, LogViewWrapper,
   } = ctx;
 
-  // Stable no-arg wrapper: the top-bar terminal icon passes an onClick event we
-  // must not forward as handleCreateLocalTerminal's `shell` arg, and an inline
-  // arrow here would defeat the memoized TopTabs onCreateLocalTerminal check.
-  const handleCreateLocalTerminalNoArg = useCallback(() => {
-    handleCreateLocalTerminal();
-  }, [handleCreateLocalTerminal]);
+  const handleTerminalCommandExecuted = useCallback((
+    command: string,
+    hostId: string,
+    hostLabel: string,
+    sessionId: string,
+  ) => {
+    addShellHistoryEntry({ command, hostId, hostLabel, sessionId });
+  }, [addShellHistoryEntry]);
+
+  const handleUpdateTerminalFontWeight = useCallback((weight: number) => {
+    updateTerminalSetting('fontWeight', weight);
+  }, [updateTerminalSetting]);
+
+  const handleRequestAddToWorkspace = useCallback((workspaceId: string) => {
+    setAddToWorkspaceDialog({ mode: 'append', workspaceId });
+  }, [setAddToWorkspaceDialog]);
 
   const appThemeStyle = useMemo(() => {
     const tokens = getUiThemeById(
@@ -140,11 +165,6 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
     } as React.CSSProperties;
   }, [accentMode, customAccent, resolvedTheme, settings.darkUiThemeId, settings.lightUiThemeId]);
 
-  const pluginKeybindingContext = useMemo(() => resolveActivePluginKeybindingContext({
-    activeTabId,
-    sessions,
-    workspaces,
-  }), [activeTabId, sessions, workspaces]);
   const pluginThemeTokens = useMemo(
     () => selectPluginThemeTokens(appThemeStyle as Record<string, unknown>),
     [appThemeStyle],
@@ -162,14 +182,6 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
     onUpdateHosts: updateHosts,
     onSaved: handleWorkSurfaceHostSaved,
   });
-  const workSurfaceVisible = useMemo(() => isHostTreeWorkTabSurface({
-    enabled: true,
-    activeTabId,
-    logViewIds: new Set(logViews.map((logView: { id: string }) => logView.id)),
-    orderedTabs: orderedTabsWithEditors,
-    sessionIds: new Set(sessions.map((session: { id: string }) => session.id)),
-    workspaceIds: new Set(workspaces.map((workspace: { id: string }) => workspace.id)),
-  }), [activeTabId, logViews, orderedTabsWithEditors, sessions, workspaces]);
   const handleCreateWorkSurfaceHostGroup = useCallback((groupPath: string) => {
     updateCustomGroups(Array.from(new Set([...customGroups, groupPath])));
   }, [customGroups, updateCustomGroups]);
@@ -266,7 +278,6 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
         onCloseLogView={closeLogView}
         onCloseTabsBatch={closeTabsBatch}
         onOpenQuickSwitcher={handleOpenQuickSwitcher}
-        onCreateLocalTerminal={handleCreateLocalTerminalNoArg}
         onThemeChange={settings.setTheme}
         onOpenSettings={handleOpenSettings}
         externalMcpEnabled={externalMcpToggle.enabled}
@@ -313,7 +324,6 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
           onCreateLocalTerminal={handleCreateLocalTerminal}
         />
         <AppHostEditorLayer
-          surfaceVisible={workSurfaceVisible}
           target={workSurfaceHostEditor.target}
           editorKey={workSurfaceHostEditor.editorKey}
           hosts={hosts}
@@ -326,6 +336,10 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
           snippets={snippets}
           terminalThemeId={terminalThemeId}
           terminalFontSize={terminalFontSize}
+          sessions={sessions}
+          workspaces={workspaces}
+          logViews={logViews}
+          orderedTabs={orderedTabsWithEditors}
           onSave={workSurfaceHostEditor.save}
           onCancel={workSurfaceHostEditor.close}
           onCreateGroup={handleCreateWorkSurfaceHostGroup}
@@ -345,7 +359,6 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
             noteGroups={noteGroups}
             customGroups={customGroups}
             knownHosts={effectiveKnownHosts}
-            shellHistory={shellHistory}
             connectionLogs={connectionLogs}
             managedSources={managedSources}
             sessionCount={sessions.filter((s) => !s.hiddenFromTabs).length}
@@ -465,22 +478,17 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
           onUpdateSessionDynamicTitle={updateSessionDynamicTitle}
           onUpdateSessionCodingCliProvider={updateSessionCodingCliProvider}
           onClearSessionFontSizeOverride={clearSessionFontSizeOverride}
-          onUpdateTerminalFontWeight={(w) => updateTerminalSetting('fontWeight', w)}
+          onUpdateTerminalFontWeight={handleUpdateTerminalFontWeight}
           onCloseSession={closeSession}
           onUpdateSessionStatus={handleSessionStatusChange}
           onUpdateHostDistro={updateHostDistro}
           onUpdateHost={handleUpdateHostFromTerminal}
           onAddKnownHost={handleAddKnownHost}
-          onCommandExecuted={(command, hostId, hostLabel, sessionId) => {
-            addShellHistoryEntry({ command, hostId, hostLabel, sessionId });
-          }}
-          shellHistory={shellHistory}
+          onCommandExecuted={handleTerminalCommandExecuted}
           onTerminalDataCapture={handleTerminalDataCapture}
           onCreateWorkspaceFromSessions={createWorkspaceFromSessions}
           onAddSessionToWorkspace={addSessionToWorkspace}
-          onRequestAddToWorkspace={(workspaceId) =>
-            setAddToWorkspaceDialog({ mode: 'append', workspaceId })
-          }
+          onRequestAddToWorkspace={handleRequestAddToWorkspace}
           onUpdateSplitSizes={updateSplitSizes}
           onSetDraggingSessionId={setDraggingSessionId}
           onToggleWorkspaceViewMode={toggleWorkspaceViewMode}
@@ -560,11 +568,12 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
           </LazyLoadBoundary>
         ))}
 
-        <PluginContributionHost
+        <AppPluginKeybindingHost
           locale={settings.uiLanguage}
           theme={resolvedTheme}
           themeTokens={pluginThemeTokens}
-          keybindingContext={pluginKeybindingContext}
+          sessions={sessions}
+          workspaces={workspaces}
         />
       </div>
 
@@ -844,3 +853,8 @@ export function AppView({ ctx }: { ctx: AppViewContext }) {
     </SnippetExecutionProvider>
   );
 }
+
+export const AppView = memo(AppViewInner, (prev, next) => (
+  appViewDomainsEqual(prev.domains, next.domains)
+));
+AppView.displayName = 'AppView';

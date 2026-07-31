@@ -17,7 +17,7 @@ import type {
   Workspace,
 } from '../../types';
 import type { LogView } from '../state/logViewState';
-import type { EditorTab } from '../state/editorTabStore';
+import type { EditorTabChrome } from '../state/editorTabStore';
 
 interface AppActiveTabChromeProps {
   showSftpTab: boolean;
@@ -31,7 +31,7 @@ interface AppActiveTabChromeProps {
   followAppTerminalTheme: boolean;
   accentMode: 'theme' | 'custom';
   customAccent: string;
-  editorTabs: readonly EditorTab[];
+  editorTabs: readonly EditorTabChrome[];
   logViews: readonly LogView[];
   resolveSessionAppearance?: (hostScope: TerminalAppearanceHostScope) => ResolvedAppearance;
   t: (key: string) => string;
@@ -140,7 +140,19 @@ export function AppActiveTabChrome({
   }, [activeTabId, editorTabFileNameCounts, editorTabs, logViews, sessionById, t, workspaceById]);
 
   useEffect(() => {
-    void netcattyBridge.get()?.setWindowTitle?.(activeWindowTitle);
+    // Title is already memoized by activeTabId; skip redundant IPC when the
+    // string did not change (e.g. two tabs sharing the same host label).
+    let cancelled = false;
+    const bridge = netcattyBridge.get();
+    if (!bridge?.setWindowTitle) return;
+    // Defer slightly so the title write does not compete with tab-switch paint.
+    const timer = window.setTimeout(() => {
+      if (!cancelled) void bridge.setWindowTitle?.(activeWindowTitle);
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [activeWindowTitle]);
 
   return null;

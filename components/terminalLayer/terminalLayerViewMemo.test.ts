@@ -74,7 +74,7 @@ test("terminal layer memo skips equivalent active workspace objects", () => {
   );
 });
 
-test("terminal layer memo re-renders when active workspace root changes", () => {
+test("terminal layer memo ignores activeWorkspace-only tab flips (live store owns them)", () => {
   const prevWorkspace = workspace();
   const nextWorkspace = cloneWorkspace(prevWorkspace);
   nextWorkspace.root = {
@@ -83,20 +83,51 @@ test("terminal layer memo re-renders when active workspace root changes", () => 
     sizes: [2, 1],
   };
 
+  // activeWorkspace is read from sidePanelLiveStore in WorkspaceSection; ctx
+  // equality must not force a full layer rebuild solely because the active
+  // workspace object identity/root changed on a tab switch.
   assert.equal(
     terminalLayerWorkspaceCtxEqual(
       { activeWorkspace: prevWorkspace },
       { activeWorkspace: nextWorkspace },
     ),
-    false,
+    true,
   );
   assert.equal(
     terminalLayerViewCtxEqual(
       { activeWorkspace: prevWorkspace },
       { activeWorkspace: nextWorkspace },
     ),
-    false,
+    true,
   );
+});
+
+test("terminal layer memo re-renders when active resizers change", () => {
+  const base = {
+    activeResizers: [
+      {
+        id: "split-1-0",
+        splitId: "split-1",
+        index: 0,
+        direction: "vertical",
+        rect: { x: 10, y: 0, w: 4, h: 100 },
+        splitArea: { w: 200, h: 100 },
+      },
+    ],
+  };
+  const next = {
+    activeResizers: [
+      {
+        id: "split-1-0",
+        splitId: "split-1",
+        index: 0,
+        direction: "vertical",
+        rect: { x: 40, y: 0, w: 4, h: 100 },
+        splitArea: { w: 200, h: 100 },
+      },
+    ],
+  };
+  assert.equal(terminalLayerWorkspaceCtxEqual(base, next), false);
 });
 
 test("terminal layer side panel stable ctx ignores linked terminal cwd changes", () => {
@@ -203,10 +234,19 @@ test("terminal layer side panel stable ctx tracks session hosts and workspaces",
     }),
     false,
   );
+  // Focus-only workspace identity changes must not bust stable side-panel equal
+  // (System/SFTP follow focus via sidePanelLiveStore).
   assert.equal(
     terminalLayerSidePanelStableCtxEqual(baseCtx, {
       ...baseCtx,
       workspaceById: new Map([["ws-1", workspace({ focusedSessionId: "session-2" })]]),
+    }),
+    true,
+  );
+  assert.equal(
+    terminalLayerSidePanelStableCtxEqual(baseCtx, {
+      ...baseCtx,
+      workspaceById: new Map([["ws-1", workspace({ title: "Renamed" })]]),
     }),
     false,
   );
@@ -237,13 +277,14 @@ test("terminal layer side panel stable ctx re-renders when session transport fla
   );
 });
 
-test("terminal layer side panel re-renders when linked terminal cwd changes", () => {
+test("terminal layer side panel live equal still tracks cwd; view ignores live cwd", () => {
   const baseCtx = {
     mountedSftpTabIds: ["workspace-1"],
     activeTerminalCwd: "/home/user",
     sftpFollowTerminalCwd: true,
   };
 
+  // Live equal still sees cwd (for diagnostic / full side-panel equal helpers).
   assert.equal(
     terminalLayerSidePanelCtxEqual(
       baseCtx,
@@ -251,12 +292,13 @@ test("terminal layer side panel re-renders when linked terminal cwd changes", ()
     ),
     false,
   );
+  // View equal uses stable keys only — cwd flows through sidePanelLiveStore.
   assert.equal(
     terminalLayerViewCtxEqual(
       baseCtx,
       { ...baseCtx, activeTerminalCwd: "/home/user/project" },
     ),
-    false,
+    true,
   );
 });
 
@@ -278,6 +320,19 @@ test("terminal layer side panel re-renders when follow terminal cwd setting chan
     terminalLayerViewCtxEqual(
       baseCtx,
       { ...baseCtx, sftpFollowTerminalCwd: true },
+    ),
+    false,
+  );
+});
+
+test("terminal layer side panel stable ctx re-renders when knownHosts change", () => {
+  const baseCtx = {
+    knownHosts: [{ id: "kh-1", hostname: "a.example", port: 22 }],
+  };
+  assert.equal(
+    terminalLayerSidePanelStableCtxEqual(
+      baseCtx,
+      { ...baseCtx, knownHosts: [{ id: "kh-2", hostname: "b.example", port: 22 }] },
     ),
     false,
   );

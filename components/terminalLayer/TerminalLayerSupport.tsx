@@ -1,6 +1,10 @@
 import React, { createContext, lazy, memo, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import { activeTabStore } from '../../application/state/activeTabStore';
+import {
+  applySessionPresentation,
+  usePresentedSession,
+} from '../../application/state/sessionPresentationStore';
 import { useTerminalLayoutSuppressActive } from '../../application/state/terminalLayoutSuppressStore';
 import type { TerminalSessionExitEvent } from '../../application/state/resolveTerminalSessionExitIntent';
 import { createTerminalSelectionAttachment } from '../../application/state/terminalSelectionAttachment';
@@ -13,6 +17,7 @@ export { buildAITerminalSessionInfo };
 export type { AITerminalSessionInfo };
 import { collectSessionIds, SplitDirection } from '../../domain/workspace';
 import { resolveSessionTabTitle } from '../../domain/sessionTabTitle';
+import { terminalPaneSessionsEqual } from '../../domain/terminalPaneSessionsEqual';
 import {
   resolveTerminalHibernateEnabled,
   resolveTerminalHibernateEnabledForProtocol,
@@ -428,6 +433,8 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
             <LazyLoadBoundary name="AI side panel" resetKey={tabId}>
               <Suspense fallback={<AIChatSidePanelFallback />}>
                 <LazyAIChatSidePanel
+                    // Full list keeps fuzzy history ranking; panel areEqual only
+                    // compares exact-scope session object refs for stream isolation.
                     sessions={aiState.sessions}
                     activeSessionIdMap={aiState.activeSessionIdMap}
                     draftsByScope={aiState.draftsByScope}
@@ -545,7 +552,6 @@ export interface TerminalLayerProps {
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
   onCommandExecuted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
-  shellHistory?: import('../../types').ShellHistoryEntry[];
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onCreateWorkspaceFromSessions: (baseSessionId: string, joiningSessionId: string, hint: Exclude<SplitHint, null>) => void;
   onAddSessionToWorkspace: (workspaceId: string, sessionId: string, hint: Exclude<SplitHint, null>) => void;
@@ -660,7 +666,6 @@ interface TerminalPaneProps {
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
   onCommandExecuted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
-  shellHistory?: import('../../types').ShellHistoryEntry[];
   onCommandSubmitted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
   onSetWorkspaceFocusedSession?: (workspaceId: string, sessionId: string) => void;
   onSplitSession?: (sessionId: string, direction: SplitDirection) => void;
@@ -840,7 +845,10 @@ export function useWorkspaceDetachPointerDrag({
     const ownerDocument = event.currentTarget.ownerDocument;
     const ownerWindow = ownerDocument.defaultView;
     const startPoint = { clientX: event.clientX, clientY: event.clientY };
-    const dragLabel = resolveSessionTabTitle(session, terminalSettings?.dynamicTabTitleMode);
+    const dragLabel = resolveSessionTabTitle(
+    applySessionPresentation(session),
+    terminalSettings?.dynamicTabTitleMode,
+  );
     let dragStarted = false;
     let cleanupFinished = false;
     let ghostEl: HTMLDivElement | null = null;
@@ -1108,6 +1116,13 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
   );
   const renderSnapshot = useSyncExternalStore(activeTabStore.subscribe, getRenderSnapshot, getRenderSnapshot);
   const { paneState, isFocusedPane } = parseTerminalPaneRenderSnapshot(renderSnapshot);
+  // Live titles/icons are store-driven; per-session snapshot so other panes do
+  // not re-render when only a sibling title changes.
+  const presentedSession = usePresentedSession(session);
+  const sessionDisplayName = resolveSessionTabTitle(
+    presentedSession,
+    terminalSettings?.dynamicTabTitleMode,
+  );
   const activeWorkspaceId = paneState.workspaceId;
   const isVisible = paneState.isVisible;
   const paneElementRef = useRef<HTMLDivElement | null>(null);
@@ -1388,7 +1403,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
         sshDebugLogEnabled={sshDebugLogEnabled}
         sudoAutofillPassword={sudoAutofillPassword}
         sudoAutofillCandidates={sudoAutofillCandidates}
-        sessionDisplayName={resolveSessionTabTitle(session, terminalSettings?.dynamicTabTitleMode)}
+        sessionDisplayName={sessionDisplayName}
         showSelectionAIAction={showSelectionAIAction}
         onAddSelectionToAI={onAddSelectionToAI}
         onRename={handleRename}
@@ -1462,7 +1477,6 @@ interface TerminalPanesHostProps {
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
   onCommandExecuted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
-  shellHistory?: import('../../types').ShellHistoryEntry[];
   onCommandSubmitted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
   onSetWorkspaceFocusedSession?: (workspaceId: string, sessionId: string) => void;
   onSplitSession?: (sessionId: string, direction: SplitDirection) => void;
@@ -1494,7 +1508,8 @@ const terminalPanesHostPropsAreEqual = (
   prev: TerminalPanesHostProps,
   next: TerminalPanesHostProps,
 ): boolean => {
-  if (prev.sessions !== next.sessions) return false;
+  // Ignore TopTabs-only presentation fields on sessions (dynamicTitle, coding CLI).
+  if (!terminalPaneSessionsEqual(prev.sessions, next.sessions)) return false;
   if (prev.sessionHostsMap !== next.sessionHostsMap) return false;
   if (prev.sessionChainHostsMap !== next.sessionChainHostsMap) return false;
   if (prev.sessionSudoAutofillPasswordsMap !== next.sessionSudoAutofillPasswordsMap) return false;

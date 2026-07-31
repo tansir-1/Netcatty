@@ -28,6 +28,11 @@ import { clearSessionFontSizeOverride as clearSessionFontSizeOverrideFields } fr
 import { buildOrderedWorkTabIds, reorderWorkTabIds } from '../app/workTabSurface';
 import { activeTabStore } from './activeTabStore';
 import {
+  publishSessionCodingCliProvider,
+  publishSessionDynamicTitle,
+  sessionPresentationStore,
+} from './sessionPresentationStore';
+import {
   closeSessionsState,
   detachSessionFromWorkspaceState,
   replaceDissolvedWorkspaceTabOrder,
@@ -46,9 +51,11 @@ import { sessionRestoreStorage } from './sessionRestoreStorage';
 import {
   buildAndWriteSessionRestorePayload,
   createInitialRestoredSessionState,
+  patchSessionRestoreActiveTabId,
   shouldPersistSessionRestoreState,
   updateRestoredSessionStatusState,
 } from './sessionRestoreState';
+import type { SessionRestorePayload } from '../../domain/sessionRestore';
 import { resolveRestorePreviousSessionSetting } from './sessionRestoreSettings';
 import type { CodingCliProviderId } from '../../domain/codingCliProviders';
 import { normalizeCodingCliDynamicTitleForStorage } from '../../domain/codingCliTitleParse';
@@ -286,6 +293,10 @@ export const useSessionState = ({
     }
 
     let timeout: number | undefined;
+    let activeTabPatchTimeout: number | undefined;
+    // Last full restore payload written this session. Tab switches patch only
+    // activeTabId against this cache instead of re-serializing every session.
+    let lastFullPayload: SessionRestorePayload | null = null;
 
     const persistNow = () => {
       const sessionsForRestore = sessionsRef.current.map((session) => {
@@ -303,7 +314,7 @@ export const useSessionState = ({
         tabOrderRef.current,
       );
       const clearOnEmpty = hasSeenRestorableSessionRestoreStateRef.current && !hasRestorableState;
-      buildAndWriteSessionRestorePayload({
+      const wrote = buildAndWriteSessionRestorePayload({
         restoreEnabled: resolveRestorePreviousSessionSetting(
           localStorageAdapter.readBoolean(STORAGE_KEY_RESTORE_PREVIOUS_SESSION),
         ),
@@ -312,8 +323,20 @@ export const useSessionState = ({
         workspaces: workspacesRef.current,
         tabOrder: tabOrderRef.current,
         activeTabId: activeTabStore.getActiveTabId(),
-        storage: sessionRestoreStorage,
+        storage: {
+          write: (payload) => {
+            lastFullPayload = payload;
+            return sessionRestoreStorage.write(payload);
+          },
+          clear: () => {
+            lastFullPayload = null;
+            sessionRestoreStorage.clear();
+          },
+        },
       });
+      if (!wrote && !hasRestorableState) {
+        lastFullPayload = null;
+      }
     };
 
     const schedulePersist = () => {
@@ -326,14 +349,51 @@ export const useSessionState = ({
       }, 250);
     };
 
+    const scheduleActiveTabPatch = () => {
+      // Coalesce rapid tab clicks. Only patch when we hold a trusted full payload
+      // written by persistNow in this effect. Never storage.read() as a base —
+      // disk can still have pre-connect sessions while live already added a host
+      // and activated its tab (effect recreated, lastFullPayload reset to null).
+      if (activeTabPatchTimeout !== undefined) {
+        window.clearTimeout(activeTabPatchTimeout);
+      }
+      activeTabPatchTimeout = window.setTimeout(() => {
+        activeTabPatchTimeout = undefined;
+        const activeTabId = activeTabStore.getActiveTabId();
+        if (!lastFullPayload) {
+          // Cache empty after effect recreate or before first full write — rebuild
+          // from live sessions/workspaces (debounced with other structural persists).
+          schedulePersist();
+          return;
+        }
+        const result = patchSessionRestoreActiveTabId({
+          activeTabId,
+          cachedPayload: lastFullPayload,
+          storage: {
+            write: (payload) => {
+              lastFullPayload = payload;
+              return sessionRestoreStorage.write(payload);
+            },
+          },
+        });
+        if (result.status === "missing") {
+          schedulePersist();
+        }
+      }, 100);
+    };
+
     schedulePersist();
     scheduleSessionRestorePersistRef.current = schedulePersist;
-    const unsubscribeActiveTab = activeTabStore.subscribeSync(schedulePersist);
+    const unsubscribeActiveTab = activeTabStore.subscribeSync(scheduleActiveTabPatch);
 
     const handlePageHide = () => {
       if (timeout !== undefined) {
         window.clearTimeout(timeout);
         timeout = undefined;
+      }
+      if (activeTabPatchTimeout !== undefined) {
+        window.clearTimeout(activeTabPatchTimeout);
+        activeTabPatchTimeout = undefined;
       }
       persistNow();
     };
@@ -345,6 +405,9 @@ export const useSessionState = ({
       scheduleSessionRestorePersistRef.current = () => {};
       if (timeout !== undefined) {
         window.clearTimeout(timeout);
+      }
+      if (activeTabPatchTimeout !== undefined) {
+        window.clearTimeout(activeTabPatchTimeout);
       }
       unsubscribeActiveTab();
       window.removeEventListener("pagehide", handlePageHide);
@@ -388,38 +451,19 @@ export const useSessionState = ({
   const updateSessionDynamicTitle = useCallback((sessionId: string, title: string | null) => {
     const normalizedTitle = title ? normalizeCodingCliDynamicTitleForStorage(title) : '';
     const nextTitle = normalizedTitle.length > 0 ? normalizedTitle : null;
-    setSessions((prev) => {
-      const session = prev.find((candidate) => candidate.id === sessionId);
-      if (!session) return prev;
-      if ((session.dynamicTitle ?? null) === nextTitle) return prev;
-      return prev.map((candidate) => {
-        if (candidate.id !== sessionId) return candidate;
-        if (!nextTitle) {
-          const { dynamicTitle: _removed, ...rest } = candidate;
-          return rest;
-        }
-        return { ...candidate, dynamicTitle: nextTitle };
-      });
-    });
+    // Presentation-only: write the external store so TopTabs / focus sidebar /
+    // pane chrome refresh via applySessionPresentation without setSessions
+    // thrashing appTerminalDomain / TerminalLayer parents.
+    publishSessionDynamicTitle(sessionId, nextTitle);
   }, []);
 
   const updateSessionCodingCliProvider = useCallback((
     sessionId: string,
     providerId: CodingCliProviderId | null,
   ) => {
-    setSessions((prev) => {
-      const session = prev.find((candidate) => candidate.id === sessionId);
-      if (!session) return prev;
-      if ((session.codingCliProviderId ?? null) === providerId) return prev;
-      return prev.map((candidate) => {
-        if (candidate.id !== sessionId) return candidate;
-        if (!providerId) {
-          const { codingCliProviderId: _removed, ...rest } = candidate;
-          return rest;
-        }
-        return { ...candidate, codingCliProviderId: providerId };
-      });
-    });
+    // Presentation-only: store-driven icon chrome. Consumers must overlay via
+    // applySessionPresentation / usePresentedSession (TopTabs, focus sidebar, panes).
+    publishSessionCodingCliProvider(sessionId, providerId);
   }, []);
 
   const createLocalTerminal = useCallback((options?: LocalTerminalOptions) => {
@@ -462,9 +506,13 @@ export const useSessionState = ({
   }, []);
 
   const closeWorkspace = useCallback((workspaceId: string) => {
-    cleanupClosedTerminalSessions(
-      sessionsRef.current.filter(session => session.workspaceId === workspaceId).map(session => session.id),
-    );
+    const closedIds = sessionsRef.current
+      .filter(session => session.workspaceId === workspaceId)
+      .map(session => session.id);
+    cleanupClosedTerminalSessions(closedIds);
+    for (const sessionId of closedIds) {
+      sessionPresentationStore.clearSession(sessionId);
+    }
     setWorkspaces(prevWorkspaces => {
       const remainingWorkspaces = prevWorkspaces.filter(w => w.id !== workspaceId);
 
@@ -485,6 +533,9 @@ export const useSessionState = ({
 
   const closeSessions = useCallback((sessionIds: string[]) => {
     cleanupClosedTerminalSessions(sessionIds);
+    for (const sessionId of sessionIds) {
+      sessionPresentationStore.clearSession(sessionId);
+    }
     const result = closeSessionsState({
       sessions: sessionsRef.current,
       workspaces: workspacesRef.current,

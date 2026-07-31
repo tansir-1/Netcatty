@@ -570,3 +570,54 @@ test("host tree toggle is hidden on root pages", () => {
     workspaceIds: new Set(),
   }), false);
 });
+
+test("TopTabs applies presentation per session tab, not via global version fan-out", () => {
+  // Global presentationVersion remapping was removed to stop sibling title
+  // thrash from re-rendering the whole tab bar.
+  assert.doesNotMatch(topTabsSource, /presentationVersion/);
+  assert.doesNotMatch(topTabsSource, /sessionPresentationStore\.subscribe/);
+  const topTabItemsSource = readFileSync(new URL("./top-tabs/TopTabItems.tsx", import.meta.url), "utf8");
+  assert.match(topTabItemsSource, /usePresentedSession/);
+  // Workspace detach menu must also apply presentation per session so labels
+  // stay live without remapping TopTabsInner.
+  assert.match(topTabItemsSource, /WorkspaceDetachSessionMenuItem/);
+  assert.match(topTabsSource, /workspaceSessions=/);
+  assert.doesNotMatch(topTabsSource, /workspaceSessionLabels/);
+});
+
+test("tab-switch focus calls refocus primitive directly without outer rAF wrap", () => {
+  const effectsSource = readFileSync(
+    new URL("./terminalLayer/useTerminalLayerEffects.ts", import.meta.url),
+    "utf8",
+  );
+  const focusBlock = effectsSource.slice(
+    effectsSource.indexOf("Restore keyboard focus after switching work tabs"),
+    effectsSource.indexOf("When focusedSessionId changes"),
+  );
+  assert.match(focusBlock, /refocusActiveTerminalSession\(\)/);
+  // Outer rAF wrapper was removed — focusTerminalSessionInput already schedules.
+  assert.doesNotMatch(focusBlock, /requestAnimationFrame\(\(\) => \{\s*refocusActiveTerminalSession/);
+});
+
+test("topTabsAreEqual tracks editorTabs for dirty chrome", () => {
+  assert.match(topTabsSource, /prev\.editorTabs === next\.editorTabs/);
+  assert.match(topTabsSource, /prev\.onRequestCloseEditorTab === next\.onRequestCloseEditorTab/);
+  // Dirty dots come from useEditorTabDirty; structure list is presence-only chrome.
+  assert.match(
+    readFileSync(new URL("./top-tabs/TopTabItems.tsx", import.meta.url), "utf8"),
+    /useEditorTabDirty/,
+  );
+});
+
+test("App shell uses editor presence chrome list not full content tabs", () => {
+  assert.match(appSource, /useEditorTabChromeList/);
+  assert.doesNotMatch(appSource, /useEditorTabs\(\)/);
+});
+
+test("App shell retains presentation-stable sessions for domain memos", () => {
+  assert.match(appSource, /retainStableSessionsIgnoringPresentation/);
+  assert.match(appSource, /sessionsForShell/);
+  assert.match(appSource, /orphanSessionsForShell/);
+  assert.match(appSource, /sessions: sessionsForShell/);
+  assert.match(appSource, /orphanSessions: orphanSessionsForShell/);
+});

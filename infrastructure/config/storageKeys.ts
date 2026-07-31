@@ -67,6 +67,8 @@ export const STORAGE_KEY_COMPOSE_BAR_HEIGHT = 'netcatty_compose_bar_height_v1';
 /** Snippet IDs pinned to the terminal compose bar quick strip. */
 export const STORAGE_KEY_COMPOSE_BAR_PINNED_SNIPPETS = 'netcatty_compose_bar_pinned_snippets_v1';
 export const STORAGE_KEY_VAULT_KNOWN_HOSTS_VIEW_MODE = 'netcatty_vault_known_hosts_view_mode_v1';
+/** Device-local: silently import system OpenSSH known_hosts on Vault load (default true). */
+export const STORAGE_KEY_AUTO_IMPORT_SYSTEM_KNOWN_HOSTS = 'netcatty_auto_import_system_known_hosts_v1';
 
 // Update check
 export const STORAGE_KEY_UPDATE_LAST_CHECK = 'netcatty_update_last_check_v1';
@@ -127,6 +129,9 @@ export const STORAGE_KEY_SFTP_DIRECTORIES_FIRST = 'netcatty_sftp_directories_fir
 export const STORAGE_KEY_SFTP_TOOLBAR_LAYOUT = 'netcatty_sftp_toolbar_layout_v1';
 /** Dense terminal session toolbar actions: show / collapse / hide + order. */
 export const STORAGE_KEY_TERMINAL_TOOLBAR_LAYOUT = 'netcatty_terminal_toolbar_layout_v1';
+/** Terminal host-tree sidebar toolbar: show / collapse / hide + order. */
+export const STORAGE_KEY_TERMINAL_HOST_TREE_TOOLBAR_LAYOUT =
+  'netcatty_terminal_host_tree_toolbar_layout_v1';
 /** Side-panel tab strip: show / collapse / hide + order (supersedes order-only key when present). */
 export const STORAGE_KEY_TERMINAL_SIDE_PANEL_TAB_LAYOUT = 'netcatty_terminal_side_panel_tab_layout_v1';
 export const STORAGE_KEY_SFTP_TRANSFER_PANEL_HEIGHT = 'netcatty_sftp_transfer_panel_height_v1';
