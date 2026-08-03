@@ -123,6 +123,39 @@ test("restoring a paused task also marks it interrupted after restart", () => {
   assert.equal(restored.tasks[0]?.lifecycleEpoch, undefined);
 });
 
+test("restoring terminal tasks strips stale conflict payloads (skip-without-clear legacy)", () => {
+  const conflict = {
+    transferId: "css-dir",
+    fileName: "css",
+    sourcePath: "/src/css",
+    targetPath: "/dst/css",
+    isDirectory: true,
+    existingType: "directory" as const,
+    existingSize: 8192,
+    newSize: 0,
+    existingModified: 1,
+    newModified: 2,
+  };
+  const restored = deserializeSftpTransferCenter(JSON.stringify({
+    version: 1,
+    tasks: [{
+      ...task("css-dir", "cancelled", 1),
+      isDirectory: true,
+      conflict,
+      endTime: Date.now(),
+    }, {
+      ...task("still-open", "attention", 2),
+      isDirectory: true,
+      conflict: { ...conflict, transferId: "still-open" },
+    }],
+  }));
+
+  assert.equal(restored.tasks[0]?.status, "cancelled");
+  assert.equal(restored.tasks[0]?.conflict, undefined);
+  assert.equal(restored.tasks[1]?.status, "attention");
+  assert.equal(restored.tasks[1]?.conflict?.fileName, "css");
+});
+
 test("history keeps unfinished tasks and caps terminal tasks by age and count", () => {
   const now = Date.UTC(2026, 6, 23);
   const old = now - 31 * 24 * 60 * 60 * 1000;
@@ -150,6 +183,49 @@ test("resume rejects changed or shortened source files", () => {
   assert.match(validateTransferResumeSource(resumable, { size: 90, lastModified: 50 }) ?? "", /size changed/);
   assert.match(validateTransferResumeSource(resumable, { size: 100, lastModified: 51 }) ?? "", /modified/);
   assert.match(validateTransferResumeSource(resumable, { size: 40, lastModified: 50 }) ?? "", /checkpoint/);
+  // Upload sources still reject growth.
+  assert.match(validateTransferResumeSource(resumable, { size: 120, lastModified: 50 }) ?? "", /size changed/);
+  // Download snapshots of append-only files may grow; mtime drift is then expected.
+  assert.equal(
+    validateTransferResumeSource(
+      resumable,
+      { size: 120, lastModified: 51 },
+      { allowSourceGrowth: true },
+    ),
+    null,
+  );
+  // Shrink remains unsafe even when growth is allowed.
+  assert.match(
+    validateTransferResumeSource(
+      resumable,
+      { size: 90, lastModified: 50 },
+      { allowSourceGrowth: true },
+    ) ?? "",
+    /size changed/,
+  );
+  // Explicit zero-byte download snapshots may also grow (empty log → first lines).
+  const emptyPlan = {
+    ...task("empty", "interrupted", 1),
+    totalBytes: 0,
+    sourceLastModified: 50,
+    checkpointBytes: 0,
+  };
+  assert.equal(
+    validateTransferResumeSource(
+      emptyPlan,
+      { size: 40, lastModified: 51 },
+      { allowSourceGrowth: true },
+    ),
+    null,
+  );
+  assert.match(
+    validateTransferResumeSource(
+      emptyPlan,
+      { size: 0, lastModified: 51 },
+      { allowSourceGrowth: true },
+    ) ?? "",
+    /modified/,
+  );
 });
 
 test("prune upgrades legacy completed children into the parent checkpoint", () => {

@@ -8,6 +8,7 @@ export const zhTWAiMessages: Messages = {
   'ai.chat.compactingStep': '正在為下一步整理上下文…',
   'ai.chat.compactionRetry': '請求過大，正在壓縮上下文並重試…',
   'ai.chat.compactionBanner': '上下文已壓縮：{before}K → {after}K tokens',
+  'ai.chat.contextUsage': '上下文使用：{used} / {max} tokens',
   'ai.chat.activity.title': 'Agent 活動',
   'ai.chat.activity.plan': '計畫',
   'ai.chat.activity.webSearch': '網頁搜尋',
@@ -257,6 +258,24 @@ export const zhTWAiMessages: Messages = {
   'ai.opencode.check': '檢查',
   'ai.opencode.resetPath': '重置',
 
+  // AI Grok Build（應用內託管 Agent，與 External MCP「新增到 Grok」不同）
+  'ai.grok.title': 'Grok Build',
+  'ai.grok.description': 'xAI 的 Grok Build 程式設計 Agent CLI。安裝 Grok CLI，使用 `grok login` 登入或設定 XAI_API_KEY 後，即可作為外部 Agent 選擇。',
+  'ai.grok.detecting': '偵測中...',
+  'ai.grok.detected': '已偵測到',
+  'ai.grok.notFound': '未找到',
+  'ai.grok.path': '路徑：',
+  'ai.grok.notFoundHint': '在 PATH 中未找到 grok。請安裝 Grok Build CLI 或在下方指定執行檔路徑。',
+  'ai.grok.customPathPlaceholder': '例如 /usr/local/bin/grok',
+  'ai.grok.check': '檢查',
+  'ai.grok.resetPath': '重置',
+  'ai.grok.runtime.acp.title': '使用 Grok ACP（agent stdio）',
+  'ai.grok.runtime.acp.default': '預設',
+  'ai.grok.runtime.acp.description':
+    '透過 Agent Client Protocol（grok agent stdio）接入 Grok。在 session/new 注入 Netcatty MCP。關閉後使用原始 headless streaming-json CLI 路徑。',
+  'ai.grok.runtime.streamingJson.hint':
+    '目前為 headless streaming-json（grok -p --output-format streaming-json）。MCP 透過專案 .grok/config.toml 注入。',
+
   // AI Default Agent
   'ai.defaultAgent': '預設 Agent',
   'ai.defaultAgent.description': '建立新 AI 工作階段時使用的 Agent',
@@ -380,6 +399,7 @@ export const zhTWAiMessages: Messages = {
   'ai.chat.approveOnce': '允許',
   'ai.chat.alwaysAllow': '始終',
   'ai.chat.slashStopDesc': '停止目前 AI 回合並取消進行中的工具',
+  'ai.chat.slashCompactDesc': '壓縮較早的對話上下文',
   'ai.chat.reject': '拒絕',
   'ai.chat.toolLabel': '工具',
   'ai.chat.targetLabel': '目標',
@@ -435,6 +455,7 @@ export const zhTWAiMessages: Messages = {
   'ai.chat.menuUserSkills': '使用者 Skills',
   'ai.chat.menuSlashCommands': '快捷指令',
   'ai.chat.slashCommands': '快捷指令',
+  'ai.chat.slashSystemCommands': '系統指令',
   'ai.chat.slashQuickMessages': '快捷訊息',
   'ai.chat.slashUserSkills': '使用者 Skills',
   'ai.chat.quickMessages': '快捷指令',

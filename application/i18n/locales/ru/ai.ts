@@ -1,6 +1,7 @@
 import type { Messages } from '../types';
 
 export const ruAiMessages: Messages = {
+  'ai.chat.contextUsage': 'Контекст: {used} / {max} токенов',
   // AI Settings
   'ai.agentSettings': 'Настройки агента',
   'ai.chat.preparing': 'Подготовка…',
@@ -210,6 +211,24 @@ export const ruAiMessages: Messages = {
   'ai.codebuddy.elicitation.validation.format': 'Поле «{field}» должно соответствовать формату {format}.',
   'ai.codebuddy.elicitation.validation.option': 'Выберите допустимый вариант для «{field}».',
 
+  // AI Grok Build (in-app managed agent — distinct from External MCP client install)
+  'ai.grok.title': 'Grok Build',
+  'ai.grok.description': 'Агент программирования Grok Build от xAI (CLI). Установите Grok CLI, выполните `grok login` или задайте XAI_API_KEY, затем выберите его как внешнего агента.',
+  'ai.grok.detecting': 'Обнаружение...',
+  'ai.grok.detected': 'Обнаружен',
+  'ai.grok.notFound': 'Не найден',
+  'ai.grok.path': 'Путь:',
+  'ai.grok.notFoundHint': 'Не удалось найти grok в PATH. Установите Grok Build CLI или укажите путь к исполняемому файлу ниже.',
+  'ai.grok.customPathPlaceholder': 'например, /usr/local/bin/grok',
+  'ai.grok.check': 'Проверить',
+  'ai.grok.resetPath': 'Сбросить',
+  'ai.grok.runtime.acp.title': 'Использовать Grok ACP (agent stdio)',
+  'ai.grok.runtime.acp.default': 'По умолчанию',
+  'ai.grok.runtime.acp.description':
+    'Подключение к Grok через Agent Client Protocol (grok agent stdio). Netcatty MCP внедряется в session/new. Выключите, чтобы использовать исходный headless streaming-json CLI.',
+  'ai.grok.runtime.streamingJson.hint':
+    'Режим headless streaming-json (grok -p --output-format streaming-json). MCP внедряется через .grok/config.toml проекта.',
+
   // AI Default Agent
   'ai.defaultAgent': 'Агент по умолчанию',
   'ai.defaultAgent.description': 'Агент, который будет использоваться при запуске новой AI-сессии',
@@ -333,6 +352,7 @@ export const ruAiMessages: Messages = {
   'ai.chat.approveOnce': 'Разрешить один раз',
   'ai.chat.alwaysAllow': 'Всегда разрешать',
   'ai.chat.slashStopDesc': 'Остановить текущий ход AI и отменить выполняющиеся инструменты',
+  'ai.chat.slashCompactDesc': 'Сжать ранний контекст разговора',
   'ai.chat.reject': 'Отклонить',
   'ai.chat.toolLabel': 'Инструмент',
   'ai.chat.targetLabel': 'Цель',
@@ -388,6 +408,7 @@ export const ruAiMessages: Messages = {
   'ai.chat.menuUserSkills': 'Пользовательские навыки',
   'ai.chat.menuSlashCommands': 'Команды /',
   'ai.chat.slashCommands': 'Команды /',
+  'ai.chat.slashSystemCommands': 'Системные команды',
   'ai.chat.slashQuickMessages': 'Быстрые сообщения',
   'ai.chat.slashUserSkills': 'Пользовательские навыки',
   'ai.chat.quickMessages': 'Команды /',
