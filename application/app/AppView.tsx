@@ -113,7 +113,7 @@ function AppViewInner({ domains }: AppViewProps) {
   useMainWindowInputFocusRecovery({ onPageHidden: dismissTransientOverlays });
 
   const {
-    accentMode, addShellHistoryEntry, addSessionToWorkspace, addToWorkspaceDialog, appendHostToWorkspace, appendLocalTerminalToWorkspace,
+    accentMode, addShellHistoryEntry, removeShellHistoryEntry, addSessionToWorkspace, addToWorkspaceDialog, appendHostToWorkspace, appendLocalTerminalToWorkspace,
     clearAndRemoveSource, clearAndRemoveSources, clearUnsavedConnectionLogs, closeLogView, closeSession, closeTabsBatch, closeWorkspace, commitPluginImporterData, commitVaultImportTransaction, copySessionToNewWindowWithCurrentShell, copySessionWithCurrentShell, copyWorkspaceWithCurrentShell,
     connectionLogs, convertKnownHostToHost, createWorkspaceFromSessions, createWorkspaceFromTargets, createWorkspaceWithHosts, customAccent,
     customGroups, currentTerminalTheme, deepLinkHostDraft, deleteConnectionLog, draggingSessionId, effectiveKnownHosts, editorTabs, editorWordWrap, emptyVaultConflict,
@@ -345,6 +345,7 @@ function AppViewInner({ domains }: AppViewProps) {
           onCreateGroup={handleCreateWorkSurfaceHostGroup}
           onImportOrReuseKey={importOrReuseKey}
           onUpdateSnippets={updateSnippets}
+          onUpdateHosts={updateHosts}
         />
 
         <VaultViewContainer appThemeStyle={appThemeStyle}>
@@ -485,6 +486,7 @@ function AppViewInner({ domains }: AppViewProps) {
           onUpdateHost={handleUpdateHostFromTerminal}
           onAddKnownHost={handleAddKnownHost}
           onCommandExecuted={handleTerminalCommandExecuted}
+          onDeleteShellHistoryEntry={removeShellHistoryEntry}
           onTerminalDataCapture={handleTerminalDataCapture}
           onCreateWorkspaceFromSessions={createWorkspaceFromSessions}
           onAddSessionToWorkspace={addSessionToWorkspace}
