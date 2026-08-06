@@ -197,6 +197,9 @@ export const enCoreMessages: Messages = {
   'settings.sessionLogs.timestamps': 'Add timestamps',
   'settings.sessionLogs.timestampsDesc': 'Prefix each line in plain text and HTML logs with the local time.',
   'settings.sessionLogs.hint': 'Session logs capture all terminal output for troubleshooting and auditing purposes.',
+  'settings.sessionLogs.clearAll': 'Clear all logs',
+  'settings.sessionLogs.clearAllDesc': 'Delete all saved session log files and host subdirectories from the save directory.',
+  'settings.sessionLogs.clearConfirm': 'This will permanently delete all session log files in the save directory. This cannot be undone. Continue?',
 
   // Settings > SSH Debug Logs
   'settings.sshDebugLogs.title': 'SSH Debug Logs',
@@ -683,6 +686,10 @@ Highlight the focused split pane:
   'settings.terminal.section.serverStats': 'Server Stats (Linux)',
   'settings.terminal.hostInfoBar.show': 'Show host information bar',
   'settings.terminal.hostInfoBar.show.desc': 'Show the host address and server information above the terminal. Action buttons remain available when hidden.',
+  'settings.terminal.hostInfoBar.titleMode': 'Host information title',
+  'settings.terminal.hostInfoBar.titleMode.desc': 'Choose whether the bar shows the connection address (user@host) or the vault host label.',
+  'settings.terminal.hostInfoBar.titleMode.address': 'Connection address',
+  'settings.terminal.hostInfoBar.titleMode.label': 'Host label',
   'settings.terminal.section.systemManager': 'System Manager',
   'settings.terminal.systemManager.processRefreshInterval': 'Process list refresh',
   'settings.terminal.systemManager.processRefreshInterval.desc': 'How often to refresh the process list in the system manager side panel.',

@@ -196,9 +196,16 @@ jobs:
             }
 
             if (event === 'issues') {
-              return set('issue_classify', {
-                issue_number: String(context.payload.issue.number),
-                reason: `issues:${context.payload.action}`,
+              const issue = context.payload.issue;
+              const decision = auto.decideIssuesEventRoute({
+                action: context.payload.action,
+                labels: issue?.labels || [],
+                actorLogin: context.payload.sender?.login,
+                botLogins: process.env.ISSUE_BOT_LOGINS,
+              });
+              return set(decision.kind, {
+                issue_number: String(issue.number),
+                reason: decision.reason,
               });
             }
 
@@ -264,6 +271,7 @@ jobs:
                   hasOpenBotPull: Boolean(pull),
                   hasOpenRelatedPull: Boolean(relatedPull),
                   body: comment.body,
+                  labels,
                 });
                 if (refined.kind === 'issue_classify') {
                   return set('issue_classify', {
@@ -348,6 +356,41 @@ jobs:
             }
 
             return set('skip', { reason: `unhandled ${event}` });
+
+  ready_for_human_handoff:
+    name: Hand reopened issue to maintainers
+    needs: route
+    if: needs.route.outputs.kind == 'ready_for_human_handoff'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cursor-source-issue-${{ needs.route.outputs.issue_number || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout helpers
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Apply ready-for-human handoff
+        uses: actions/github-script@v9
+        env:
+          ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
+          TRUSTED_COMMENT_AUTHORS: ${{ vars.AUTOMATION_OWN_ACTORS || 'binaricat,netcatty-bot,github-actions[bot]' }}
+        with:
+          github-token: ${{ secrets.TRIAGE_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const auto = require(`${process.env.GITHUB_WORKSPACE}/scripts/cursor-automation.cjs`);
+            await auto.applyReadyForHumanHandoff({
+              github,
+              context,
+              issueNumber: process.env.ISSUE_NUMBER,
+              dedupeMarker: auto.REOPEN_HANDOFF_MARKER,
+              trustedCommentAuthors: process.env.TRUSTED_COMMENT_AUTHORS,
+            });
 
   cleanup_source_issue:
     name: Clean source issue state
@@ -2093,6 +2136,7 @@ jobs:
                 ".cursor-runtime/followup-pending-snapshots.json",
                 ".cursor-runtime/followup-verify-result.json",
                 ".cursor-runtime/followup-test-comparison.json",
+                ".cursor-runtime/followup-base-tests.log",
                 ".cursor-runtime/followup-candidate-lint.log",
                 ".cursor-runtime/followup-candidate-tests.log",
                 ".cursor-runtime/followup-candidate-build.log",
@@ -2114,6 +2158,7 @@ jobs:
             .cursor-runtime/followup-pending-snapshots.json
             .cursor-runtime/followup-verify-result.json
             .cursor-runtime/followup-test-comparison.json
+            .cursor-runtime/followup-base-tests.log
             .cursor-runtime/followup-candidate-lint.log
             .cursor-runtime/followup-candidate-tests.log
             .cursor-runtime/followup-candidate-build.log
@@ -3379,6 +3424,7 @@ jobs:
                 ".cursor-runtime/implement-pr-body.md",
                 ".cursor-runtime/verify-result.json",
                 ".cursor-runtime/test-comparison.json",
+                ".cursor-runtime/base-tests.log",
                 ".cursor-runtime/candidate-lint.log",
                 ".cursor-runtime/candidate-tests.log",
                 ".cursor-runtime/candidate-build.log",
@@ -3400,6 +3446,7 @@ jobs:
             .cursor-runtime/implement-pr-body.out.md
             .cursor-runtime/verify-result.json
             .cursor-runtime/test-comparison.json
+            .cursor-runtime/base-tests.log
             .cursor-runtime/candidate-lint.log
             .cursor-runtime/candidate-tests.log
             .cursor-runtime/candidate-build.log
@@ -3409,6 +3456,14 @@ jobs:
         if: steps.patch.outputs.artifact_ready == 'true' && steps.verify.outputs.passed != 'true'
         run: |
           echo "Candidate patch was preserved, but candidate-specific verification failed." >&2
+          if [[ -f .cursor-runtime/test-comparison.json ]]; then
+            echo "Test comparison:" >&2
+            cat .cursor-runtime/test-comparison.json >&2 || true
+          fi
+          if [[ -f .cursor-runtime/verify-result.json ]]; then
+            echo "Verify result:" >&2
+            cat .cursor-runtime/verify-result.json >&2 || true
+          fi
           exit 1
 
       - name: Mark needs human on implement failure
@@ -4812,6 +4867,7 @@ jobs:
                 ".cursor-runtime/fix.patch",
                 ".cursor-runtime/fix-verify-result.json",
                 ".cursor-runtime/fix-test-comparison.json",
+                ".cursor-runtime/fix-base-tests.log",
                 ".cursor-runtime/fix-candidate-lint.log",
                 ".cursor-runtime/fix-candidate-tests.log",
                 ".cursor-runtime/fix-candidate-build.log",
@@ -4831,6 +4887,7 @@ jobs:
             .cursor-runtime/fix.patch
             .cursor-runtime/fix-verify-result.json
             .cursor-runtime/fix-test-comparison.json
+            .cursor-runtime/fix-base-tests.log
             .cursor-runtime/fix-candidate-lint.log
             .cursor-runtime/fix-candidate-tests.log
             .cursor-runtime/fix-candidate-build.log
@@ -4840,6 +4897,14 @@ jobs:
         if: steps.codex.outputs.action == 'fix' && steps.fixpatch.outputs.artifact_ready == 'true' && steps.fixverify.outputs.passed != 'true'
         run: |
           echo "Codex fix patch was preserved, but candidate-specific verification failed." >&2
+          if [[ -f .cursor-runtime/fix-test-comparison.json ]]; then
+            echo "Test comparison:" >&2
+            cat .cursor-runtime/fix-test-comparison.json >&2 || true
+          fi
+          if [[ -f .cursor-runtime/fix-verify-result.json ]]; then
+            echo "Verify result:" >&2
+            cat .cursor-runtime/fix-verify-result.json >&2 || true
+          fi
           exit 1
 
       - name: Mark needs human when no fix produced
@@ -5296,8 +5361,7 @@ jobs:
               },
             );
             const forceRetry =
-              process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
-            if (
+              process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';            if (
               !forceRetry &&
               auto.shouldSkipExternalCodexRerequest({
                 existingComments: comments,

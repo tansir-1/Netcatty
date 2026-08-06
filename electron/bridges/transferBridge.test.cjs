@@ -12,6 +12,7 @@ const transferBridge = require("./transferBridge.cjs");
 const sftpBridge = require("./sftpBridge.cjs");
 const tempDirBridge = require("./tempDirBridge.cjs");
 const {
+  DOWNLOAD_TRANSFER_CONCURRENCY,
   TRANSFER_CHUNK_SIZE,
   UPLOAD_TRANSFER_CONCURRENCY,
 } = require("./transferLimits.cjs");
@@ -47,6 +48,74 @@ function createFastSftp(overrides) {
   sftp.end = () => {};
   Object.assign(sftp, overrides);
   return sftp;
+}
+
+/**
+ * Pipelined READ mock for bulk SFTP downloads. Bulk transfer no longer has a
+ * serial createReadStream path — tests must exercise open/read fanout.
+ *
+ * @param {Buffer | (() => Buffer)} payloadOrFactory
+ * @param {object} [overrides]
+ * @param {{ stall?: boolean }} [options]
+ *   stall — hold READ callbacks in `pendingReads` until releasePending() is called
+ */
+function createPipelinedDownloadSftp(payloadOrFactory, overrides = {}, options = {}) {
+  const pendingReads = [];
+  const getPayload = typeof payloadOrFactory === "function"
+    ? payloadOrFactory
+    : () => payloadOrFactory;
+  const allowFullFileHashStream = options.allowFullFileHashStream === true;
+  const sftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      if (typeof flags === "function") {
+        // Some call sites pass (path, callback) without flags.
+        flags(null, Buffer.from("read-handle"));
+        return;
+      }
+      callback(null, Buffer.from("read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      const payload = getPayload() || Buffer.alloc(0);
+      const end = Math.min(position + length, payload.length);
+      const slice = payload.subarray(position, end);
+      const deliver = () => {
+        slice.copy(buffer, offset);
+        callback(null, slice.length);
+      };
+      if (options.stall) {
+        pendingReads.push(deliver);
+        return;
+      }
+      setImmediate(deliver);
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    // Hash / sample verification only (bounded start/end). Reject unbounded
+    // opens so a reintroduced bulk createReadStream body path cannot green
+    // success tests by streaming the full file.
+    createReadStream(_remotePath, streamOptions = {}) {
+      const start = streamOptions?.start;
+      const end = streamOptions?.end;
+      if (!allowFullFileHashStream && (!Number.isFinite(start) || !Number.isFinite(end))) {
+        throw new Error("bulk createReadStream must not be used for SFTP download body");
+      }
+      const payload = getPayload() || Buffer.alloc(0);
+      const from = Number.isFinite(start) ? start : 0;
+      const to = Number.isFinite(end) ? end : Math.max(0, payload.length - 1);
+      return Readable.from([Buffer.from(payload.subarray(from, to + 1))]);
+    },
+    ...overrides,
+  });
+  return {
+    sftp,
+    pendingReads,
+    releasePending() {
+      for (const deliver of pendingReads.splice(0)) {
+        try { deliver(); } catch { /* ignore */ }
+      }
+    },
+  };
 }
 
 test("SFTP upload ignores cancellation after remote promotion is committed", async (t) => {
@@ -1554,83 +1623,40 @@ test("pause acknowledges quickly then publishes a full source identity", async (
   assert.equal((await running).error, undefined);
 });
 
-test("remote pause identity rejects a same-size source rewrite", async (t) => {
+test("remote resume identity rejects a same-size source rewrite", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-modifytime-id-"));
   t.after(async () => {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
 
-  const payload = Buffer.from("abcdef");
+  const payload = Buffer.alloc(3 * TRANSFER_CHUNK_SIZE, 11);
+  for (let i = 0; i < payload.length; i += 1) payload[i] = i % 251;
   const modifyTimeMs = 1_700_000_000_000;
-  let currentPayload = payload;
-  const source = new PassThrough();
-  let readStreamCalls = 0;
+  const digest = crypto.createHash("sha256").update(payload).digest("hex");
+  const sourceFingerprint = `sha256:p${payload.length}:${digest}`;
+  const checkpoint = TRANSFER_CHUNK_SIZE;
+  const targetPath = path.join(tempDir, "target.bin");
+  const stagedPath = tempDirBridge.getTransferTempFilePath(
+    "download-modifytime-id-resume",
+    path.basename(targetPath),
+  );
+  await fs.promises.mkdir(path.dirname(stagedPath), { recursive: true });
+  await fs.promises.writeFile(stagedPath, payload.subarray(0, checkpoint));
+
+  // Same size, one byte past the saved prefix rewritten.
+  const rewritten = Buffer.from(payload);
+  rewritten[checkpoint + 4] = 90;
+
+  const { sftp } = createPipelinedDownloadSftp(rewritten);
   const client = {
-    sftp: createFastSftp({
-      createReadStream() {
-        readStreamCalls += 1;
-        return readStreamCalls === 1 ? source : Readable.from(currentPayload);
-      },
-    }),
+    sftp,
     stat() {
-      return Promise.resolve({ size: currentPayload.length, modifyTime: modifyTimeMs });
+      return Promise.resolve({ size: rewritten.length, modifyTime: modifyTimeMs });
     },
     client: { sftp(callback) { callback(new Error("isolated channel unavailable")); } },
   };
   transferBridge.init({ sftpClients: new Map([["source", client]]) });
 
-  const sender = createSender();
-  const targetPath = path.join(tempDir, "target.bin");
-  const running = transferBridge.startTransfer(
-    { sender },
-    {
-      transferId: "download-modifytime-id",
-      sourcePath: "/tmp/source.bin",
-      targetPath,
-      sourceType: "sftp",
-      targetType: "local",
-      sourceSftpId: "source",
-      totalBytes: payload.length,
-      resumable: true,
-    },
-  );
-  t.after(async () => {
-    source.destroy();
-    await transferBridge.cancelTransfer(null, { transferId: "download-modifytime-id" });
-    await running.catch(() => {});
-    transferBridge.clearPendingCancel("download-modifytime-id");
-  });
-
-  const readyDeadline = Date.now() + 1000;
-  while (source.listenerCount("data") === 0 && Date.now() < readyDeadline) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  assert.ok(source.listenerCount("data") > 0);
-  source.write(payload.subarray(0, 3));
-  await new Promise((resolve) => setImmediate(resolve));
-
-  const paused = await transferBridge.pauseTransfer(null, { transferId: "download-modifytime-id" });
-  assert.equal(paused.success, true);
-  const digest = crypto.createHash("sha256").update(payload).digest("hex");
-  // Remote download fingerprints are versioned with planned prefix coverage.
-  const expectedFingerprint = `sha256:p${payload.length}:${digest}`;
-  const fingerprintPublished = await waitUntil(() => sender.sent.some((entry) => (
-    entry.channel === "netcatty:transfer:progress"
-    && entry.payload.sourceFingerprint === expectedFingerprint
-  )));
-  assert.equal(fingerprintPublished, true, "remote pause identity must be published after pause acknowledgement");
-  const fingerprintEntry = sender.sent.findLast((entry) => (
-    entry.channel === "netcatty:transfer:progress"
-    && entry.payload.sourceFingerprint === expectedFingerprint
-  ));
-  const sourceFingerprint = fingerprintEntry?.payload.sourceFingerprint;
-  assert.equal(sourceFingerprint, expectedFingerprint);
-
-  await transferBridge.cancelTransfer(null, { transferId: "download-modifytime-id" });
-  assert.match((await running).error || "", /cancel/i);
-
-  currentPayload = Buffer.from(payload);
-  currentPayload[4] = 90;
   const restarted = await transferBridge.startTransfer(
     { sender: createSender() },
     {
@@ -1642,11 +1668,11 @@ test("remote pause identity rejects a same-size source rewrite", async (t) => {
       sourceSftpId: "source",
       totalBytes: payload.length,
       resumable: true,
-      checkpointBytes: 3,
+      checkpointBytes: checkpoint,
       sourceFingerprint,
     },
   );
-  assert.match(restarted.error || "", /source file has changed/i);
+  assert.match(restarted.error || "", /source file has changed|saved content does not match/i);
 });
 
 test("legacy sampled identity restarts safely instead of resuming mixed content", async (t) => {
@@ -1670,14 +1696,16 @@ test("legacy sampled identity restarts safely instead of resuming mixed content"
   await fs.promises.mkdir(path.dirname(stagePath), { recursive: true });
   await fs.promises.writeFile(stagePath, original.subarray(0, checkpoint));
 
+  const { sftp } = createPipelinedDownloadSftp(rewritten, {
+    // meta: fingerprints restart from zero; hash helpers may still sample.
+    createReadStream(_remotePath, options = {}) {
+      const start = Number.isFinite(options.start) ? options.start : 0;
+      const end = Number.isFinite(options.end) ? options.end : rewritten.length - 1;
+      return Readable.from(Buffer.from(rewritten.subarray(start, end + 1)));
+    },
+  });
   const client = {
-    sftp: createFastSftp({
-      createReadStream(_remotePath, options = {}) {
-        const start = Number.isFinite(options.start) ? options.start : 0;
-        const end = Number.isFinite(options.end) ? options.end : rewritten.length - 1;
-        return Readable.from(Buffer.from(rewritten.subarray(start, end + 1)));
-      },
-    }),
+    sftp,
     stat() {
       return Promise.resolve({ size: fileSize, modifyTime: modifyTimeMs });
     },
@@ -1700,7 +1728,7 @@ test("legacy sampled identity restarts safely instead of resuming mixed content"
       sourceFingerprint: `meta:${fileSize}:${modifyTimeMs}`,
     },
   );
-  assert.equal(result.error, undefined);
+  assert.equal(result.error, undefined, result.error);
   assert.deepEqual(await fs.promises.readFile(targetPath), rewritten);
 });
 
@@ -3867,7 +3895,7 @@ test("resumable SFTP downloads reject growth when the planned prefix was rewritt
   }
 });
 
-test("stream fallback resume skips source open when checkpoint already covers the snapshot", async (t) => {
+test("checkpoint-complete resume skips source open when checkpoint already covers the snapshot", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-download-complete-checkpoint-"));
   const transferId = "download-complete-checkpoint-growth";
   const targetPath = path.join(tempDir, "download.bin");
@@ -3882,23 +3910,35 @@ test("stream fallback resume skips source open when checkpoint already covers th
   const grownRemote = Buffer.concat([snapshot, Buffer.alloc(4 * 1024, 92)]);
   await fs.promises.mkdir(path.dirname(stagedPath), { recursive: true });
   await fs.promises.writeFile(stagedPath, snapshot);
+  // Prefix fingerprint keeps the checkpoint (meta: fingerprints are cleared
+  // and restart from zero before downloadFile runs). Matches the planned
+  // snapshot size so append growth on the remote does not fail identity.
+  const digest = crypto.createHash("sha256").update(snapshot).digest("hex");
+  const sourceFingerprint = `sha256:p${snapshot.length}:${digest}`;
 
-  let bodyStreamAtOldEof = false;
-  const serveReadStream = (_remotePath, options = {}) => {
-    const start = Number.isFinite(options.start) ? options.start : 0;
-    const end = Number.isFinite(options.end) ? options.end : grownRemote.length - 1;
-    // A buggy resume would open the transfer body at the planned EOF and pull
-    // the append tail. Prefix verification only reads [0, snapshot).
-    if (start >= snapshot.length) {
-      bodyStreamAtOldEof = true;
-    }
-    return Readable.from([Buffer.from(grownRemote.subarray(start, end + 1))]);
-  };
+  let bodyOpenAtOldEof = false;
+  let openCalls = 0;
   const sharedSftp = createFastSftp({
-    createReadStream: serveReadStream,
+    open() {
+      openCalls += 1;
+      bodyOpenAtOldEof = true;
+      throw new Error("must not open transfer body at planned EOF");
+    },
+    read() {
+      throw new Error("must not READ after planned EOF");
+    },
+    createReadStream(_remotePath, options = {}) {
+      const start = Number.isFinite(options.start) ? options.start : 0;
+      // Prefix verification may sample [0, snapshot); body open at EOF is the bug.
+      if (start >= snapshot.length) bodyOpenAtOldEof = true;
+      // Allow prefix hash reads for resume verification; reject transfer-body EOF opens.
+      if (start >= snapshot.length) {
+        throw new Error("must not open createReadStream at planned EOF");
+      }
+      return Readable.from([Buffer.from(grownRemote.subarray(start, (options.end ?? start) + 1))]);
+    },
   });
   const client = {
-    // Force sequential fallback (no isolated fast channel).
     __netcattySudoMode: true,
     sftp: sharedSftp,
     stat() {
@@ -3925,16 +3965,18 @@ test("stream fallback resume skips source open when checkpoint already covers th
       totalBytes: snapshot.length,
       resumable: true,
       checkpointBytes: snapshot.length,
+      sourceFingerprint,
     },
   );
 
   assert.equal(result.error, undefined, result.error);
-  assert.equal(bodyStreamAtOldEof, false, "must not open transfer body stream at the old EOF");
+  assert.equal(openCalls, 0, "checkpoint-complete must not open remote handle");
+  assert.equal(bodyOpenAtOldEof, false, "must not open transfer body at the old EOF");
   const downloaded = await fs.promises.readFile(targetPath);
   assert.deepEqual(downloaded, snapshot);
 });
 
-test("stream fallback treats a zero-byte snapshot as complete when remote has grown", async (t) => {
+test("zero-byte snapshot is complete when remote has grown (no body open)", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-download-empty-growth-"));
   const transferId = "download-empty-snapshot-growth";
   const targetPath = path.join(tempDir, "empty.log");
@@ -3945,15 +3987,22 @@ test("stream fallback treats a zero-byte snapshot as complete when remote has gr
   });
 
   // Preflight sees an empty file; later stats report append growth. The body
-  // stream must not open (unbounded read would pull the tail and fail).
+  // path must not open (unbounded read would pull the tail and fail).
   const grownRemote = Buffer.from("appended-after-empty-snapshot");
   let remoteSize = 0;
-  let bodyStreamOpened = false;
+  let bodyOpened = false;
   const sharedSftp = createFastSftp({
+    open() {
+      bodyOpened = true;
+      throw new Error("must not OPEN body for zero-byte snapshot");
+    },
+    read() {
+      bodyOpened = true;
+      throw new Error("must not READ body for zero-byte snapshot");
+    },
     createReadStream() {
-      bodyStreamOpened = true;
-      remoteSize = grownRemote.length;
-      return Readable.from([grownRemote]);
+      bodyOpened = true;
+      throw new Error("must not createReadStream for zero-byte snapshot");
     },
   });
   const client = {
@@ -3989,7 +4038,7 @@ test("stream fallback treats a zero-byte snapshot as complete when remote has gr
   );
 
   assert.equal(result.error, undefined, result.error);
-  assert.equal(bodyStreamOpened, false, "zero-byte planned snapshot must not open a source stream");
+  assert.equal(bodyOpened, false, "zero-byte planned snapshot must not open a source body");
   const downloaded = await fs.promises.readFile(targetPath);
   assert.equal(downloaded.length, 0);
 });
@@ -4126,6 +4175,3022 @@ test("uploads prefer concurrent shared channel over serial WriteStream", async (
   assert.ok(
     maxInFlight <= UPLOAD_TRANSFER_CONCURRENCY,
     `expected concurrency <= ${UPLOAD_TRANSFER_CONCURRENCY}, got ${maxInFlight}`,
+  );
+});
+
+test("cancel during stalled shared upload OPEN drains before remote cleanup", async (t) => {
+  // Codex P2 on a7f96c94: cancel rejected shared write OPEN immediately, so
+  // runRemoteUploadTransaction cleaned up the stage before a late "w" OPEN
+  // recreated it — leaving an orphan .part (or truncating an in-place target).
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-open-drain-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 41));
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  let releaseOpen = null;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      releaseOpen = () => {
+        remoteFiles.set(key, Buffer.alloc(0));
+        eventLog.push(`open-created:${key}`);
+        callback(null, Buffer.from(`handle:${key}`));
+      };
+    },
+    write() {
+      throw new Error("WRITE must not run after cancel during OPEN");
+    },
+    close(_handle, callback) {
+      eventLog.push("close");
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ size: remoteFiles.get(key).length });
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-drain-cancel";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared write OPEN to stall");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+
+  // Must still be waiting for OPEN drain — immediate settle would be the bug.
+  let settledEarly = false;
+  await Promise.race([
+    running.then(() => { settledEarly = true; }),
+    new Promise((resolve) => setTimeout(resolve, 100)),
+  ]);
+  assert.equal(settledEarly, false, "shared write OPEN cancel must drain before settle");
+
+  releaseOpen?.();
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("transfer did not settle after drained shared write OPEN")), 3000);
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.ok(sender.sent.some((entry) => entry.channel === "netcatty:transfer:cancelled"));
+
+  const closeIdx = eventLog.indexOf("close");
+  const deleteIdx = eventLog.findIndex((entry) => entry.startsWith("delete:"));
+  assert.ok(closeIdx >= 0, `expected CLOSE before cleanup, log=${eventLog.join(",")}`);
+  assert.ok(deleteIdx >= 0, `expected stage delete after CLOSE, log=${eventLog.join(",")}`);
+  assert.ok(closeIdx < deleteIdx, `CLOSE must precede cleanup delete, log=${eventLog.join(",")}`);
+  assert.equal(
+    [...remoteFiles.keys()].some((key) => key.includes(".netcatty-upload-")),
+    false,
+    `expected no orphan staged upload, remaining=${[...remoteFiles.keys()].join(",")}`,
+  );
+});
+
+test("shared upload OPEN drain force-completes when cancel has no OPEN callback", async (t) => {
+  // Codex P2 on cd57d960: cancel settle without force-complete left
+  // sharedWriteOpenDrain pending forever when OPEN never arrived and no
+  // channel error fired, hanging the transfer and SFTP lease.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-open-cancel-no-callback-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 51));
+
+  let endCalls = 0;
+  let openCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, _callback) {
+      assert.equal(flags, "w");
+      openCalls += 1;
+      // Never invoke the OPEN callback (stalled shared channel, no error).
+    },
+    write() {
+      throw new Error("WRITE must not run after cancel during OPEN");
+    },
+    close() {
+      throw new Error("CLOSE must not run without an OPEN handle");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      const error = new Error("ENOENT");
+      error.code = 2;
+      return Promise.reject(error);
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete() {},
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-cancel-no-callback";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload-cancel-hang.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => openCalls >= 1, 2000);
+  assert.ok(ready, "expected shared write OPEN to stall");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer hung awaiting shared write OPEN drain after cancel")),
+        5500,
+      );
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:complete"), false);
+});
+
+test("shared upload cancel settle does not hang when best-effort unlink never callbacks", async (t) => {
+  // Codex P2 on 3f0f4608: cancel + OPEN "w" waited for unlink before finishCancel.
+  // A dead shared channel that never invokes unlink left the transfer/lease active.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-unlink-hang-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 61));
+
+  let openCalls = 0;
+  let unlinkCalls = 0;
+  let endCalls = 0;
+  let openCallback = null;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      openCalls += 1;
+      openCallback = callback;
+    },
+    unlink(_remotePath, _callback) {
+      unlinkCalls += 1;
+      // Never invoke unlink callback (stalled shared channel).
+    },
+    write() {
+      throw new Error("WRITE must not run after cancel during OPEN");
+    },
+    close(_handle, callback) {
+      callback?.(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      const error = new Error("ENOENT");
+      error.code = 2;
+      return Promise.reject(error);
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete() {},
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-cancel-unlink-hang";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload-cancel-unlink-hang.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => openCalls >= 1 && openCallback, 2000);
+  assert.ok(ready, "expected shared write OPEN to stall with callback held");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+  // OPEN returns after cancel — triggers close + best-effort unlink path.
+  openCallback(null, Buffer.from("handle:hang-unlink"));
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer hung awaiting best-effort unlink after cancel")),
+        5500,
+      );
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.ok(unlinkCalls >= 1, "expected best-effort unlink after cancel OPEN");
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+});
+
+test("shared upload OPEN drain survives cancel settle timeout", async (t) => {
+  // Codex P2 on af9cef2e / 0cda4a39 / cd57d960: cancel settle + drain
+  // force-complete must not hang, and a late truncating OPEN on a generated
+  // stage after that must close + unlink so stage cleanup cannot leave a
+  // recreate orphan.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-open-drain-timeout-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 43));
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  let releaseOpen = null;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      releaseOpen = () => {
+        remoteFiles.set(key, Buffer.alloc(0));
+        eventLog.push(`open-created:${key}`);
+        callback(null, Buffer.from(`handle:${key}`));
+      };
+    },
+    write() {
+      throw new Error("WRITE must not run after cancel during OPEN");
+    },
+    close(_handle, callback) {
+      eventLog.push("close");
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      const key = String(remotePath);
+      eventLog.push(`unlink:${key}`);
+      remoteFiles.delete(key);
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ size: remoteFiles.get(key).length });
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-drain-timeout";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload-timeout.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared write OPEN to stall");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+
+  // Past cancel settle (2s) + drain force-complete (2s): transfer must settle
+  // without an OPEN callback so lease/admission cannot hang.
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("transfer hung after cancel OPEN drain force-complete")), 5500);
+    }),
+  ]);
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+
+  // Late OPEN after force-complete — must close + unlink, no orphan stage.
+  releaseOpen?.();
+  const lateCleanup = await waitUntil(
+    () => eventLog.includes("close") && eventLog.some((entry) => entry.startsWith("unlink:")),
+    2000,
+  );
+  assert.ok(lateCleanup, `expected late OPEN close+unlink, log=${eventLog.join(",")}`);
+  assert.equal(
+    [...remoteFiles.keys()].some((key) => key.includes(".netcatty-upload-")),
+    false,
+    `expected no orphan staged upload, remaining=${[...remoteFiles.keys()].join(",")}`,
+  );
+});
+
+test("in-place shared upload cancel does not unlink final target after late OPEN", async (t) => {
+  // Codex P1 on a9f748c8: cancel+truncating "w" unlinked filePath unconditionally,
+  // so late OPEN on an in-place/symlink destination could delete the final target.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-inplace-open-cancel-nounlink-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 53));
+  const targetPath = "/tmp/inplace-link.bin";
+  const existingPayload = Buffer.from("keep-me");
+
+  const remoteFiles = new Map([[targetPath, Buffer.from(existingPayload)]]);
+  const eventLog = [];
+  let releaseOpen = null;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    lstat(remotePath, callback) {
+      const key = String(remotePath);
+      if (key.includes(".netcatty-backup-") || key.includes(".netcatty-upload-")) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        callback(error);
+        return;
+      }
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        callback(error);
+        return;
+      }
+      callback(null, {
+        size: remoteFiles.get(key).length,
+        mode: 0o120777,
+        isDirectory: () => false,
+        isSymbolicLink: () => true,
+      });
+    },
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      assert.equal(key, targetPath, "in-place upload must OPEN the final target");
+      releaseOpen = () => {
+        remoteFiles.set(key, Buffer.alloc(0));
+        eventLog.push(`open-created:${key}`);
+        callback(null, Buffer.from(`handle:${key}`));
+      };
+    },
+    write() {
+      throw new Error("WRITE must not run after cancel during OPEN");
+    },
+    close(_handle, callback) {
+      eventLog.push("close");
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      const key = String(remotePath);
+      eventLog.push(`unlink:${key}`);
+      remoteFiles.delete(key);
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    async stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        throw error;
+      }
+      return { size: remoteFiles.get(key).length };
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-inplace-open-cancel-nounlink";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: false,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared in-place write OPEN to stall");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("transfer hung after in-place cancel OPEN drain force-complete")), 5500);
+    }),
+  ]);
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+
+  releaseOpen?.();
+  const lateClose = await waitUntil(() => eventLog.includes("close"), 2000);
+  assert.ok(lateClose, `expected late OPEN close, log=${eventLog.join(",")}`);
+  assert.equal(
+    eventLog.some((entry) => entry.startsWith("unlink:")),
+    false,
+    `in-place cancel must not unlink final target, log=${eventLog.join(",")}`,
+  );
+  assert.equal(
+    eventLog.some((entry) => entry === `delete:${targetPath}`),
+    false,
+    `in-place cancel must not delete final target, log=${eventLog.join(",")}`,
+  );
+  assert.ok(remoteFiles.has(targetPath), "final in-place target must still exist after cancel");
+});
+
+test("shared upload OPEN drain survives channel error before OPEN callback", async (t) => {
+  // Codex P2 on 532cf6cc: channel error completed sharedWriteOpenDrain before the
+  // OPEN callback, so cleanup could race a late truncating OPEN.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-open-channel-error-drain-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 47));
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  let releaseOpen = null;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      releaseOpen = () => {
+        remoteFiles.set(key, Buffer.alloc(0));
+        eventLog.push(`open-created:${key}`);
+        callback(null, Buffer.from(`handle:${key}`));
+      };
+    },
+    write() {
+      throw new Error("WRITE must not run after channel error during OPEN");
+    },
+    close(_handle, callback) {
+      eventLog.push("close");
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ size: remoteFiles.get(key).length });
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-channel-error-drain";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload-channel-error.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared write OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died during upload OPEN"));
+
+  // Channel error settles the OPEN wait, but cleanup must wait for drain.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(eventLog.some((entry) => entry.startsWith("delete:")), false,
+    "cleanup must not run before late OPEN drain after channel error");
+
+  releaseOpen?.();
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("transfer did not settle after channel error + late OPEN")), 5000);
+    }),
+  ]);
+
+  assert.ok(result.error, "expected transfer to fail after channel error");
+  assert.match(result.error, /shared SFTP channel died during upload OPEN/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.ok(eventLog.includes("close"), `expected CLOSE after late OPEN, log=${eventLog.join(",")}`);
+  // Resumable uploads preserve the stage on error (not cancel), so delete may
+  // not run; the invariant is drain completed (CLOSE) before the failure path
+  // returned, with no racing truncating OPEN after settle.
+  assert.ok(
+    eventLog.indexOf("close") >= 0
+      && eventLog.findIndex((entry) => entry.startsWith("open-created:")) >= 0
+      && eventLog.indexOf("close")
+        > eventLog.findIndex((entry) => entry.startsWith("open-created:")),
+    `late OPEN must be closed before failure returns, log=${eventLog.join(",")}`,
+  );
+});
+
+test("shared upload OPEN drain force-completes when channel error has no OPEN callback", async (t) => {
+  // Codex P2 on 90494c0c: channel error rejected OPEN but left sharedWriteOpenDrain
+  // pending forever when the OPEN callback never arrived, hanging the transfer
+  // and SFTP lease on a dead shared channel.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-open-channel-error-no-callback-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 49));
+
+  let endCalls = 0;
+  let openCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, _callback) {
+      assert.equal(flags, "w");
+      openCalls += 1;
+      // Never invoke the OPEN callback (dead channel after error).
+    },
+    write() {
+      throw new Error("WRITE must not run after channel error during OPEN");
+    },
+    close() {
+      throw new Error("CLOSE must not run without an OPEN handle");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      const error = new Error("ENOENT");
+      error.code = 2;
+      return Promise.reject(error);
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete() {},
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-channel-error-no-callback";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload-channel-error-hang.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => openCalls >= 1, 2000);
+  assert.ok(ready, "expected shared write OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died with no OPEN callback"));
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer hung awaiting shared write OPEN drain after channel error")),
+        5000,
+      );
+    }),
+  ]);
+
+  assert.ok(result.error, "expected transfer to fail after channel error");
+  assert.match(result.error, /shared SFTP channel died with no OPEN callback/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:complete"), false);
+});
+
+test("shared upload OPEN drain unlinks late staged OPEN after channel-error force-complete", async (t) => {
+  // Codex P2 on bd42c51c: late truncating OPEN after channel-error drain
+  // force-complete is not a cancel (`transfer.cancelled` false). Non-resumable
+  // staged uploads already cleaned the stage after the forced drain; the late
+  // "w" OPEN must still unlink the recreated `.netcatty-upload-*` orphan.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-upload-open-channel-error-late-unlink-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 55));
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  let releaseOpen = null;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      releaseOpen = () => {
+        remoteFiles.set(key, Buffer.alloc(0));
+        eventLog.push(`open-created:${key}`);
+        callback(null, Buffer.from(`handle:${key}`));
+      };
+    },
+    write() {
+      throw new Error("WRITE must not run after channel error during OPEN");
+    },
+    close(_handle, callback) {
+      eventLog.push("close");
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      const key = String(remotePath);
+      eventLog.push(`unlink:${key}`);
+      remoteFiles.delete(key);
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    async stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        throw error;
+      }
+      return { size: remoteFiles.get(key).length };
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const sender = createSender();
+  const transferId = "upload-shared-open-channel-error-late-unlink";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath: "/tmp/upload-channel-error-late-unlink.bin",
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      // Non-resumable → cleanupStage runs after failure (no preserve-on-error).
+      resumable: false,
+      skipAdmission: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared write OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died before OPEN callback"));
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer hung awaiting shared write OPEN drain after channel error")),
+        5000,
+      );
+    }),
+  ]);
+  assert.ok(result.error, "expected transfer to fail after channel error");
+  assert.match(result.error, /shared SFTP channel died before OPEN callback/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+
+  // Late OPEN after drain force-complete — must close + unlink generated stage.
+  releaseOpen?.();
+  const lateCleanup = await waitUntil(
+    () => eventLog.includes("close") && eventLog.some((entry) => entry.startsWith("unlink:")),
+    2000,
+  );
+  assert.ok(lateCleanup, `expected late OPEN close+unlink after channel error, log=${eventLog.join(",")}`);
+  assert.equal(
+    [...remoteFiles.keys()].some((key) => key.includes(".netcatty-upload-")),
+    false,
+    `expected no orphan staged upload, remaining=${[...remoteFiles.keys()].join(",")}`,
+  );
+});
+
+test("late shared OPEN unlink still cleans non-resumable stage under same-id retry", async (t) => {
+  // Codex P2 on 7c446c7: retry ownership must not suppress unlink for every
+  // generatedStagePath. Non-resumable uploads use a unique
+  // `.netcatty-upload-*` path per attempt; a stale late OPEN on attempt 1's
+  // path must still unlink so the orphan is not left behind when a same-id
+  // retry already owns activeTransfers.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-open-late-unlink-nonresume-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 59));
+  const targetPath = "/tmp/upload-late-unlink-nonresume.bin";
+  const transferId = "upload-shared-open-late-unlink-nonresume";
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  /** @type {null | (() => void)} */
+  let releaseFirstOpen = null;
+  let openGeneration = 0;
+  let endCalls = 0;
+  /** @type {null | (() => void)} */
+  let releaseRetryWrites = null;
+  const retryWritesReleased = new Promise((resolve) => {
+    releaseRetryWrites = resolve;
+  });
+  /** @type {string | null} */
+  let firstStagePath = null;
+  /** @type {string | null} */
+  let retryStagePath = null;
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      openGeneration += 1;
+      const generation = openGeneration;
+      if (generation === 1) {
+        firstStagePath = key;
+        assert.match(key, /\.netcatty-upload-.*\.part$/, "first attempt must OPEN unique non-resumable stage");
+        releaseFirstOpen = () => {
+          if (!remoteFiles.has(key)) {
+            remoteFiles.set(key, Buffer.alloc(0));
+          }
+          eventLog.push(`open-created-1:${key}`);
+          callback(null, Buffer.from(`handle-1:${key}`));
+        };
+        return;
+      }
+      retryStagePath = key;
+      assert.match(key, /\.netcatty-upload-.*\.part$/, "retry must OPEN a fresh non-resumable stage");
+      assert.notEqual(key, firstStagePath, "non-resumable retry must not reuse first stage path");
+      remoteFiles.set(key, Buffer.from("retry-stage"));
+      eventLog.push(`open-created-${generation}:${key}`);
+      callback(null, Buffer.from(`handle-${generation}:${key}`));
+    },
+    write(handle, buffer, offset, length, position, callback) {
+      void retryWritesReleased.then(() => {
+        const key = String(handle).replace(/^handle-\d+:/, "");
+        const current = remoteFiles.get(key) || Buffer.alloc(0);
+        const end = position + length;
+        const next = Buffer.alloc(Math.max(current.length, end));
+        current.copy(next);
+        buffer.copy(next, position, offset, offset + length);
+        remoteFiles.set(key, next);
+        eventLog.push(`write:${key}:${length}@${position}`);
+        setImmediate(() => callback(null));
+      });
+    },
+    close(handle, callback) {
+      eventLog.push(`close:${String(handle)}`);
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      const key = String(remotePath);
+      eventLog.push(`unlink:${key}`);
+      remoteFiles.delete(key);
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    async stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        throw error;
+      }
+      return { size: remoteFiles.get(key).length };
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const firstSender = createSender();
+  const firstRunning = transferBridge.startTransfer(
+    { sender: firstSender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: false,
+      skipAdmission: true,
+    },
+  );
+
+  const firstOpenReady = await waitUntil(() => typeof releaseFirstOpen === "function", 2000);
+  assert.ok(firstOpenReady, "expected first shared write OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died before first OPEN callback"));
+
+  const firstResult = await Promise.race([
+    firstRunning,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("first transfer hung awaiting shared write OPEN drain after channel error")),
+        5000,
+      );
+    }),
+  ]);
+  assert.ok(firstResult.error, "expected first transfer to fail after channel error");
+  assert.match(firstResult.error, /shared SFTP channel died before first OPEN callback/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+
+  // Same transfer id retry (non-resumable) owns a different stage path before
+  // the stale OPEN callback from attempt 1 arrives.
+  transferBridge.clearPendingCancel(transferId);
+  const retrySender = createSender();
+  const retryRunning = transferBridge.startTransfer(
+    { sender: retrySender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: false,
+      skipAdmission: true,
+    },
+  );
+
+  const retryOpenReady = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("open-created-2:")),
+    3000,
+  );
+  assert.ok(retryOpenReady, `expected retry OPEN, log=${eventLog.join(",")}`);
+  assert.ok(retryStagePath, "retry must have opened a stage");
+  assert.ok(
+    remoteFiles.has(retryStagePath),
+    "retry must own its unique stage before stale late OPEN",
+  );
+  const retryStageBeforeLateOpen = Buffer.from(remoteFiles.get(retryStagePath));
+
+  // Stale late OPEN from attempt 1: must close + unlink attempt-1 stage only.
+  releaseFirstOpen?.();
+  const lateCleanup = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("close:handle-1:"))
+      && eventLog.some((entry) => entry === `unlink:${firstStagePath}`),
+    2000,
+  );
+  assert.ok(
+    lateCleanup,
+    `expected late close+unlink of first non-resumable stage, log=${eventLog.join(",")}`,
+  );
+  assert.equal(
+    eventLog.some((entry) => entry === `unlink:${retryStagePath}`),
+    false,
+    `stale late OPEN must not unlink retry stage, log=${eventLog.join(",")}`,
+  );
+  assert.ok(
+    remoteFiles.has(retryStagePath),
+    "retry stage must survive stale late OPEN on a different path",
+  );
+  assert.ok(
+    remoteFiles.get(retryStagePath).equals(retryStageBeforeLateOpen),
+    "retry stage bytes must not be removed by stale late OPEN unlink",
+  );
+  assert.equal(
+    remoteFiles.has(firstStagePath),
+    false,
+    "first attempt non-resumable stage must be unlinked (no orphan)",
+  );
+
+  releaseRetryWrites?.();
+  await transferBridge.cancelTransfer(null, { transferId });
+  const retryResult = await Promise.race([
+    retryRunning,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("retry transfer hung after cancel")), 5000);
+    }),
+  ]);
+  assert.ok(
+    retryResult.cancelled === true || /cancel/i.test(String(retryResult.error || "")),
+    `expected retry cancel settle, result=${JSON.stringify(retryResult)}`,
+  );
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+});
+
+test("late shared OPEN unlink skips same-id retry resume stage", async (t) => {
+  // Codex P2 on d19ecb88 + P1 on 42a27ef7:
+  // - After drain force-complete, a late truncating "w" must not unlink a
+  //   same-id retry's deterministic resume stage.
+  // - Path gate serializes truncating OPENs on that path; if force-complete
+  //   already released the gate and the retry accepted its own OPEN, a late
+  //   stale OPEN that re-truncates must invalidate the retry rather than allow
+  //   a sparse promote.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-open-late-unlink-retry-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 57));
+  const targetPath = "/tmp/upload-late-unlink-retry.bin";
+  const transferId = "upload-shared-open-late-unlink-retry";
+  const deterministicStagePath = `/tmp/.upload-late-unlink-retry.bin.netcatty-${transferId}.part`;
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  /** @type {null | (() => void)} */
+  let releaseFirstOpen = null;
+  let openGeneration = 0;
+  let endCalls = 0;
+  /** @type {null | (() => void)} */
+  let releaseRetryWrites = null;
+  const retryWritesReleased = new Promise((resolve) => {
+    releaseRetryWrites = resolve;
+  });
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      openGeneration += 1;
+      const generation = openGeneration;
+      if (generation === 1) {
+        assert.equal(key, deterministicStagePath, "first attempt must OPEN deterministic resume stage");
+        releaseFirstOpen = () => {
+          // Model a late server-side truncating OPEN: wipe whatever is at the
+          // path when the stale OPEN finally applies.
+          remoteFiles.set(key, Buffer.alloc(0));
+          eventLog.push(`open-created-1:${key}`);
+          callback(null, Buffer.from(`handle-1:${key}`));
+        };
+        return;
+      }
+      remoteFiles.set(key, Buffer.from("retry-stage"));
+      eventLog.push(`open-created-${generation}:${key}`);
+      callback(null, Buffer.from(`handle-${generation}:${key}`));
+    },
+    write(handle, buffer, offset, length, position, callback) {
+      // Hold retry WRITEs so the stale OPEN can land mid-attempt.
+      void retryWritesReleased.then(() => {
+        const key = String(handle).replace(/^handle-\d+:/, "");
+        const current = remoteFiles.get(key) || Buffer.alloc(0);
+        const end = position + length;
+        const next = Buffer.alloc(Math.max(current.length, end));
+        current.copy(next);
+        buffer.copy(next, position, offset, offset + length);
+        remoteFiles.set(key, next);
+        eventLog.push(`write:${key}:${length}@${position}`);
+        setImmediate(() => callback(null));
+      });
+    },
+    close(handle, callback) {
+      eventLog.push(`close:${String(handle)}`);
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      const key = String(remotePath);
+      eventLog.push(`unlink:${key}`);
+      remoteFiles.delete(key);
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    async stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        throw error;
+      }
+      return { size: remoteFiles.get(key).length };
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const firstSender = createSender();
+  const firstRunning = transferBridge.startTransfer(
+    { sender: firstSender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const firstOpenReady = await waitUntil(() => typeof releaseFirstOpen === "function", 2000);
+  assert.ok(firstOpenReady, "expected first shared write OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died before first OPEN callback"));
+
+  const firstResult = await Promise.race([
+    firstRunning,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("first transfer hung awaiting shared write OPEN drain after channel error")),
+        5000,
+      );
+    }),
+  ]);
+  assert.ok(firstResult.error, "expected first transfer to fail after channel error");
+  assert.match(firstResult.error, /shared SFTP channel died before first OPEN callback/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+
+  // Same-id retry reuses the deterministic stage. Drain force-complete does
+  // not release the path gate: the retry must wait until the stale OPEN
+  // callback settles (Codex P1 — no hard-cap race for different transferIds).
+  transferBridge.clearPendingCancel(transferId);
+  const retrySender = createSender();
+  const retryRunning = transferBridge.startTransfer(
+    { sender: retrySender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(
+    eventLog.some((entry) => entry.startsWith("open-created-2:")),
+    false,
+    `retry must not OPEN while prior gate is held, log=${eventLog.join(",")}`,
+  );
+
+  // Settling the first OPEN frees the gate; then the retry may proceed.
+  releaseFirstOpen?.();
+  const lateClose = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("close:handle-1:")),
+    2000,
+  );
+  assert.ok(lateClose, `expected close of first OPEN handle, log=${eventLog.join(",")}`);
+
+  const retryOpenReady = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("open-created-2:")),
+    5000,
+  );
+  assert.ok(retryOpenReady, `expected retry OPEN after prior gate release, log=${eventLog.join(",")}`);
+
+  releaseRetryWrites?.();
+  const retryResult = await Promise.race([
+    retryRunning,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("retry transfer hung after prior OPEN settled")), 8000);
+    }),
+  ]);
+  // Normal success is { transferId, totalBytes }; cancel/error also settle.
+  assert.ok(
+    retryResult
+    && (
+      (retryResult.transferId && retryResult.error == null && retryResult.cancelled !== true)
+      || retryResult.cancelled === true
+      || retryResult.error
+    ),
+    `expected retry to settle after gate release, result=${JSON.stringify(retryResult)}`,
+  );
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+});
+
+test("truncating shared OPEN path gate serializes same-path retry until prior OPEN settles", async (t) => {
+  // Codex P1 on 42a27ef7: while attempt-1's truncating OPEN is still pending
+  // (no force-complete yet), a same-id retry must not issue OPEN "w" on the
+  // deterministic stage — wait for the prior gate.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-open-path-gate-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 61));
+  const targetPath = "/tmp/upload-path-gate.bin";
+  const transferId = "upload-shared-open-path-gate";
+  const deterministicStagePath = `/tmp/.upload-path-gate.bin.netcatty-${transferId}.part`;
+
+  const remoteFiles = new Map();
+  const eventLog = [];
+  /** @type {null | (() => void)} */
+  let releaseFirstOpen = null;
+  let openGeneration = 0;
+  let endCalls = 0;
+  /** @type {null | (() => void)} */
+  let releaseRetryWrites = null;
+  const retryWritesReleased = new Promise((resolve) => {
+    releaseRetryWrites = resolve;
+  });
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      openGeneration += 1;
+      const generation = openGeneration;
+      if (generation === 1) {
+        releaseFirstOpen = () => {
+          remoteFiles.set(key, Buffer.alloc(0));
+          eventLog.push(`open-created-1:${key}`);
+          callback(null, Buffer.from(`handle-1:${key}`));
+        };
+        return;
+      }
+      remoteFiles.set(key, Buffer.from("retry-after-gate"));
+      eventLog.push(`open-created-${generation}:${key}`);
+      callback(null, Buffer.from(`handle-${generation}:${key}`));
+    },
+    write(handle, buffer, offset, length, position, callback) {
+      void retryWritesReleased.then(() => {
+        const key = String(handle).replace(/^handle-\d+:/, "");
+        const current = remoteFiles.get(key) || Buffer.alloc(0);
+        const end = position + length;
+        const next = Buffer.alloc(Math.max(current.length, end));
+        current.copy(next);
+        buffer.copy(next, position, offset, offset + length);
+        remoteFiles.set(key, next);
+        setImmediate(() => callback(null));
+      });
+    },
+    close(handle, callback) {
+      eventLog.push(`close:${String(handle)}`);
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      eventLog.push(`unlink:${String(remotePath)}`);
+      remoteFiles.delete(String(remotePath));
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    async stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        throw error;
+      }
+      return { size: remoteFiles.get(key).length };
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      remoteFiles.delete(String(remotePath));
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const firstSender = createSender();
+  // Do not emit channel error: keep OPEN pending without force-complete so the
+  // path gate stays held until the OPEN callback.
+  const firstRunning = transferBridge.startTransfer(
+    { sender: firstSender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const firstOpenReady = await waitUntil(() => typeof releaseFirstOpen === "function", 2000);
+  assert.ok(firstOpenReady, "expected first shared write OPEN to stall");
+
+  // Start same-id retry while first OPEN is still pending (gate held).
+  // Overwrite activeTransfers; first attempt is still awaiting OPEN.
+  transferBridge.clearPendingCancel(transferId);
+  const retrySender = createSender();
+  const retryRunning = transferBridge.startTransfer(
+    { sender: retrySender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(
+    eventLog.some((entry) => entry.startsWith("open-created-2:")),
+    false,
+    `retry must wait on path gate while prior truncating OPEN is pending, log=${eventLog.join(",")}`,
+  );
+
+  // Settle first OPEN (cancel it via late path): release callback as success
+  // but first transfer may still be the waiter — force cancel first attempt.
+  await transferBridge.cancelTransfer(null, { transferId: `${transferId}-noop` }).catch(() => {});
+  // First attempt is no longer active (retry replaced it). Release OPEN.
+  releaseFirstOpen?.();
+  const lateClose = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("close:handle-1:")),
+    2000,
+  );
+  assert.ok(lateClose, `expected first OPEN to close after gate release, log=${eventLog.join(",")}`);
+
+  const retryOpenReady = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("open-created-2:")),
+    3000,
+  );
+  assert.ok(
+    retryOpenReady,
+    `expected retry OPEN after prior OPEN settled, log=${eventLog.join(",")}`,
+  );
+  assert.ok(
+    remoteFiles.get(deterministicStagePath)?.equals(Buffer.from("retry-after-gate")),
+    "retry stage must be written by retry OPEN after gate, not wiped by ordering race",
+  );
+
+  releaseRetryWrites?.();
+  await transferBridge.cancelTransfer(null, { transferId });
+  const retryResult = await Promise.race([
+    retryRunning,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("retry hung after path-gate test")), 5000);
+    }),
+  ]);
+  assert.ok(
+    retryResult.cancelled === true || /cancel/i.test(String(retryResult.error || "")),
+    `expected retry cancel settle, result=${JSON.stringify(retryResult)}`,
+  );
+  // First attempt may still be pending cancel/error; do not leave it hanging.
+  void firstRunning.catch(() => {});
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+});
+
+test("remoteOpenPathMatchesStaged compares logical and encoded OPEN paths", () => {
+  // Codex: filePath can be a session-encoded Buffer while stagedRemote.path is
+  // the logical string — strict === would fail and wrongly allow unlink of the
+  // retry-owned stage.
+  const match = transferBridge._remoteOpenPathMatchesStagedForTests;
+  assert.equal(typeof match, "function");
+  const logical = "/tmp/.upload.bin.netcatty-tid.part";
+  assert.equal(
+    match(logical, { path: logical, sftpId: null }),
+    true,
+    "identical logical strings match",
+  );
+  assert.equal(
+    match(Buffer.from(logical), { path: logical, sftpId: null }),
+    true,
+    "OPEN Buffer of logical path matches staged logical path",
+  );
+  assert.equal(
+    match(Buffer.from(logical), {
+      path: logical,
+      sftpId: "missing-session",
+      encoding: "utf-8",
+    }),
+    true,
+    "utf-8 encode of logical path still matches OPEN Buffer",
+  );
+  assert.equal(
+    match("/tmp/other.part", { path: logical, sftpId: null }),
+    false,
+    "different paths must not match",
+  );
+  assert.equal(
+    match(logical, null),
+    false,
+    "missing stagedRemote must not match",
+  );
+  assert.equal(
+    match(logical, { path: "" }),
+    false,
+    "empty staged path must not match",
+  );
+});
+
+test("late shared OPEN unlink still cleans stage when same-id retry is in-place", async (t) => {
+  // Codex P2 on 39e20bfa: skip late unlink only when active.stagedRemote.path
+  // matches. A same-id in-place retry (symlink destination → writeInPlace)
+  // keeps resumable + targetPath but stagedRemote is null; a stale late OPEN
+  // on the leftover `.netcatty-<id>.part` must still unlink the orphan.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-shared-open-late-unlink-inplace-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const localPath = path.join(tempDir, "upload.bin");
+  await fs.promises.writeFile(localPath, Buffer.alloc(TRANSFER_CHUNK_SIZE, 61));
+  const targetPath = "/tmp/upload-late-unlink-inplace.bin";
+  const transferId = "upload-shared-open-late-unlink-inplace";
+  const deterministicStagePath = `/tmp/.upload-late-unlink-inplace.bin.netcatty-${transferId}.part`;
+
+  const remoteFiles = new Map();
+  // After the first attempt fails, the destination appears as a symlink so the
+  // retry is planned in-place (no stagedRemote).
+  let destinationIsSymlink = false;
+  const eventLog = [];
+  /** @type {null | (() => void)} */
+  let releaseFirstOpen = null;
+  let openGeneration = 0;
+  let endCalls = 0;
+  /** @type {null | (() => void)} */
+  let releaseRetryWrites = null;
+  const retryWritesReleased = new Promise((resolve) => {
+    releaseRetryWrites = resolve;
+  });
+  const sharedSftp = createFastSftp({
+    lstat(remotePath, callback) {
+      const key = String(remotePath);
+      if (destinationIsSymlink && key === targetPath) {
+        callback(null, {
+          size: 0,
+          mode: 0o120777,
+          isDirectory: () => false,
+          isSymbolicLink: () => true,
+        });
+        return;
+      }
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        callback(error);
+        return;
+      }
+      callback(null, {
+        size: remoteFiles.get(key).length,
+        mode: 0o100644,
+        isDirectory: () => false,
+        isSymbolicLink: () => false,
+      });
+    },
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "w");
+      const key = String(remotePath);
+      openGeneration += 1;
+      const generation = openGeneration;
+      if (generation === 1) {
+        assert.equal(key, deterministicStagePath, "first attempt must OPEN deterministic resume stage");
+        releaseFirstOpen = () => {
+          if (!remoteFiles.has(key)) {
+            remoteFiles.set(key, Buffer.alloc(0));
+          }
+          eventLog.push(`open-created-1:${key}`);
+          callback(null, Buffer.from(`handle-1:${key}`));
+        };
+        return;
+      }
+      // In-place retry opens the final target, not the stage.
+      assert.equal(key, targetPath, "in-place retry must OPEN final target");
+      remoteFiles.set(key, Buffer.from("retry-inplace"));
+      eventLog.push(`open-created-${generation}:${key}`);
+      callback(null, Buffer.from(`handle-${generation}:${key}`));
+    },
+    write(handle, buffer, offset, length, position, callback) {
+      void retryWritesReleased.then(() => {
+        const key = String(handle).replace(/^handle-\d+:/, "");
+        const current = remoteFiles.get(key) || Buffer.alloc(0);
+        const end = position + length;
+        const next = Buffer.alloc(Math.max(current.length, end));
+        current.copy(next);
+        buffer.copy(next, position, offset, offset + length);
+        remoteFiles.set(key, next);
+        eventLog.push(`write:${key}:${length}@${position}`);
+        setImmediate(() => callback(null));
+      });
+    },
+    close(handle, callback) {
+      eventLog.push(`close:${String(handle)}`);
+      callback(null);
+    },
+    unlink(remotePath, callback) {
+      const key = String(remotePath);
+      eventLog.push(`unlink:${key}`);
+      remoteFiles.delete(key);
+      callback(null);
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    async stat(remotePath) {
+      const key = String(remotePath);
+      if (!remoteFiles.has(key)) {
+        const error = new Error("ENOENT");
+        error.code = 2;
+        throw error;
+      }
+      return { size: remoteFiles.get(key).length };
+    },
+    rename() {
+      return Promise.resolve();
+    },
+    async delete(remotePath) {
+      const key = String(remotePath);
+      eventLog.push(`delete:${key}`);
+      remoteFiles.delete(key);
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["target", client]]) });
+
+  const firstSender = createSender();
+  const firstRunning = transferBridge.startTransfer(
+    { sender: firstSender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const firstOpenReady = await waitUntil(() => typeof releaseFirstOpen === "function", 2000);
+  assert.ok(firstOpenReady, "expected first shared write OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died before first OPEN callback"));
+
+  const firstResult = await Promise.race([
+    firstRunning,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("first transfer hung awaiting shared write OPEN drain after channel error")),
+        5000,
+      );
+    }),
+  ]);
+  assert.ok(firstResult.error, "expected first transfer to fail after channel error");
+  assert.match(firstResult.error, /shared SFTP channel died before first OPEN callback/i);
+
+  // Force the retry into writeInPlace (symlink) while still resumable.
+  destinationIsSymlink = true;
+  // Seed a leftover stage orphan the late OPEN would otherwise protect via
+  // resumable+targetPath heuristics.
+  remoteFiles.set(deterministicStagePath, Buffer.from("orphan-stage"));
+  transferBridge.clearPendingCancel(transferId);
+  const retrySender = createSender();
+  const retryRunning = transferBridge.startTransfer(
+    { sender: retrySender },
+    {
+      transferId,
+      sourcePath: localPath,
+      targetPath,
+      sourceType: "local",
+      targetType: "sftp",
+      targetSftpId: "target",
+      totalBytes: TRANSFER_CHUNK_SIZE,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const retryOpenReady = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("open-created-2:")),
+    3000,
+  );
+  assert.ok(retryOpenReady, `expected in-place retry OPEN, log=${eventLog.join(",")}`);
+  assert.ok(
+    remoteFiles.has(deterministicStagePath),
+    "orphan stage must still exist before stale late OPEN",
+  );
+
+  // Stale late OPEN from attempt 1 on the stage path: must close + unlink even
+  // though a same-id resumable retry owns activeTransfers (in-place, no stage).
+  releaseFirstOpen?.();
+  const lateCleanup = await waitUntil(
+    () => eventLog.some((entry) => entry.startsWith("close:handle-1:"))
+      && eventLog.some((entry) => entry === `unlink:${deterministicStagePath}`),
+    2000,
+  );
+  assert.ok(
+    lateCleanup,
+    `expected late close+unlink of orphan stage under in-place retry, log=${eventLog.join(",")}`,
+  );
+  assert.equal(
+    remoteFiles.has(deterministicStagePath),
+    false,
+    "orphan stage must be unlinked when retry is not using it",
+  );
+  assert.ok(
+    remoteFiles.has(targetPath),
+    "in-place retry final target must not be unlinked",
+  );
+
+  releaseRetryWrites?.();
+  await transferBridge.cancelTransfer(null, { transferId });
+  const retryResult = await Promise.race([
+    retryRunning,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("retry transfer hung after cancel")), 5000);
+    }),
+  ]);
+  assert.ok(
+    retryResult.cancelled === true || /cancel/i.test(String(retryResult.error || "")),
+    `expected retry cancel settle, result=${JSON.stringify(retryResult)}`,
+  );
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+});
+
+test("sudo SFTP downloads prefer concurrent shared READ over serial createReadStream", async (t) => {
+  // Sudo cannot open an isolated channel, so downloads used to fall straight to
+  // createReadStream (1-in-flight READs → hundreds of KB/s). Uploads already
+  // keep pipelined WRITE fanout on the shared browse channel; downloads must
+  // mirror that for the elevated SFTP path (#2719).
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-download-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(DOWNLOAD_TRANSFER_CONCURRENCY * TRANSFER_CHUNK_SIZE, 47);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+  const targetPath = path.join(tempDir, "download.bin");
+
+  let maxInFlight = 0;
+  let activeReads = 0;
+  let createReadStreamCalls = 0;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      activeReads += 1;
+      maxInFlight = Math.max(maxInFlight, activeReads);
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => {
+        activeReads -= 1;
+        callback(null, slice.length);
+      });
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not be used when concurrent READ works");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const result = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-sudo-shared-concurrent",
+      sourcePath: "/root/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  assert.equal(result.error, undefined, result.error);
+  assert.equal(createReadStreamCalls, 0);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.ok(
+    maxInFlight >= 2,
+    `expected pipelined READ concurrency >= 2, got ${maxInFlight}`,
+  );
+  assert.ok(
+    maxInFlight <= DOWNLOAD_TRANSFER_CONCURRENCY,
+    `expected concurrency <= ${DOWNLOAD_TRANSFER_CONCURRENCY}, got ${maxInFlight}`,
+  );
+  const downloaded = await fs.promises.readFile(targetPath);
+  assert.deepEqual(downloaded, payload);
+});
+
+test("non-sudo downloads use concurrent shared READ when isolated channel is unavailable", async (t) => {
+  // Isolated-channel miss (pool full / open unavailable) must still pipeline
+  // READs on the browse channel — same fail-closed contract as uploads (#2449).
+  // Serial createReadStream is never a silent bulk-transfer fallback (#2719).
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-nonsudo-shared-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(4 * TRANSFER_CHUNK_SIZE, 19);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 197;
+  const targetPath = path.join(tempDir, "download.bin");
+
+  let openCalls = 0;
+  let maxInFlight = 0;
+  let activeReads = 0;
+  let createReadStreamCalls = 0;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      openCalls += 1;
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      activeReads += 1;
+      maxInFlight = Math.max(maxInFlight, activeReads);
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => {
+        activeReads -= 1;
+        callback(null, slice.length);
+      });
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after isolated miss");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    // No client.client → openIsolatedSftpChannel returns null (isolated miss).
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const result = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-nonsudo-isolated-miss-shared",
+      sourcePath: "/home/user/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  assert.equal(result.error, undefined, result.error);
+  assert.ok(openCalls >= 1, "non-sudo isolated miss must use shared concurrent OPEN");
+  assert.equal(createReadStreamCalls, 0, "serial createReadStream must not run");
+  assert.equal(endCalls, 0, "browse channel must not be ended");
+  assert.ok(
+    maxInFlight >= 2,
+    `expected pipelined READ concurrency >= 2, got ${maxInFlight}`,
+  );
+  const downloaded = await fs.promises.readFile(targetPath);
+  assert.deepEqual(downloaded, payload);
+});
+
+test("second concurrent sudo download waits for shared fast slot (no serial stream)", async (t) => {
+  // FAST_DOWNLOAD_CHANNELS_PER_SESSION (#1507) still caps concurrent fanout to
+  // one file; a second download waits for the slot instead of crawling via
+  // serial createReadStream (#2719 fail-closed alignment).
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-slot-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payloadA = Buffer.alloc(4 * TRANSFER_CHUNK_SIZE, 11);
+  for (let index = 0; index < payloadA.length; index += 1) payloadA[index] = index % 211;
+  const payloadB = Buffer.alloc(2 * TRANSFER_CHUNK_SIZE, 22);
+  for (let index = 0; index < payloadB.length; index += 1) payloadB[index] = (index * 3) % 223;
+  const targetA = path.join(tempDir, "a.bin");
+  const targetB = path.join(tempDir, "b.bin");
+
+  let endCalls = 0;
+  let createReadStreamCalls = 0;
+  let openBCalls = 0;
+  let activeBReads = 0;
+  let maxInFlightB = 0;
+  const pendingReadCallbacks = [];
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      if (String(remotePath).includes("b.bin")) openBCalls += 1;
+      callback(null, Buffer.from(`handle:${remotePath}`));
+    },
+    read(handle, buffer, offset, length, position, callback) {
+      const key = handle.toString();
+      const payload = key.includes("b.bin") ? payloadB : payloadA;
+      // Stall first transfer READs so it keeps the shared fast slot until released.
+      if (!key.includes("b.bin")) {
+        pendingReadCallbacks.push(() => {
+          const slice = payload.subarray(position, position + length);
+          slice.copy(buffer, offset);
+          callback(null, slice.length);
+        });
+        return;
+      }
+      activeBReads += 1;
+      maxInFlightB = Math.max(maxInFlightB, activeBReads);
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => {
+        activeBReads -= 1;
+        callback(null, slice.length);
+      });
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run while waiting for fast slot");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat(remotePath) {
+      const size = String(remotePath).includes("b.bin") ? payloadB.length : payloadA.length;
+      return Promise.resolve({
+        size,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const first = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId: "download-sudo-slot-first",
+      sourcePath: "/root/a.bin",
+      targetPath: targetA,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payloadA.length,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  const firstReady = await waitUntil(() => pendingReadCallbacks.length >= 1, 2000);
+  assert.ok(firstReady, "expected first sudo download to hold shared READ slot");
+
+  const secondPromise = transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-sudo-slot-second",
+      sourcePath: "/root/b.bin",
+      targetPath: targetB,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payloadB.length,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+
+  // Condition-based wait: second must enter the session slot queue.
+  assert.ok(
+    await waitUntil(() => transferBridge._getSessionFastDownloadWaiterCountForTests(client) >= 1, 2000),
+    "second download must enqueue on the session fast slot",
+  );
+  assert.equal(openBCalls, 0, "second download must wait for shared fast slot");
+  assert.equal(createReadStreamCalls, 0, "serial stream must not run while waiting");
+
+  // Release first transfer's stalled READs so it can finish and free the slot.
+  const drainPending = () => {
+    for (const release of pendingReadCallbacks.splice(0)) {
+      try { release(); } catch { /* ignore */ }
+    }
+  };
+  // Keep draining late-arriving first-transfer READs until it settles.
+  const drainTimer = setInterval(drainPending, 5);
+  t.after(() => clearInterval(drainTimer));
+  drainPending();
+
+  const firstResult = await Promise.race([
+    first,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("first transfer did not settle after READ release")), 5000);
+    }),
+  ]);
+  assert.equal(firstResult.error, undefined, firstResult.error);
+
+  const second = await Promise.race([
+    secondPromise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("second transfer did not settle after slot free")), 5000);
+    }),
+  ]);
+  assert.equal(second.error, undefined, second.error);
+  assert.ok(openBCalls >= 1, "second download must use concurrent OPEN after slot free");
+  assert.ok(
+    maxInFlightB >= 2,
+    `second download must pipeline READs after slot free, got maxInFlightB=${maxInFlightB}`,
+  );
+  assert.equal(createReadStreamCalls, 0, "serial createReadStream must never run");
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.equal(transferBridge._getSessionFastDownloadWaiterCountForTests(client), 0);
+  const downloadedA = await fs.promises.readFile(targetA);
+  const downloadedB = await fs.promises.readFile(targetB);
+  assert.deepEqual(downloadedA, payloadA);
+  assert.deepEqual(downloadedB, payloadB);
+});
+
+test("cancel while waiting for session fast download slot settles without serial stream", async (t) => {
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-slot-wait-cancel-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payloadA = Buffer.alloc(4 * TRANSFER_CHUNK_SIZE, 7);
+  const payloadB = Buffer.alloc(2 * TRANSFER_CHUNK_SIZE, 9);
+  const pendingA = [];
+  let endCalls = 0;
+  let createReadStreamCalls = 0;
+  let openBCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      if (String(remotePath).includes("b.bin")) openBCalls += 1;
+      callback(null, Buffer.from(`handle:${remotePath}`));
+    },
+    read(handle, buffer, offset, length, position, callback) {
+      const key = handle.toString();
+      if (key.includes("b.bin")) {
+        throw new Error("second download must not READ after cancel on slot wait");
+      }
+      pendingA.push(() => {
+        buffer.fill(7, offset, offset + length);
+        callback(null, length);
+      });
+    },
+    close(_handle, callback) { callback(null); },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run");
+    },
+    end() { endCalls += 1; },
+  });
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat(remotePath) {
+      const size = String(remotePath).includes("b.bin") ? payloadB.length : payloadA.length;
+      return Promise.resolve({ size, mtimeMs: 1_000, ctimeMs: 1_000, mtime: 1, ctime: 1 });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const first = transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "slot-hold-first",
+      sourcePath: "/root/a.bin",
+      targetPath: path.join(tempDir, "a.bin"),
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payloadA.length,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+  assert.ok(await waitUntil(() => pendingA.length >= 1, 2000));
+
+  const secondPromise = transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "slot-wait-cancel-second",
+      sourcePath: "/root/b.bin",
+      targetPath: path.join(tempDir, "b.bin"),
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payloadB.length,
+      resumable: true,
+      skipAdmission: true,
+    },
+  );
+  assert.ok(
+    await waitUntil(() => transferBridge._getSessionFastDownloadWaiterCountForTests(client) >= 1, 2000),
+    "second must wait on session slot",
+  );
+
+  await transferBridge.cancelTransfer(null, { transferId: "slot-wait-cancel-second" });
+  const second = await Promise.race([
+    secondPromise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("slot-wait cancel hung")), 3000)),
+  ]);
+  assert.match(second.error || "", /cancel/i);
+  assert.equal(openBCalls, 0);
+  assert.equal(createReadStreamCalls, 0);
+  assert.equal(endCalls, 0);
+  assert.equal(transferBridge._getSessionFastDownloadWaiterCountForTests(client), 0);
+
+  // Holder still completes after stalled READs are released.
+  const drain = setInterval(() => {
+    for (const release of pendingA.splice(0)) {
+      try { release(); } catch { /* ignore */ }
+    }
+  }, 5);
+  t.after(() => clearInterval(drain));
+  const firstResult = await Promise.race([
+    first,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("holder hung")), 5000)),
+  ]);
+  assert.equal(firstResult.error, undefined, firstResult.error);
+});
+
+test("resumable concurrent download range failure fails closed (no serial stream)", async (t) => {
+  // Mirror upload fail-closed: when concurrent strategies fail, never complete
+  // via createReadStream crawl.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-download-fail-closed-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(3 * TRANSFER_CHUNK_SIZE, 41);
+  const targetPath = path.join(tempDir, "download.bin");
+  await fs.promises.writeFile(targetPath, Buffer.from("original"));
+  let createReadStreamCalls = 0;
+  let secondReadCallback = null;
+  const isolated = createFastSftp({
+    open(_remotePath, _flags, callback) {
+      callback(null, Buffer.from("iso-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      if (position === TRANSFER_CHUNK_SIZE) {
+        secondReadCallback = callback;
+        return;
+      }
+      payload.copy(buffer, offset, position, position + length);
+      callback(null, length);
+      if (position === 2 * TRANSFER_CHUNK_SIZE && secondReadCallback) {
+        const cb = secondReadCallback;
+        secondReadCallback = null;
+        queueMicrotask(() => cb(new Error("second range failed")));
+      }
+    },
+    close(_handle, callback) { callback(null); },
+    end() {},
+  });
+  const shared = createFastSftp({
+    open(_remotePath, _flags, callback) {
+      callback(new Error("shared open also fails"));
+    },
+    read() {
+      throw new Error("shared READ must not run after OPEN failure");
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not complete the download");
+    },
+  });
+  const client = {
+    sftp: shared,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+    client: {
+      sftp(callback) { callback(null, isolated); },
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const result = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-sparse-fail-closed",
+      sourcePath: "/tmp/source.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  assert.match(result.error || "", /pipelined download failed|second range failed|shared open also fails/i);
+  assert.equal(createReadStreamCalls, 0);
+  assert.equal(await fs.promises.readFile(targetPath, "utf8"), "original");
+});
+
+test("sudo concurrent READ failure fails closed (no createReadStream)", async (t) => {
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-fail-closed-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(2 * TRANSFER_CHUNK_SIZE, 55);
+  const targetPath = path.join(tempDir, "download.bin");
+  let createReadStreamCalls = 0;
+  let endCalls = 0;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("sudo-handle"));
+    },
+    read(_handle, _buffer, _offset, _length, _position, callback) {
+      setImmediate(() => callback(new Error("sudo READ rejected")));
+    },
+    close(_handle, callback) { callback(null); },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after sudo concurrent fail");
+    },
+    end() { endCalls += 1; },
+  });
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const result = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-sudo-fail-closed",
+      sourcePath: "/root/source.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  assert.match(result.error || "", /pipelined download failed|sudo READ rejected/i);
+  assert.equal(createReadStreamCalls, 0);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended on fail-closed");
+});
+
+test("isolated download CLOSE timeout disposes channel instead of returning it to the pool", async (t) => {
+  // Codex P2 on a3b11137: success-path CLOSE timeout with disposeChannel:true
+  // only logged and left remoteCloseError unset, so downloadFile released the
+  // isolated channel back to the pool without dispose.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-isolated-close-timeout-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(2 * TRANSFER_CHUNK_SIZE, 33);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 173;
+  const targetPath = path.join(tempDir, "download.bin");
+
+  let openedChannels = 0;
+  let endCalls = 0;
+  let closeCalls = 0;
+  const makeIsolated = () => createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from(`isolated-${openedChannels}`));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, _callback) {
+      closeCalls += 1;
+      // Never invoke callback — simulates a hung CLOSE on an isolated channel.
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    sftp: createFastSftp({
+      createReadStream() {
+        throw new Error("serial stream must not run when isolated concurrent READ succeeds");
+      },
+    }),
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+    client: {
+      sftp(callback) {
+        openedChannels += 1;
+        callback(null, makeIsolated());
+      },
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const first = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-isolated-close-timeout",
+      sourcePath: "/tmp/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  assert.equal(first.error, undefined, first.error);
+  assert.ok(closeCalls >= 1, "expected isolated CLOSE to be attempted");
+  assert.ok(endCalls >= 1, "CLOSE timeout must dispose the isolated channel");
+  assert.deepEqual(await fs.promises.readFile(targetPath), payload);
+
+  // A follow-up download must open a fresh isolated channel, not reuse the timed-out one.
+  const targetPath2 = path.join(tempDir, "download-2.bin");
+  const second = await transferBridge.startTransfer(
+    { sender: createSender() },
+    {
+      transferId: "download-isolated-close-timeout-2",
+      sourcePath: "/tmp/download.bin",
+      targetPath: targetPath2,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+  assert.equal(second.error, undefined, second.error);
+  assert.ok(openedChannels >= 2, `expected a new isolated channel after dispose, got ${openedChannels}`);
+  assert.deepEqual(await fs.promises.readFile(targetPath2), payload);
+});
+
+test("cancel during stalled shared sudo download OPEN settles without sftp.end()", async (t) => {
+  // Codex P2 on 2c369403: disposeChannel:false made pre-OPEN abort a no-op while
+  // openSftpHandle had no cancel reject, so cancel hung forever and held the lease.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-open-stall-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const targetPath = path.join(tempDir, "download.bin");
+  const fileSize = DOWNLOAD_TRANSFER_CONCURRENCY * TRANSFER_CHUNK_SIZE;
+  let endCalls = 0;
+  let createReadStreamCalls = 0;
+  let closeCalls = 0;
+  let releaseOpen = null;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      releaseOpen = () => callback(null, Buffer.from("late-shared-handle"));
+    },
+    read() {
+      throw new Error("READ must not run after cancel during OPEN");
+    },
+    close(_handle, callback) {
+      closeCalls += 1;
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after cancel");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: fileSize,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const transferId = "download-sudo-open-stall-cancel";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: "/root/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: fileSize,
+      resumable: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared OPEN to stall");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("transfer did not settle after cancel during shared OPEN")), 3000);
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended on cancel");
+  assert.equal(createReadStreamCalls, 0, "cancel must not fall through to serial stream");
+  assert.ok(sender.sent.some((entry) => entry.channel === "netcatty:transfer:cancelled"));
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:error"), false);
+
+  // Late OPEN success after cancel should close the handle, not leave it open.
+  releaseOpen?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(closeCalls >= 1, `expected late shared handle close, got ${closeCalls}`);
+});
+
+test("shared sudo download OPEN rejects on channel error without hanging", async (t) => {
+  // Codex P2 on 50ef8fac: outer onChannelError only recorded the error for a
+  // post-await check. If the shared channel emitted error while sftp.open was
+  // pending and never invoked the OPEN callback, the transfer hung forever and
+  // held the SFTP lease. openSftpHandleForTransfer must reject on channel error.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-open-channel-error-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const targetPath = path.join(tempDir, "download.bin");
+  const fileSize = DOWNLOAD_TRANSFER_CONCURRENCY * TRANSFER_CHUNK_SIZE;
+  let endCalls = 0;
+  let createReadStreamCalls = 0;
+  let closeCalls = 0;
+  let releaseOpen = null;
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      releaseOpen = () => callback(null, Buffer.from("late-shared-handle-after-error"));
+    },
+    read() {
+      throw new Error("READ must not run after channel error during OPEN");
+    },
+    close(_handle, callback) {
+      closeCalls += 1;
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after pipelined OPEN failure");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: fileSize,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const transferId = "download-sudo-open-channel-error";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: "/root/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: fileSize,
+      resumable: true,
+    },
+  );
+
+  const ready = await waitUntil(() => typeof releaseOpen === "function", 2000);
+  assert.ok(ready, "expected shared OPEN to stall");
+
+  sharedSftp.emit("error", new Error("shared SFTP channel died during OPEN"));
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer did not settle after shared channel error during OPEN")),
+        3000,
+      );
+    }),
+  ]);
+
+  assert.ok(result.error, "expected transfer to fail after channel error");
+  assert.match(
+    result.error,
+    /shared SFTP channel died during OPEN|pipelined download failed/i,
+  );
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended on channel error");
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:cancelled"), false);
+  assert.equal(
+    createReadStreamCalls,
+    0,
+    "concurrent shared OPEN failure must fail closed (no serial stream fallback)",
+  );
+
+  // Late OPEN success after channel-error reject should close the handle.
+  releaseOpen?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(closeCalls >= 1, `expected late shared handle close, got ${closeCalls}`);
+});
+
+test("cancel during stalled shared sudo READ settles without sftp.end()", async (t) => {
+  // Codex P2 on d855e69c: disposeChannel:false passed forceSettleOnError:false, so
+  // cancel while an sftp.read callback never arrives hung forever (abortChannel is
+  // a no-op on shared channels). Downloads have no remote WRITEs to drain, so they
+  // must force-settle on cancel without ending the sudo session.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-read-stall-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const targetPath = path.join(tempDir, "download.bin");
+  const fileSize = 4 * TRANSFER_CHUNK_SIZE;
+  let endCalls = 0;
+  let createReadStreamCalls = 0;
+  let activeReads = 0;
+  let maxInFlight = 0;
+  const pendingReadCallbacks = [];
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, _buffer, _offset, _length, _position, callback) {
+      activeReads += 1;
+      maxInFlight = Math.max(maxInFlight, activeReads);
+      // Stall forever — never invoke callback (simulates dead/hung READ).
+      pendingReadCallbacks.push(() => {
+        activeReads -= 1;
+        callback(new Error("late READ after cancel"));
+      });
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after cancel");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: fileSize,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const transferId = "download-sudo-read-stall-cancel";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: "/root/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: fileSize,
+      resumable: true,
+    },
+  );
+
+  const ready = await waitUntil(() => pendingReadCallbacks.length >= 1, 2000);
+  assert.ok(ready, "expected at least one shared READ to stall");
+  assert.ok(maxInFlight >= 1, `expected in-flight READ, got ${maxInFlight}`);
+
+  await transferBridge.cancelTransfer(null, { transferId });
+  // forceSettleOnError grace is 2s; shared cancel/fail CLOSE is fire-and-forget.
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer did not settle after cancel during stalled shared READ")),
+        5000,
+      );
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended on cancel during READ");
+  assert.equal(createReadStreamCalls, 0, "cancel must not fall through to serial stream");
+  assert.ok(sender.sent.some((entry) => entry.channel === "netcatty:transfer:cancelled"));
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:error"), false);
+
+  // Late READ callbacks after settle must not crash the process.
+  for (const release of pendingReadCallbacks.splice(0)) {
+    try { release(); } catch { /* ignore */ }
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("cancel during stalled shared verification READ settles without sftp.end()", async (t) => {
+  // Codex P2 on cba714f3: after ranged READs finish, verifyFastDownloadSamples still
+  // awaits bare sftp.read outside forceSettleOnError. Shared cancel cannot
+  // sftp.end(), so a hung verification READ would hold the transfer and lease.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-verify-stall-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(3 * TRANSFER_CHUNK_SIZE, 61);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+  const targetPath = path.join(tempDir, "download.bin");
+  let endCalls = 0;
+  let createReadStreamCalls = 0;
+  let transferredBytes = 0;
+  const pendingVerifyCallbacks = [];
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-verify-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      // Complete the concurrent download first; stall only verification samples.
+      if (transferredBytes < payload.length) {
+        const slice = payload.subarray(position, position + length);
+        slice.copy(buffer, offset);
+        transferredBytes += slice.length;
+        setImmediate(() => callback(null, slice.length));
+        return;
+      }
+      pendingVerifyCallbacks.push(() => {
+        callback(new Error("late verification READ after cancel"));
+      });
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after cancel");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const transferId = "download-sudo-verify-stall-cancel";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: "/root/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  const ready = await waitUntil(() => pendingVerifyCallbacks.length >= 1, 3000);
+  assert.ok(ready, "expected verification READ to stall after ranged download");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer did not settle after cancel during stalled verification READ")),
+        5000,
+      );
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended during verification cancel");
+  assert.equal(createReadStreamCalls, 0, "cancel must not fall through to serial stream");
+  assert.ok(sender.sent.some((entry) => entry.channel === "netcatty:transfer:cancelled"));
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:error"), false);
+
+  for (const release of pendingVerifyCallbacks.splice(0)) {
+    try { release(); } catch { /* ignore */ }
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("cancel during responsive last verification sample reports cancelled", async (t) => {
+  // Codex P2 on 74ae5e0a: cancel during the last sample can let the READ win the
+  // race before the 2s force-settle fires. Without a post-race cancelled check,
+  // verification returns successfully and sendComplete() reports done.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-verify-race-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(3 * TRANSFER_CHUNK_SIZE, 67);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+  const targetPath = path.join(tempDir, "download.bin");
+  let endCalls = 0;
+  let transferredBytes = 0;
+  let verifyReadCount = 0;
+  let releaseLastVerifyRead = null;
+  const lastVerifyReadHeld = new Promise((resolve) => {
+    releaseLastVerifyRead = resolve;
+  });
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-verify-race-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      if (transferredBytes < payload.length) {
+        const slice = payload.subarray(position, position + length);
+        slice.copy(buffer, offset);
+        transferredBytes += slice.length;
+        setImmediate(() => callback(null, slice.length));
+        return;
+      }
+      verifyReadCount += 1;
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      // Hold only the last sample briefly so cancel can land mid-READ, then
+      // complete successfully (responsive server — force-settle never fires).
+      if (verifyReadCount >= 3) {
+        lastVerifyReadHeld.then(() => {
+          setImmediate(() => callback(null, slice.length));
+        });
+        return;
+      }
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      throw new Error("serial createReadStream must not run");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const transferId = "download-sudo-verify-race-cancel";
+  const running = transferBridge.startTransfer(
+    { sender },
+    {
+      transferId,
+      sourcePath: "/root/download.bin",
+      targetPath,
+      sourceType: "sftp",
+      targetType: "local",
+      sourceSftpId: "source",
+      totalBytes: payload.length,
+      resumable: true,
+    },
+  );
+
+  const ready = await waitUntil(() => verifyReadCount >= 3, 3000);
+  assert.ok(ready, "expected last verification sample to be held");
+
+  await transferBridge.cancelTransfer(null, { transferId });
+  releaseLastVerifyRead();
+
+  const result = await Promise.race([
+    running,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer did not settle after cancel during last verification sample")),
+        3000,
+      );
+    }),
+  ]);
+
+  assert.match(result.error || "", /cancel/i);
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended");
+  assert.ok(sender.sent.some((entry) => entry.channel === "netcatty:transfer:cancelled"));
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:complete"), false);
+  assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:error"), false);
+});
+
+test("shared verification channel error between samples fails without hanging", async (t) => {
+  // Codex P2 on 14783168: channel error between sample races (after one sample
+  // resolves, before the next rejectPending is installed) was dropped; the next
+  // readSftpRange could hang forever on a dead shared channel.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sudo-verify-gap-error-"));
+  t.after(async () => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+
+  const payload = Buffer.alloc(3 * TRANSFER_CHUNK_SIZE, 71);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+  const targetPath = path.join(tempDir, "download.bin");
+  let endCalls = 0;
+  let transferredBytes = 0;
+  let verifyReadCount = 0;
+  let sharedSftp = null;
+  const pendingSecondVerify = [];
+  sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-verify-gap-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      if (transferredBytes < payload.length) {
+        const slice = payload.subarray(position, position + length);
+        slice.copy(buffer, offset);
+        transferredBytes += slice.length;
+        setImmediate(() => callback(null, slice.length));
+        return;
+      }
+      verifyReadCount += 1;
+      if (verifyReadCount === 1) {
+        const slice = payload.subarray(position, position + length);
+        slice.copy(buffer, offset);
+        setImmediate(() => {
+          callback(null, slice.length);
+          // Emit after the first sample resolves and before the next race installs
+          // rejectPending — the gap Codex identified.
+          setImmediate(() => {
+            sharedSftp.emit("error", new Error("shared channel died between samples"));
+          });
+        });
+        return;
+      }
+      // Subsequent verification READs never callback (dead channel).
+      pendingSecondVerify.push(callback);
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      throw new Error("serial createReadStream must not run after channel error");
+    },
+    end() {
+      endCalls += 1;
+    },
+  });
+
+  const client = {
+    __netcattySudoMode: true,
+    sftp: sharedSftp,
+    stat() {
+      return Promise.resolve({
+        size: payload.length,
+        mtimeMs: 1_000,
+        ctimeMs: 1_000,
+        mtime: 1,
+        ctime: 1,
+      });
+    },
+  };
+  transferBridge.init({ sftpClients: new Map([["source", client]]) });
+
+  const sender = createSender();
+  const result = await Promise.race([
+    transferBridge.startTransfer(
+      { sender },
+      {
+        transferId: "download-sudo-verify-gap-error",
+        sourcePath: "/root/download.bin",
+        targetPath,
+        sourceType: "sftp",
+        targetType: "local",
+        sourceSftpId: "source",
+        totalBytes: payload.length,
+        resumable: true,
+      },
+    ),
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("transfer hung after shared verification channel error between samples")),
+        4000,
+      );
+    }),
+  ]);
+
+  // Concurrent path already staged the full file, so fallback may complete via
+  // the checkpoint>=fileSize short-circuit — either outcome is fine as long as
+  // we settle instead of hanging on the dead-channel READ.
+  assert.ok(result, "expected transfer to settle after inter-sample channel error");
+  assert.equal(endCalls, 0, "shared sudo channel must not be ended on verification error");
+  assert.ok(
+    sender.sent.some((entry) => (
+      entry.channel === "netcatty:transfer:complete"
+      || entry.channel === "netcatty:transfer:error"
+      || entry.channel === "netcatty:transfer:cancelled"
+    )),
+    "expected a terminal transfer event after channel error between samples",
   );
 });
 
@@ -4417,13 +7482,15 @@ test("fast resumable downloads pause only at a complete checkpoint", async (t) =
 });
 
 test("fast resumable downloads fall back from the highest contiguous checkpoint", async (t) => {
+  // Isolated concurrent ranges fail mid-file; concurrent-shared resumes from the
+  // highest contiguous checkpoint (no serial createReadStream fallback).
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-contiguous-fallback-"));
   t.after(async () => {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
 
   const payload = Buffer.alloc(3 * 32 * 1024, 17);
-  let fallbackStart = null;
+  let sharedOpenCheckpoint = null;
   let secondReadCallback = null;
   let targetPath = null;
   let stagedPath = null;
@@ -4447,14 +7514,30 @@ test("fast resumable downloads fall back from the highest contiguous checkpoint"
       callback(null);
     },
   });
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      try {
+        sharedOpenCheckpoint = fs.statSync(stagedPath).size;
+      } catch {
+        sharedOpenCheckpoint = -1;
+      }
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      throw new Error("serial createReadStream must not run after isolated range failure");
+    },
+  });
   const client = {
-    sftp: createFastSftp({
-      createReadStream(_remotePath, options) {
-        fallbackStart = options.start;
-        assert.equal(fs.statSync(stagedPath).size, options.start);
-        return Readable.from(payload.subarray(options.start));
-      },
-    }),
+    sftp: sharedSftp,
     stat() {
       return Promise.resolve({ size: payload.length });
     },
@@ -4486,15 +7569,15 @@ test("fast resumable downloads fall back from the highest contiguous checkpoint"
     (transferred) => progress.push(transferred),
   );
 
-  assert.equal(result.error, undefined);
-  assert.equal(fallbackStart, 32 * 1024);
-  const firstPastCheckpoint = progress.findIndex((transferred) => transferred > fallbackStart);
+  assert.equal(result.error, undefined, result.error);
+  assert.equal(sharedOpenCheckpoint, 32 * 1024);
+  const firstPastCheckpoint = progress.findIndex((transferred) => transferred > sharedOpenCheckpoint);
   assert.ok(firstPastCheckpoint >= 0);
-  assert.ok(progress.slice(firstPastCheckpoint + 1).includes(fallbackStart));
+  assert.ok(progress.slice(firstPastCheckpoint + 1).includes(sharedOpenCheckpoint));
   assert.deepEqual(await fs.promises.readFile(targetPath), payload);
 });
 
-test("resumable download fallback rejects a remote source changed during streaming", async (t) => {
+test("resumable download fallback rejects a remote source changed during concurrent-shared", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-download-fallback-change-"));
   const transferId = "download-fallback-change";
   const targetPath = path.join(tempDir, "download.bin");
@@ -4515,13 +7598,26 @@ test("resumable download fallback rejects a remote source changed during streami
       callback(new Error("range download unavailable"));
     },
   });
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      sourceChanged = true;
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      throw new Error("serial createReadStream must not run");
+    },
+  });
   const client = {
-    sftp: createFastSftp({
-      createReadStream() {
-        sourceChanged = true;
-        return Readable.from(payload);
-      },
-    }),
+    sftp: sharedSftp,
     stat() {
       return Promise.resolve({
         size: payload.length,
@@ -4557,7 +7653,7 @@ test("resumable download fallback rejects a remote source changed during streami
   assert.equal(fs.existsSync(stagedPath), false);
 });
 
-test("range-failure fallback truncates sparse local tail before streaming", async (t) => {
+test("range-failure fallback truncates sparse local tail before concurrent-shared", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-sparse-tail-"));
   t.after(async () => {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
@@ -4568,8 +7664,7 @@ test("range-failure fallback truncates sparse local tail before streaming", asyn
   const chunk = 32 * 1024;
   const payload = Buffer.alloc(2 * chunk, 17);
   let firstReadCallback = null;
-  let fallbackStart = null;
-  let sizeAtFallback = null;
+  let sizeAtSharedOpen = null;
   const transferId = "download-sparse-tail";
   const targetPath = path.join(tempDir, "sparse.bin");
   // Resumable downloads stage under the transfer temp path, not the final target.
@@ -4595,19 +7690,31 @@ test("range-failure fallback truncates sparse local tail before streaming", asyn
       callback(null);
     },
   });
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      // Capture *staged* size when concurrent-shared opens (post-truncate).
+      try {
+        sizeAtSharedOpen = fs.statSync(stagedPath).size;
+      } catch {
+        sizeAtSharedOpen = -1;
+      }
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      throw new Error("serial createReadStream must not run after range failure");
+    },
+  });
   const client = {
-    sftp: createFastSftp({
-      createReadStream(_remotePath, options) {
-        fallbackStart = options.start;
-        // Capture *staged* size when stream fallback opens (post-truncate).
-        try {
-          sizeAtFallback = fs.statSync(stagedPath).size;
-        } catch {
-          sizeAtFallback = -1;
-        }
-        return Readable.from(payload.subarray(options.start || 0));
-      },
-    }),
+    sftp: sharedSftp,
     stat() {
       return Promise.resolve({ size: payload.length });
     },
@@ -4634,10 +7741,10 @@ test("range-failure fallback truncates sparse local tail before streaming", asyn
   );
 
   assert.equal(result.error, undefined, result.error);
-  assert.equal(fallbackStart, 0);
   // Contiguous checkpoint never advanced past 0; sparse tail must be truncated
-  // on the staged .part (final target is only written at promote time).
-  assert.equal(sizeAtFallback, 0);
+  // on the staged .part before concurrent-shared resumes (final target is only
+  // written at promote time).
+  assert.equal(sizeAtSharedOpen, 0);
   assert.deepEqual(await fs.promises.readFile(targetPath), payload);
 });
 
@@ -4826,7 +7933,9 @@ test("cancelled fast resumable downloads release their isolated channel", async 
   assert.equal(fallbackReads, 0);
 });
 
-test("SFTP downloads fall back to a compatible stream after fastGet fails", async (t) => {
+test("SFTP downloads fall back to concurrent shared READ after fastGet fails", async (t) => {
+  // Non-resumable fastGet failure must not crawl via serial createReadStream;
+  // the next pipelined strategy is concurrent-shared READ on the browse channel.
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-fallback-test-"));
   t.after(async () => {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
@@ -4834,6 +7943,9 @@ test("SFTP downloads fall back to a compatible stream after fastGet fails", asyn
 
   const expected = Buffer.from("complete fallback download");
   let fastGetAttempts = 0;
+  let createReadStreamCalls = 0;
+  let maxInFlight = 0;
+  let activeReads = 0;
   const fastSftp = createFastSftp({
     fastGet(_remotePath, localPath, _options, done) {
       fastGetAttempts += 1;
@@ -4843,13 +7955,31 @@ test("SFTP downloads fall back to a compatible stream after fastGet fails", asyn
       );
     },
   });
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, position, callback) {
+      activeReads += 1;
+      maxInFlight = Math.max(maxInFlight, activeReads);
+      const slice = expected.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => {
+        activeReads -= 1;
+        callback(null, slice.length);
+      });
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run after fastGet failure");
+    },
+  });
   const client = {
-    sftp: createFastSftp({
-      createReadStream() {
-        const { Readable } = require("node:stream");
-        return Readable.from(expected);
-      },
-    }),
+    sftp: sharedSftp,
     stat() {
       return Promise.resolve({ size: expected.length });
     },
@@ -4875,12 +8005,17 @@ test("SFTP downloads fall back to a compatible stream after fastGet fails", asyn
     },
   );
 
-  assert.equal(result.error, undefined);
+  assert.equal(result.error, undefined, result.error);
   assert.equal(fastGetAttempts, 1);
+  assert.equal(createReadStreamCalls, 0);
+  assert.ok(maxInFlight >= 1, "expected concurrent shared READ after fastGet failure");
   assert.deepEqual(await fs.promises.readFile(targetPath), expected);
 });
 
-test("SFTP downloads keep concurrent files moving within the fast-channel budget", async (t) => {
+test("SFTP downloads serialize concurrent files on the session fast-path slot", async (t) => {
+  // FAST_DOWNLOAD_CHANNELS_PER_SESSION caps concurrent 64-READ fanout to one
+  // file per session. A second download waits for the slot (pipelined path)
+  // instead of crawling via serial createReadStream (#2719 / #1507).
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-budget-test-"));
   t.after(async () => {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
@@ -4890,33 +8025,49 @@ test("SFTP downloads keep concurrent files moving within the fast-channel budget
   let activeFastGets = 0;
   let maxActiveFastGets = 0;
   let openedChannels = 0;
-  let fallbackReads = 0;
-  const fastSftp = createFastSftp({
-    fastGet(_remotePath, localPath, _options, done) {
-      activeFastGets += 1;
-      maxActiveFastGets = Math.max(maxActiveFastGets, activeFastGets);
-      completions.push(async () => {
-        await fs.promises.writeFile(localPath, "downloaded");
-        activeFastGets -= 1;
-        done();
-      });
+  let createReadStreamCalls = 0;
+  // Shared browse channel has open/read so a slot-waiter can still pipeline if
+  // the isolated pool is empty after the first channel is disposed. For this
+  // test both files complete via isolated fastGet after serializing on the slot.
+  const sharedSftp = createFastSftp({
+    open(_remotePath, flags, callback) {
+      assert.equal(flags, "r");
+      callback(null, Buffer.from("shared-read-handle"));
+    },
+    read(_handle, buffer, offset, length, _position, callback) {
+      buffer.fill(0x64, offset, offset + length);
+      setImmediate(() => callback(null, length));
+    },
+    close(_handle, callback) {
+      callback(null);
+    },
+    createReadStream() {
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not run under session slot wait");
     },
   });
   const client = {
-    sftp: createFastSftp({
-      createReadStream() {
-        fallbackReads += 1;
-        const { Readable } = require("node:stream");
-        return Readable.from("downloaded");
-      },
-    }),
+    sftp: sharedSftp,
     stat() {
       return Promise.resolve({ size: 10 });
     },
     client: {
       sftp(callback) {
         openedChannels += 1;
-        callback(null, fastSftp);
+        // Fresh channel per open so the second transfer can acquire isolated
+        // after the first returns its channel to the pool (or opens again).
+        const channel = createFastSftp({
+          fastGet(_remotePath, localPath, _options, done) {
+            activeFastGets += 1;
+            maxActiveFastGets = Math.max(maxActiveFastGets, activeFastGets);
+            completions.push(async () => {
+              await fs.promises.writeFile(localPath, "downloaded");
+              activeFastGets -= 1;
+              done();
+            });
+          },
+        });
+        callback(null, channel);
       },
     },
   };
@@ -4944,15 +8095,30 @@ test("SFTP downloads keep concurrent files moving within the fast-channel budget
   }
   assert.equal(completions.length, 1);
   assert.equal(openedChannels, 1);
-  const second = start("download-two");
-  const secondResult = await second;
-  assert.equal(secondResult.error, undefined);
-  assert.equal(fallbackReads, 1);
+
+  const secondPromise = start("download-two");
+  // Second must wait on the session slot — no second fastGet yet, no serial stream.
+  assert.ok(
+    await waitUntil(() => transferBridge._getSessionFastDownloadWaiterCountForTests(client) >= 1, 2000),
+    "second download must enqueue on the session fast slot",
+  );
+  assert.equal(completions.length, 1, "second download must wait for session fast slot");
+  assert.equal(createReadStreamCalls, 0);
 
   await completions[0]();
   assert.equal((await first).error, undefined);
-  assert.equal(maxActiveFastGets, 1);
-  assert.equal(openedChannels, 1);
+
+  // After first releases the slot, second proceeds on the pipelined path.
+  const secondDeadline = Date.now() + 1000;
+  while (completions.length < 2 && Date.now() < secondDeadline) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(completions.length, 2, "second download should start after slot free");
+  await completions[1]();
+  const secondResult = await secondPromise;
+  assert.equal(secondResult.error, undefined, secondResult.error);
+  assert.equal(createReadStreamCalls, 0, "serial createReadStream must never run");
+  assert.equal(maxActiveFastGets, 1, "only one concurrent fastGet at a time");
 });
 
 test("idle fast-download channels are discarded when a delayed error arrives", async (t) => {
@@ -5084,21 +8250,19 @@ test("SFTP downloads cancelled while opening do not block the session", async (t
   assert.equal(openCalls, 2);
 });
 
-test("resumable stream transfers pause without losing their checkpoint and continue", async (t) => {
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-pause-test-"));
+test("shared concurrent downloads fail closed when open/read are missing (no createReadStream)", async (t) => {
+  // Code-level lock: bulk download must not reintroduce serial createReadStream.
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-no-stream-body-"));
   t.after(async () => {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
-
-  const source = new PassThrough();
-  const sink = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
-  let readStreamCalls = 0;
+  let createReadStreamCalls = 0;
   const sftp = createFastSftp({
+    // Intentionally no open/read — pipelined path unavailable.
     createReadStream() {
-      readStreamCalls += 1;
-      return readStreamCalls === 1 ? source : Readable.from(Buffer.from("abcdef"));
+      createReadStreamCalls += 1;
+      throw new Error("serial createReadStream must not be used for bulk SFTP download");
     },
-    createWriteStream() { return sink; },
   });
   const client = {
     sftp,
@@ -5106,53 +8270,10 @@ test("resumable stream transfers pause without losing their checkpoint and conti
     client: { sftp(callback) { callback(new Error("isolated channel unavailable")); } },
   };
   transferBridge.init({ sftpClients: new Map([["source", client]]) });
-
-  const lifecycleEvents = [];
-  const originalLoad = Module._load;
-  // broadcastGlobalTransferEvent only loads electron when process.versions.electron
-  // is set (avoids install.js downloads in bare Node unit tests).
-  const previousElectronVersion = process.versions.electron;
-  Object.defineProperty(process.versions, "electron", {
-    configurable: true,
-    enumerable: true,
-    value: previousElectronVersion || "test",
-  });
-  Module._load = function load(request, parent, isMain) {
-    if (request === "electron") {
-      return {
-        BrowserWindow: {
-          getAllWindows: () => [{
-            isDestroyed: () => false,
-            webContents: {
-              isDestroyed: () => false,
-              send(channel, payload) {
-                if (channel === "netcatty:sftp:global-transfer") lifecycleEvents.push(payload);
-              },
-            },
-          }],
-        },
-      };
-    }
-    return originalLoad(request, parent, isMain);
-  };
-  t.after(() => {
-    Module._load = originalLoad;
-    if (previousElectronVersion === undefined) {
-      delete process.versions.electron;
-    } else {
-      Object.defineProperty(process.versions, "electron", {
-        configurable: true,
-        enumerable: true,
-        value: previousElectronVersion,
-      });
-    }
-  });
-
-  const sender = createSender();
-  const running = transferBridge.startTransfer(
-    { sender },
+  const result = await transferBridge.startTransfer(
+    { sender: createSender() },
     {
-      transferId: "download-paused",
+      transferId: "download-no-stream-body",
       sourcePath: "/tmp/source.bin",
       targetPath: path.join(tempDir, "target.bin"),
       sourceType: "sftp",
@@ -5162,45 +8283,8 @@ test("resumable stream transfers pause without losing their checkpoint and conti
       resumable: true,
     },
   );
-
-  const readyDeadline = Date.now() + 1000;
-  while (source.listenerCount("data") === 0 && Date.now() < readyDeadline) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  assert.ok(source.listenerCount("data") > 0);
-  source.write(Buffer.from("abc"));
-  await new Promise((resolve) => setImmediate(resolve));
-  const paused = await transferBridge.pauseTransfer(null, { transferId: "download-paused" });
-  // Full-file source fingerprint is no longer on the pause critical path.
-  assert.equal(paused.success, true);
-  assert.equal(paused.checkpointBytes, 3);
-  assert.equal(paused.resumeStage, "direct");
-  assert.equal(paused.downloadCheckpointBytes, 0);
-  assert.equal(paused.uploadCheckpointBytes, 0);
-  const pausedEvent = lifecycleEvents.findLast((event) => event.type === "paused");
-  assert.equal(pausedEvent?.transferId, "download-paused");
-  assert.equal(pausedEvent?.checkpointBytes, 3);
-  assert.equal(pausedEvent?.resumeStage, "direct");
-  assert.equal(pausedEvent?.downloadCheckpointBytes, 0);
-  assert.equal(pausedEvent?.uploadCheckpointBytes, 0);
-  assert.equal(pausedEvent?.lifecycleEpoch, 1);
-
-  source.write(Buffer.from("def"));
-  await new Promise((resolve) => setImmediate(resolve));
-  const pausedAgain = await transferBridge.pauseTransfer(null, { transferId: "download-paused" });
-  assert.equal(pausedAgain.success, true);
-  assert.equal(pausedAgain.checkpointBytes, 3);
-  assert.equal(pausedAgain.resumeStage, "direct");
-
-  const resumed = await transferBridge.resumeTransfer(null, { transferId: "download-paused" });
-  assert.equal(resumed.success, true);
-  assert.ok(Number.isFinite(resumed.lifecycleEpoch), "soft-resume must return bridge lifecycleEpoch");
-  assert.deepEqual(
-    lifecycleEvents.findLast((event) => event.type === "resumed"),
-    { type: "resumed", transferId: "download-paused", lifecycleEpoch: 2 },
-  );
-  source.end();
-  assert.equal((await running).error, undefined);
+  assert.match(result.error || "", /pipelined download failed|open\/read missing/i);
+  assert.equal(createReadStreamCalls, 0, "bulk path must never call createReadStream");
 });
 
 test("stream local-copy pause survives write-stream drain without auto-resuming the pipe", async (t) => {
@@ -5416,8 +8500,20 @@ test("resumable downloads never promote a partial staged file", async (t) => {
 
   const targetPath = path.join(tempDir, "target.bin");
   await fs.promises.writeFile(targetPath, Buffer.from("original"));
-  const source = new PassThrough();
-  const sftp = createFastSftp({ createReadStream() { return source; } });
+  // Remote pretends size=6 but EOF after 3 bytes — concurrent READ must fail closed
+  // without promoting a partial stage over the existing target.
+  const partial = Buffer.from("abc");
+  const { sftp } = createPipelinedDownloadSftp(partial, {
+    read(_handle, buffer, offset, length, position, callback) {
+      if (position >= partial.length) {
+        setImmediate(() => callback(null, 0));
+        return;
+      }
+      const slice = partial.subarray(position, Math.min(position + length, partial.length));
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+  });
   const client = {
     sftp,
     stat() { return Promise.resolve({ size: 6 }); },
@@ -5439,14 +8535,9 @@ test("resumable downloads never promote a partial staged file", async (t) => {
       resumable: true,
     },
   );
-  const readyDeadline = Date.now() + 1000;
-  while (source.listenerCount("data") === 0 && Date.now() < readyDeadline) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  source.end(Buffer.from("abc"));
 
   const result = await running;
-  assert.match(result.error || "", /full source|size mismatch/i);
+  assert.match(result.error || "", /full source|size mismatch|pipelined download failed/i);
   assert.equal(await fs.promises.readFile(targetPath, "utf8"), "original");
   assert.equal(sender.sent.some((entry) => entry.channel === "netcatty:transfer:complete"), false);
 });
@@ -5927,11 +9018,41 @@ test("resume rejects a same-size temporary prefix that does not match the source
 test("bridge admission applies one global concurrency limit across callers", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-admission-test-"));
   t.after(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
-  const firstSource = new PassThrough();
-  const secondSource = new PassThrough();
+  const pendingByPath = new Map();
+  const payloads = {
+    "/first": Buffer.from("a"),
+    "/second": Buffer.from("b"),
+  };
   const sftp = createFastSftp({
-    createReadStream(remotePath) {
-      return remotePath === "/first" ? firstSource : secondSource;
+    open(remotePath, flags, callback) {
+      const cb = typeof flags === "function" ? flags : callback;
+      cb(null, Buffer.from(`handle:${remotePath}`));
+    },
+    read(handle, buffer, offset, length, position, callback) {
+      const key = handle.toString().replace(/^handle:/, "");
+      const payload = payloads[key] || Buffer.from("x");
+      // Stall only the first READ per path so admission can observe "started".
+      // Later verification samples complete immediately.
+      if (!pendingByPath.has(key)) {
+        pendingByPath.set(key, []);
+        pendingByPath.get(key).push(() => {
+          const slice = payload.subarray(position, position + length);
+          slice.copy(buffer, offset);
+          callback(null, slice.length);
+        });
+        return;
+      }
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) { callback(null); },
+    // Content-hash helpers only — bulk body uses open/read above.
+    createReadStream(remotePath, options = {}) {
+      const payload = payloads[remotePath] || Buffer.from("x");
+      const start = Number.isFinite(options.start) ? options.start : 0;
+      const end = Number.isFinite(options.end) ? options.end : payload.length - 1;
+      return Readable.from([Buffer.from(payload.subarray(start, end + 1))]);
     },
   });
   const client = { sftp, stat: async () => ({ size: 1 }) };
@@ -5950,39 +9071,62 @@ test("bridge admission applies one global concurrency limit across callers", asy
   });
   const first = start("admission-first", "/first");
   assert.equal(
-    await waitUntil(() => firstSource.listenerCount("data") > 0),
+    await waitUntil(() => (pendingByPath.get("/first") || []).length > 0),
     true,
     "first admitted transfer did not start",
   );
   const second = start("admission-second", "/second");
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(secondSource.listenerCount("data"), 0);
-  firstSource.end(Buffer.from("a"));
+  assert.equal(pendingByPath.has("/second"), false);
+  for (const deliver of (pendingByPath.get("/first") || []).splice(0)) deliver();
   assert.equal((await first).error, undefined);
   assert.equal(
-    await waitUntil(() => secondSource.listenerCount("data") > 0),
+    await waitUntil(() => (pendingByPath.get("/second") || []).length > 0),
     true,
     "second admitted transfer did not start after the first completed",
   );
-  secondSource.end(Buffer.from("b"));
+  for (const deliver of (pendingByPath.get("/second") || []).splice(0)) deliver();
   assert.equal((await second).error, undefined);
 });
 
 test("bridge admission gives different remote sessions independent concurrency", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-per-session-test-"));
   t.after(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
-  const sourceA = new PassThrough();
-  const sourceB = new PassThrough();
-  const makeClient = (source) => ({
-    sftp: createFastSftp({ createReadStream() { return source; } }),
-    stat: async () => ({ size: 1 }),
-  });
+  const makeClient = (label) => {
+    const pending = [];
+    let firstRead = true;
+    const payload = Buffer.from(label);
+    const { sftp } = createPipelinedDownloadSftp(payload, {
+      read(_handle, buffer, offset, length, position, callback) {
+        const deliver = () => {
+          const slice = payload.subarray(position, position + length);
+          slice.copy(buffer, offset);
+          callback(null, slice.length);
+        };
+        if (firstRead) {
+          firstRead = false;
+          pending.push(deliver);
+          return;
+        }
+        setImmediate(deliver);
+      },
+    });
+    return {
+      client: { sftp, stat: async () => ({ size: 1 }) },
+      pending,
+      release() {
+        for (const deliver of pending.splice(0)) deliver();
+      },
+    };
+  };
+  const a = makeClient("a");
+  const b = makeClient("b");
   transferBridge.init({ sftpClients: new Map([
-    ["source-a", makeClient(sourceA)],
-    ["source-b", makeClient(sourceB)],
+    ["source-a", a.client],
+    ["source-b", b.client],
   ]) });
 
-  const start = (id, sourceSftpId, source) => transferBridge.startTransfer({ sender: createSender() }, {
+  const start = (id, sourceSftpId) => transferBridge.startTransfer({ sender: createSender() }, {
     transferId: id,
     sourcePath: `/${id}`,
     targetPath: path.join(tempDir, `${id}.bin`),
@@ -5992,16 +9136,15 @@ test("bridge admission gives different remote sessions independent concurrency",
     totalBytes: 1,
     resumable: true,
     globalConcurrency: 1,
-  }).finally(() => source.destroy());
-  const first = start("per-session-a", "source-a", sourceA);
-  const second = start("per-session-b", "source-b", sourceB);
-  const deadline = Date.now() + 500;
-  while ((sourceA.listenerCount("data") === 0 || sourceB.listenerCount("data") === 0) && Date.now() < deadline) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  const bothStarted = sourceA.listenerCount("data") > 0 && sourceB.listenerCount("data") > 0;
-  sourceA.end(Buffer.from("a"));
-  sourceB.end(Buffer.from("b"));
+  });
+  const first = start("per-session-a", "source-a");
+  const second = start("per-session-b", "source-b");
+  const bothStarted = await waitUntil(
+    () => a.pending.length > 0 && b.pending.length > 0,
+    500,
+  );
+  a.release();
+  b.release();
   await Promise.all([first, second]);
   assert.equal(bothStarted, true);
 });
@@ -6009,17 +9152,12 @@ test("bridge admission gives different remote sessions independent concurrency",
 test("clearPendingCancel allows intentional same-id start after a pre-start cancel", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-clear-pending-"));
   t.after(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
-  const source = new PassThrough();
-  const sftp = createFastSftp({
-    createReadStream() {
-      return source;
-    },
-  });
+  const { sftp } = createPipelinedDownloadSftp(Buffer.from("a"));
   transferBridge.init({ sftpClients: new Map([["source", { sftp, stat: async () => ({ size: 1 }) }]]) });
 
   await transferBridge.cancelTransfer(null, { transferId: "retry-same-id" });
   transferBridge.clearPendingCancel("retry-same-id");
-  const resultPromise = transferBridge.startTransfer({ sender: createSender() }, {
+  const result = await transferBridge.startTransfer({ sender: createSender() }, {
     transferId: "retry-same-id",
     sourcePath: "/remote",
     targetPath: path.join(tempDir, "out.bin"),
@@ -6029,20 +9167,19 @@ test("clearPendingCancel allows intentional same-id start after a pre-start canc
     totalBytes: 1,
     skipAdmission: true,
   });
-  while (source.listenerCount("data") === 0) await new Promise((resolve) => setImmediate(resolve));
-  source.end(Buffer.from("a"));
-  const result = await resultPromise;
   assert.equal(result.cancelled, undefined);
-  assert.equal(result.error, undefined);
+  assert.equal(result.error, undefined, result.error);
 });
 
 test("cancel before skipAdmission start rejects the transfer without writing", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-pending-cancel-"));
   t.after(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
-  const source = new PassThrough();
-  const sftp = createFastSftp({
-    createReadStream() {
-      return source;
+  let openCalls = 0;
+  const { sftp } = createPipelinedDownloadSftp(Buffer.from("a"), {
+    open(_remotePath, flags, callback) {
+      openCalls += 1;
+      const cb = typeof flags === "function" ? flags : callback;
+      cb(null, Buffer.from("read-handle"));
     },
   });
   transferBridge.init({ sftpClients: new Map([["source", { sftp, stat: async () => ({ size: 1 }) }]]) });
@@ -6059,7 +9196,7 @@ test("cancel before skipAdmission start rejects the transfer without writing", a
     skipAdmission: true,
   });
   assert.equal(result.cancelled, true);
-  assert.equal(source.listenerCount("data"), 0);
+  assert.equal(openCalls, 0, "pre-start cancel must not open a remote handle");
 });
 
 test("pre-start cancel latches stay hard bounded when cancelled work never starts", async (t) => {
@@ -6080,11 +9217,35 @@ test("pre-start cancel latches stay hard bounded when cancelled work never start
 test("pausing a queued admission job preserves the payload checkpoint", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-queued-checkpoint-"));
   t.after(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
-  const firstSource = new PassThrough();
-  const secondSource = new PassThrough();
+  const pendingByPath = new Map();
+  const payloads = { "/first": Buffer.from("a"), "/second": Buffer.from("b") };
   const sftp = createFastSftp({
-    createReadStream(remotePath) {
-      return remotePath === "/first" ? firstSource : secondSource;
+    open(remotePath, flags, callback) {
+      const cb = typeof flags === "function" ? flags : callback;
+      cb(null, Buffer.from(`handle:${remotePath}`));
+    },
+    read(handle, buffer, offset, length, position, callback) {
+      const key = handle.toString().replace(/^handle:/, "");
+      const payload = payloads[key] || Buffer.from("x");
+      if (!pendingByPath.has(key)) {
+        pendingByPath.set(key, []);
+        pendingByPath.get(key).push(() => {
+          const slice = payload.subarray(position, position + length);
+          slice.copy(buffer, offset);
+          callback(null, slice.length);
+        });
+        return;
+      }
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) { callback(null); },
+    createReadStream(remotePath, options = {}) {
+      const payload = payloads[remotePath] || Buffer.from("x");
+      const start = Number.isFinite(options.start) ? options.start : 0;
+      const end = Number.isFinite(options.end) ? options.end : payload.length - 1;
+      return Readable.from([Buffer.from(payload.subarray(start, end + 1))]);
     },
   });
   transferBridge.init({ sftpClients: new Map([["source", { sftp, stat: async () => ({ size: 1 }) }]]) });
@@ -6102,25 +9263,51 @@ test("pausing a queued admission job preserves the payload checkpoint", async (t
   });
 
   const first = start("queued-ckpt-first", "/first", 0);
-  while (firstSource.listenerCount("data") === 0) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(await waitUntil(() => (pendingByPath.get("/first") || []).length > 0));
   const second = start("queued-ckpt-second", "/second", 42);
   const paused = await transferBridge.pauseTransfer(null, { transferId: "queued-ckpt-second" });
   assert.equal(paused.success, true);
   assert.equal(paused.checkpointBytes, 42);
   assert.equal((await transferBridge.cancelTransfer(null, { transferId: "queued-ckpt-second" })).success, true);
   assert.equal((await second).cancelled, true);
-  firstSource.end(Buffer.from("a"));
+  for (const deliver of (pendingByPath.get("/first") || []).splice(0)) deliver();
   assert.equal((await first).error, undefined);
 });
 
 test("queued admission jobs can be paused, resumed, prioritized, and cancelled before opening a stream", async (t) => {
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "netcatty-transfer-queued-controls-"));
   t.after(async () => { await fs.promises.rm(tempDir, { recursive: true, force: true }); });
-  const firstSource = new PassThrough();
-  const secondSource = new PassThrough();
+  const pendingByPath = new Map();
+  let secondOpenCalls = 0;
+  const payloads = { "/first": Buffer.from("a"), "/second": Buffer.from("b") };
   const sftp = createFastSftp({
-    createReadStream(remotePath) {
-      return remotePath === "/first" ? firstSource : secondSource;
+    open(remotePath, flags, callback) {
+      const cb = typeof flags === "function" ? flags : callback;
+      if (String(remotePath).includes("second")) secondOpenCalls += 1;
+      cb(null, Buffer.from(`handle:${remotePath}`));
+    },
+    read(handle, buffer, offset, length, position, callback) {
+      const key = handle.toString().replace(/^handle:/, "");
+      const payload = payloads[key] || Buffer.from("x");
+      if (!pendingByPath.has(key)) {
+        pendingByPath.set(key, []);
+        pendingByPath.get(key).push(() => {
+          const slice = payload.subarray(position, position + length);
+          slice.copy(buffer, offset);
+          callback(null, slice.length);
+        });
+        return;
+      }
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      setImmediate(() => callback(null, slice.length));
+    },
+    close(_handle, callback) { callback(null); },
+    createReadStream(remotePath, options = {}) {
+      const payload = payloads[remotePath] || Buffer.from("x");
+      const start = Number.isFinite(options.start) ? options.start : 0;
+      const end = Number.isFinite(options.end) ? options.end : payload.length - 1;
+      return Readable.from([Buffer.from(payload.subarray(start, end + 1))]);
     },
   });
   transferBridge.init({ sftpClients: new Map([["source", { sftp, stat: async () => ({ size: 1 }) }]]) });
@@ -6137,17 +9324,17 @@ test("queued admission jobs can be paused, resumed, prioritized, and cancelled b
   });
 
   const first = start("queued-control-first", "/first");
-  while (firstSource.listenerCount("data") === 0) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(await waitUntil(() => (pendingByPath.get("/first") || []).length > 0));
   const second = start("queued-control-second", "/second");
   assert.equal((await transferBridge.pauseTransfer(null, { transferId: "queued-control-second" })).success, true);
-  assert.equal(secondSource.listenerCount("data"), 0);
+  assert.equal(secondOpenCalls, 0, "queued second must not open while first holds admission");
   assert.equal((await transferBridge.resumeTransfer(null, { transferId: "queued-control-second" })).success, true);
   assert.equal((await transferBridge.prioritizeTransfer(null, { transferId: "queued-control-second" })).success, true);
   assert.equal((await transferBridge.cancelTransfer(null, { transferId: "queued-control-second" })).success, true);
   assert.equal((await second).cancelled, true);
-  firstSource.end(Buffer.from("a"));
+  for (const deliver of (pendingByPath.get("/first") || []).splice(0)) deliver();
   assert.equal((await first).error, undefined);
-  assert.equal(secondSource.listenerCount("data"), 0);
+  assert.equal(secondOpenCalls, 0, "cancelled queued job must never open a remote handle");
 });
 
 test("transfer session leases hold SFTP ids across soft-close until release", async (t) => {

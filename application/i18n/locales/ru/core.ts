@@ -185,6 +185,9 @@ export const ruCoreMessages: Messages = {
   'settings.sessionLogs.timestamps': 'Добавлять метки времени',
   'settings.sessionLogs.timestampsDesc': 'Добавлять локальное время в начало каждой строки в текстовых и HTML-журналах.',
   'settings.sessionLogs.hint': 'Журналы сессий сохраняют весь вывод терминала для диагностики и аудита.',
+  'settings.sessionLogs.clearAll': 'Очистить все журналы',
+  'settings.sessionLogs.clearAllDesc': 'Удалить все сохранённые файлы журналов сессий и вложенные папки хостов из папки сохранения.',
+  'settings.sessionLogs.clearConfirm': 'Это приведёт к безвозвратному удалению всех файлов журналов сессий в папке сохранения. Это действие нельзя отменить. Продолжить?',
 
   // Settings > SSH Debug Logs
   'settings.sshDebugLogs.title': 'Отладочные журналы SSH',
@@ -640,6 +643,10 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.section.serverStats': 'Статистика сервера (Linux)',
   'settings.terminal.hostInfoBar.show': 'Показывать сведения о хосте',
   'settings.terminal.hostInfoBar.show.desc': 'Показывать адрес хоста и сведения о сервере над терминалом. Кнопки действий остаются доступными после скрытия.',
+  'settings.terminal.hostInfoBar.titleMode': 'Заголовок сведений о хосте',
+  'settings.terminal.hostInfoBar.titleMode.desc': 'Показывать в панели адрес подключения (user@host) или метку хоста из хранилища.',
+  'settings.terminal.hostInfoBar.titleMode.address': 'Адрес подключения',
+  'settings.terminal.hostInfoBar.titleMode.label': 'Метка хоста',
   'settings.terminal.section.systemManager': 'Системный менеджер',
   'settings.terminal.systemManager.processRefreshInterval': 'Обновление списка процессов',
   'settings.terminal.systemManager.processRefreshInterval.desc': 'Как часто обновлять список процессов в боковой панели системного менеджера.',
