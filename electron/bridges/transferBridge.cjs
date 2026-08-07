@@ -21,6 +21,8 @@ const { openBoundedSftpChannel } = require("./boundedSftpOpen.cjs");
 const {
   DOWNLOAD_TRANSFER_CONCURRENCY,
   FAST_DOWNLOAD_CHANNELS_PER_SESSION,
+  SFTP_OPEN_TIMEOUT_MS,
+  SFTP_REQUEST_TIMEOUT_MS,
   TRANSFER_CHUNK_SIZE,
   UPLOAD_TRANSFER_CONCURRENCY,
 } = require("./transferLimits.cjs");
@@ -336,15 +338,32 @@ function remoteOpenPathMatchesStaged(openPath, stagedRemote) {
  * if the stale OPEN lands after the retry has begun writing, the server
  * truncates the retry stage and a later size check can promote sparse data
  * (Codex P1 on 42a27ef7). Wait for any prior OPEN on the path to settle before
- * issuing another truncating OPEN; release on OPEN callback and on drain
- * force-complete so a dead channel cannot block retries forever.
+ * issuing another truncating OPEN; release on OPEN callback so a late truncating
+ * OPEN cannot race a retry. When an OPEN dies without a callback, fail() poisons
+ * the entry so later waiters reject promptly (fail-closed) instead of hanging
+ * forever on waitForPrior (#2755 / Codex P2 on dca41093).
  *
- * @type {Map<string, { promise: Promise<void>, resolve: () => void, released: boolean }>}
+ * @type {Map<string, {
+ *   promise: Promise<void>,
+ *   resolve: () => void,
+ *   reject: (err: Error) => void,
+ *   released: boolean,
+ *   failed: boolean,
+ *   failError: Error | null,
+ * }>}
  */
 const truncatingSharedWriteOpenGates = new Map();
 /** @type {WeakMap<object, string>} */
 const truncatingSharedWriteSftpKeys = new WeakMap();
 let truncatingSharedWriteSftpSeq = 0;
+
+function createPoisonedWriteOpenPathGateError(message) {
+  const err = new Error(
+    message || "Prior write OPEN never settled; path gate is fail-closed",
+  );
+  err.noTransferFallback = true;
+  return err;
+}
 
 function sharedWriteOpenPathKey(filePath) {
   if (Buffer.isBuffer(filePath)) return `b:${filePath.toString("hex")}`;
@@ -387,38 +406,163 @@ function sharedWriteOpenSessionKey(sftp, transfer) {
 /**
  * @param {string | Buffer} filePath
  * @param {string} [sessionKey]
- * @returns {{ waitForPrior: Promise<void>, release: () => void }}
+ * @returns {{
+ *   waitForPrior: Promise<void>,
+ *   release: () => void,
+ *   fail: (err?: Error, options?: { reinstall?: boolean }) => void,
+ *   markOpenIssued: () => void,
+ *   releaseAfterTransportGone: () => void,
+ * }}
  */
 function beginTruncatingSharedWriteOpen(filePath, sessionKey = "unknown") {
   const key = `${sessionKey}|${sharedWriteOpenPathKey(filePath)}`;
   const prior = truncatingSharedWriteOpenGates.get(key);
+
+  // Poisoned prior: keep the fail-closed barrier. Do not replace the map entry
+  // with a fresh waiter that could release and let a later OPEN race a still-
+  // pending truncate. New callers fail promptly on waitForPrior.
+  if (prior?.failed) {
+    const err = prior.failError || createPoisonedWriteOpenPathGateError();
+    return {
+      waitForPrior: Promise.reject(err),
+      release: () => {},
+      fail: () => {},
+      markOpenIssued: () => {},
+      releaseAfterTransportGone: () => {},
+    };
+  }
+
   const waitForPrior = prior && !prior.released
     ? prior.promise
     : Promise.resolve();
 
   let resolve;
-  const promise = new Promise((r) => {
-    resolve = r;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
   });
+  // Avoid unhandledRejection when nobody awaits yet (fail before waiters attach).
+  promise.catch(() => {});
   const entry = {
     promise,
     resolve: () => {
       resolve();
     },
+    reject: (err) => {
+      reject(err);
+    },
     released: false,
+    failed: false,
+    failError: null,
+    // True once this entry has started the remote OPEN. Waiters that only
+    // block on a prior must not act as the OPEN owner for poison cleanup.
+    openIssued: false,
+    priorEntry: prior && !prior.released ? prior : null,
+    transportGone: false,
+    transportGoneTimer: null,
+    releaseAfterTransportGone: null,
   };
   truncatingSharedWriteOpenGates.set(key, entry);
 
   const release = () => {
     if (entry.released) return;
     entry.released = true;
+    if (entry.transportGoneTimer) {
+      clearTimeout(entry.transportGoneTimer);
+      entry.transportGoneTimer = null;
+    }
     if (truncatingSharedWriteOpenGates.get(key) === entry) {
       truncatingSharedWriteOpenGates.delete(key);
     }
+    // Already failed: promise rejected; drop the barrier once OPEN settled.
+    if (entry.failed) return;
     entry.resolve();
   };
 
-  return { waitForPrior, release };
+  /**
+   * After the owning SFTP transport is closed/replaced, clear a poisoned
+   * barrier so reconnects to the same host/path are not fail-closed forever.
+   * Keep a short grace so a late OPEN callback that still races end() cannot
+   * wipe a same-path retry with no barrier (Codex P2 on 713719c2).
+   */
+  const releaseAfterTransportGone = () => {
+    entry.transportGone = true;
+    if (!entry.failed || entry.released || entry.transportGoneTimer) return;
+    entry.transportGoneTimer = setTimeout(() => {
+      entry.transportGoneTimer = null;
+      if (entry.released || !entry.failed) return;
+      release();
+    }, 2000);
+  };
+  entry.releaseAfterTransportGone = releaseAfterTransportGone;
+
+  const markOpenIssued = () => {
+    entry.openIssued = true;
+  };
+
+  /**
+   * @param {Error} [error]
+   * @param {{ reinstall?: boolean }} [options]
+   *   reinstall — when true (default), make the OPEN-owning entry the durable
+   *   map barrier. Successor waiters that only propagate a prior poison must
+   *   pass false so they cannot steal the slot (Codex P2 on 64450bfd).
+   */
+  const fail = (error, options = {}) => {
+    const wantReinstall = options.reinstall !== false;
+    const err = error instanceof Error
+      ? error
+      : createPoisonedWriteOpenPathGateError(String(error?.message || error || ""));
+    if (!err.noTransferFallback) err.noTransferFallback = true;
+
+    if (!entry.released && !entry.failed) {
+      entry.failed = true;
+      entry.failError = err;
+      entry.reject(err);
+    }
+
+    // A successor waiter may already own the map slot. Poison that head too so
+    // its promise cannot resolve and clear the barrier for a third upload while
+    // the original truncating OPEN may still land (Codex P1 on 0292802c).
+    const current = truncatingSharedWriteOpenGates.get(key);
+    if (current && current !== entry && !current.released && !current.failed) {
+      current.failed = true;
+      current.failError = err;
+      current.reject(err);
+    }
+
+    if (!wantReinstall || entry.released) return;
+
+    // Prefer the OPEN-owning ancestor as the durable barrier. A waiter that
+    // reaches fastPut timeout must not reinstall itself and arm transport
+    // cleanup while the prior OPEN's channel may still deliver a late truncate
+    // (Codex P1 on 251bf9ec).
+    let barrier = entry;
+    if (!entry.openIssued) {
+      let cursor = entry.priorEntry;
+      while (cursor && !cursor.released) {
+        barrier = cursor;
+        if (cursor.openIssued || !cursor.priorEntry || cursor.priorEntry.released) break;
+        cursor = cursor.priorEntry;
+      }
+      if (!barrier.failed) {
+        barrier.failed = true;
+        barrier.failError = err;
+        try { barrier.reject(err); } catch { /* ignore */ }
+      }
+    }
+    truncatingSharedWriteOpenGates.set(key, barrier);
+    // Arm post-transport clear only when THIS entry owns the unresolved OPEN
+    // and is the one being poisoned (its isolated channel already ended before
+    // fastPut timeout). A waiter fail() that walks to an ancestor must not
+    // start that ancestor's cleanup while the ancestor's transport may still
+    // deliver a late truncating OPEN (Codex P1 on 4f2397ce).
+    if (barrier === entry && barrier.openIssued) {
+      try { barrier.releaseAfterTransportGone?.(); } catch { /* ignore */ }
+    }
+  };
+
+  return { waitForPrior, release, fail, markOpenIssued, releaseAfterTransportGone };
 }
 
 /**
@@ -471,6 +615,9 @@ async function resolveRemoteResumeCheckpoint(client, sftpId, filePath, encoding,
 
 async function hashReadable(readable, options = {}) {
   const { signal, onProgress } = options;
+  const inactivityTimeoutMs = Number(options.inactivityTimeoutMs) > 0
+    ? Number(options.inactivityTimeoutMs)
+    : 0;
   const cancellationError = () => {
     const error = new Error("Transfer cancelled");
     error.code = "ABORT_ERR";
@@ -486,22 +633,49 @@ async function hashReadable(readable, options = {}) {
   signal?.addEventListener?.("abort", abortReadable, { once: true });
   const hash = crypto.createHash("sha256");
   let bytesRead = 0;
-  try {
-    for await (const chunk of readable) {
+  let timer = null;
+  let rejectTimeout = null;
+  const armInactivityTimer = () => {
+    if (!inactivityTimeoutMs) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      const error = new Error(`SFTP stream timed out after ${inactivityTimeoutMs} ms`);
+      error.code = "SFTP_STREAM_TIMEOUT";
+      error.sftpRequestTimedOut = true;
+      try { readable.destroy?.(error); } catch { /* ignore */ }
+      rejectTimeout?.(error);
+    }, inactivityTimeoutMs);
+  };
+  const consume = (async () => {
+    armInactivityTimer();
+    try {
+      for await (const chunk of readable) {
+        if (signal?.aborted) throw cancellationError();
+        hash.update(chunk);
+        bytesRead += chunk.length;
+        onProgress?.(bytesRead);
+        armInactivityTimer();
+      }
       if (signal?.aborted) throw cancellationError();
-      hash.update(chunk);
-      bytesRead += chunk.length;
-      onProgress?.(bytesRead);
+      return hash.digest("hex");
+    } catch (error) {
+      if (signal?.aborted) throw cancellationError();
+      throw error;
     }
-    if (signal?.aborted) throw cancellationError();
-    return hash.digest("hex");
-  } catch (error) {
-    if (signal?.aborted) throw cancellationError();
-    throw error;
+  })();
+  try {
+    if (!inactivityTimeoutMs) return await consume;
+    const timeout = new Promise((_, reject) => {
+      rejectTimeout = reject;
+    });
+    return await Promise.race([consume, timeout]);
   } finally {
+    if (timer) clearTimeout(timer);
     signal?.removeEventListener?.("abort", abortReadable);
   }
 }
+
+const EMPTY_SHA256_HEX = crypto.createHash("sha256").update("").digest("hex");
 
 function hashLocalPrefix(filePath, bytes, options) {
   if (!Number.isFinite(bytes) || bytes < 0) return Promise.resolve(null);
@@ -511,6 +685,67 @@ function hashLocalPrefix(filePath, bytes, options) {
 
 function hashLocalFile(filePath, options = {}) {
   return hashReadable(fs.createReadStream(filePath), options);
+}
+
+async function hashRemotePrefixViaSshCommand(client, remotePath, bytes, options = {}) {
+  if (!Number.isFinite(bytes) || bytes <= 0 || isScpModeClient(client)) return null;
+  // Sudo SFTP elevates the subsystem, but exec() still runs as the login user.
+  // For a root-only source, head can fail while sha256sum/openssl still emit the
+  // empty-input digest and exit 0 — skip the command path and use elevated SFTP.
+  if (client?.__netcattySudoMode) return null;
+  const sshClient = client?.client;
+  if (!sshClient || typeof sshClient.exec !== "function") return null;
+
+  if (typeof remotePath !== "string") return null;
+  const byteCount = Math.floor(bytes);
+  const escapedPath = remotePath.replace(/'/g, "'\\''");
+  const commands = [
+    `if command -v head >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then head -c ${byteCount} '${escapedPath}' | sha256sum; else exit 127; fi`,
+    `if command -v busybox >/dev/null 2>&1; then busybox head -c ${byteCount} '${escapedPath}' | busybox sha256sum; else exit 127; fi`,
+    `if command -v head >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then head -c ${byteCount} '${escapedPath}' | openssl dgst -sha256; else exit 127; fi`,
+  ];
+
+  for (const command of commands) {
+    try {
+      const result = await executeBoundedSshCommand(sshClient, command, {
+        signal: options.signal,
+        openingTimeoutMs: Number(options.sshDigestOpeningTimeoutMs) > 0
+          ? Number(options.sshDigestOpeningTimeoutMs)
+          : 15_000,
+        runTimeoutMs: Number(options.sshDigestRunTimeoutMs) > 0
+          ? Number(options.sshDigestRunTimeoutMs)
+          : 10 * 60_000,
+        maxOutputBytes: 64 * 1024,
+      });
+      if (result.code !== 0) continue;
+      const match = String(result.stdout || "").match(/\b([a-fA-F0-9]{64})\b/);
+      if (!match) continue;
+      const digest = match[1].toLowerCase();
+      // Empty-input digest with bytes > 0 means head failed open into the hasher.
+      if (digest === EMPTY_SHA256_HEX) continue;
+      return digest;
+    } catch (error) {
+      if (options.signal?.aborted || error?.code === "ABORT_ERR") {
+        throw error;
+      }
+      // Run timeout: the exec stream opened, so the SSH transport is still valid.
+      // Treat the optional digest as a miss and fall through to SFTP verification.
+      if (error?.code === "SSH_EXEC_RUN_TIMEOUT") {
+        return null;
+      }
+      // Open timeout invalidates the physical transport in boundedSshExec. Do not
+      // continue into SFTP on this dead session — propagate so the caller fails
+      // closed instead of hanging/failing obscurely on a poisoned channel.
+      // Mark noTransferFallback so downloadFile's isolated→shared catch does not
+      // retry verification/body transfer on the invalidated transport.
+      if (error?.code === "SSH_EXEC_OPEN_TIMEOUT") {
+        error.noTransferFallback = true;
+        abandonWedgedVerificationSftpChannel(client);
+        throw error;
+      }
+    }
+  }
+  return null;
 }
 
 async function hashRemoteFile(client, sftpId, filePath, encoding, options = {}) {
@@ -544,8 +779,6 @@ async function hashRemoteFile(client, sftpId, filePath, encoding, options = {}) 
     options,
   );
 }
-
-const EMPTY_SHA256_HEX = crypto.createHash("sha256").update("").digest("hex");
 
 /** @param {number|null|undefined} prefixBytes null = full file; >=0 = bounded prefix (incl. empty). */
 function formatSourceFingerprint(digest, prefixBytes) {
@@ -859,6 +1092,107 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
     }
     await fs.promises.unlink(readyPath).catch(() => {});
     throw err;
+  }
+}
+
+/**
+ * Apply the source mtime to the committed destination so skip-unchanged
+ * (size + mtime) can match on a later folder transfer. Best-effort: never
+ * fails the transfer if utimes/setstat is unsupported or times out.
+ */
+async function awaitBestEffortBounded(promise, timeoutMs, label) {
+  let timer = null;
+  try {
+    await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function preserveTransferredDestinationMtime(transfer, options = {}) {
+  try {
+    // Only use the pre-transfer soft identity. Re-statting after commit can pick
+    // up a rewritten same-size source and stamp a newer mtime onto older bytes
+    // (Codex P1 on non-resumable / SCP paths).
+    const mtimeMs = Number(transfer?.sourceSoftIdentity?.mtimeMs);
+    if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) return;
+
+    // Compare / skip logic uses whole seconds; stamp the destination the same way.
+    const mtimeSec = Math.floor(mtimeMs / 1000);
+    if (mtimeSec <= 0) return;
+    const when = new Date(mtimeSec * 1000);
+    // Best-effort stamp must not pin sendComplete / scheduler forever when the
+    // server stops answering metadata requests (Codex P2).
+    const mtimeTimeoutMs = Number(options.timeoutMs) > 0
+      ? Number(options.timeoutMs)
+      : 15_000;
+
+    if (transfer.targetType === "local" && transfer.targetPath) {
+      await awaitBestEffortBounded(
+        fs.promises.utimes(transfer.targetPath, when, when),
+        mtimeTimeoutMs,
+        "Destination utimes",
+      );
+      return;
+    }
+
+    if (transfer.targetType !== "sftp" || !transfer.targetSftpId || !transfer.targetPath) {
+      return;
+    }
+    const client = sftpClients.get(transfer.targetSftpId);
+    if (!client) return;
+
+    if (isScpModeClient(client)) {
+      // SCP has no SETSTAT; best-effort touch via the SSH session.
+      const sshClient = client.client;
+      if (!sshClient || typeof sshClient.exec !== "function") return;
+      const escaped = String(transfer.targetPath).replace(/'/g, "'\\''");
+      const command = `touch -d @${mtimeSec} -- '${escaped}' 2>/dev/null || `
+        + `touch -t "$(date -u -r ${mtimeSec} +%Y%m%d%H%M.%S 2>/dev/null `
+        + `|| date -u -d @${mtimeSec} +%Y%m%d%H%M.%S 2>/dev/null)" -- '${escaped}' 2>/dev/null `
+        + `|| true`;
+      await executeBoundedSshCommand(sshClient, command, { runTimeoutMs: mtimeTimeoutMs });
+      return;
+    }
+
+    await requireSftpChannel(client);
+    const encoded = encodePathForSession(
+      transfer.targetSftpId,
+      transfer.targetPath,
+      transfer.targetEncoding,
+    );
+    if (typeof client.setStat === "function") {
+      await awaitBestEffortBounded(
+        client.setStat(encoded, { mtime: mtimeSec, atime: mtimeSec }),
+        mtimeTimeoutMs,
+        "Destination setStat",
+      );
+      return;
+    }
+    const sftp = client.sftp;
+    if (!sftp || typeof sftp.setstat !== "function") return;
+    await awaitBestEffortBounded(
+      new Promise((resolve, reject) => {
+        sftp.setstat(encoded, { mtime: mtimeSec, atime: mtimeSec }, (err) => (
+          err ? reject(err) : resolve()
+        ));
+      }),
+      mtimeTimeoutMs,
+      "Destination setstat",
+    );
+  } catch (err) {
+    console.warn(
+      "[transferBridge] failed to preserve destination mtime:",
+      err?.message || String(err),
+    );
   }
 }
 
@@ -1438,6 +1772,98 @@ async function prepareStreamFallbackAfterRangeFailure(transfer, client) {
   }
 }
 
+/**
+ * Wait for a prior truncating WRITE OPEN's published gate before fastPut.
+ * Cancelable and time-bounded so a dead isolated OPEN that never callbacks
+ * cannot hang strategy fallback forever (#2755). On timeout/cancel the waiter
+ * fails closed without resolving the published transfer gate (clearing that
+ * poison early lets a late truncating OPEN wipe an in-place destination after
+ * sendComplete; Codex P1 on e2cc8241), and also poisons the shared path map so
+ * later same-path waiters fail promptly (#2755 / Codex P2 on dca41093).
+ */
+async function waitForPendingWriteOpenPathGate(transfer, options = {}) {
+  if (transfer?.noTransferFallback || transfer?.inPlaceWriteOpenPoisoned) {
+    const err = new Error("In-place write OPEN poison is still held; refusing same-path fallback");
+    err.noTransferFallback = true;
+    throw err;
+  }
+  const gate = transfer?.pendingWriteOpenPathGate;
+  if (typeof gate?.then !== "function") return;
+  // Default 2s matches fastPut's fail-closed wait (#2755): hanging forever on a
+  // dead OPEN pins the transfer/lease; longer waits only delay the poison path.
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 2_000;
+  const timeoutMessage = typeof options.timeoutMessage === "string" && options.timeoutMessage
+    ? options.timeoutMessage
+    : "Timed out waiting for prior write OPEN to settle before fastPut";
+  const poisonGate = () => {
+    // Fail closed for later same-path waiters: do not resolve/clear the published
+    // transfer gate from this waiter (Codex P1 on e2cc8241), but do poison the
+    // shared path map so a successor that replaced the entry cannot OPEN while a
+    // truncating OPEN may still land (#2755 / Codex P2 on dca41093).
+    try {
+      transfer._failPendingWriteOpenPathGate?.(
+        createPoisonedWriteOpenPathGateError(
+          "Prior write OPEN never settled; path gate is fail-closed",
+        ),
+      );
+    } catch { /* ignore */ }
+  };
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const previousAbort = transfer.abort;
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      transfer.signal?.removeEventListener?.("abort", onAbort);
+      if (transfer.abort === abortWait) transfer.abort = previousAbort;
+    };
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onAbort = () => {
+      transfer.cancelled = true;
+      // Same fail-closed poison as the timeout path: cancel must not leave later
+      // same-path uploads hanging on waitForPrior (Codex P2).
+      poisonGate();
+      finish(reject, new Error("Transfer cancelled"));
+    };
+    const abortWait = () => {
+      try { previousAbort?.(); } catch { /* ignore */ }
+      onAbort();
+    };
+    transfer.abort = abortWait;
+    transfer.signal?.addEventListener?.("abort", onAbort, { once: true });
+    if (transfer.cancelled || transfer.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    timer = setTimeout(() => {
+      const err = new Error(timeoutMessage);
+      err.noTransferFallback = true;
+      poisonGate();
+      finish(reject, err);
+    }, timeoutMs);
+    // Only a successful gate release unblocks safely. A poisoned/rejected gate
+    // must fail this waiter closed; do not proceed to another writer.
+    Promise.resolve(gate).then(
+      () => finish(resolve),
+      (err) => finish(
+        reject,
+        err instanceof Error ? err : new Error(String(err?.message || err || "path gate failed")),
+      ),
+    );
+  });
+  if (transfer.cancelled || transfer.signal?.aborted) {
+    throw new Error("Transfer cancelled");
+  }
+}
+
 function getIsolatedDownloadChannelPool(client) {
   let pool = isolatedDownloadChannelPools.get(client);
   if (!pool) {
@@ -1815,76 +2241,23 @@ async function uploadFile(
     transfer.uploadStrategy = "scp";
     logTransferDiag(transfer, "strategy", { strategy: "scp" });
     const backend = getScpBackendForClient(client);
-    let scpSourcePath = localPath;
-    let digestPath = null;
-    let snapshotPath = null;
-    let openReadStream = null;
-    let initialSource = null;
-    try {
-      if (!transfer.sourceIsOwnedTemp) {
-        initialSource = await fs.promises.stat(localPath);
-        const snapshotId = crypto.createHash("sha256")
-          .update(String(transfer.transferId || localPath))
-          .digest("hex")
-          .slice(0, 16);
-        digestPath = tempDirBridge.getTransferTempFilePath(
-          `upload-digest-${snapshotId}`,
-          "ranges.sha256",
-        );
-        snapshotPath = tempDirBridge.getTransferTempFilePath(
-          `upload-source-${snapshotId}`,
-          "snapshot.bin",
-        );
-        await createUploadDigestBaseline(localPath, digestPath, fileSize, transfer);
-        if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
-        const sourceAfterBaseline = await fs.promises.stat(localPath);
-        assertSourceMetadataUnchanged(initialSource, sourceAfterBaseline, fileSize, {
-          contentVerifiedSeparately: true,
-        });
-        if (typeof onBytesCommitted === "function") {
-          await createVerifiedUploadSnapshot(
-            localPath,
-            snapshotPath,
-            digestPath,
-            fileSize,
-            transfer,
-          );
-          scpSourcePath = snapshotPath;
-        } else {
-          // Remote staging can safely discard a failed upload. Verify every
-          // source chunk as SCP reads it, then rescan before promotion, without
-          // requiring another full local copy of large files.
-          snapshotPath = null;
-          openReadStream = () => createVerifiedUploadReadStream(
-            localPath,
-            digestPath,
-            fileSize,
-            transfer,
-          );
-        }
-      }
-      await backend.uploadFile(scpSourcePath, remotePath, {
-        fileSize,
-        transfer,
-        encoding,
-        signal: transfer.signal,
-        openReadStream,
-        onProgress: (transferred, total) => sendProgress(transferred, total || fileSize),
-      });
-      if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
-      if (digestPath && !snapshotPath) {
-        const latestSource = await fs.promises.stat(localPath);
-        assertSourceMetadataUnchanged(initialSource, latestSource, fileSize, {
-          contentVerifiedSeparately: true,
-        });
-        await verifyUploadDigestBaseline(localPath, digestPath, fileSize, transfer);
-      }
-      onBytesCommitted?.();
-      return;
-    } finally {
-      if (snapshotPath) await fs.promises.rm(snapshotPath, { force: true }).catch(() => {});
-      if (digestPath) await fs.promises.rm(digestPath, { force: true }).catch(() => {});
-    }
+    // Stream the live local path directly — no whole-file digest / snapshot.
+    // openReadStream is optional for scpBackend (falls back to createReadStream);
+    // provide a plain file stream so tests/backends that always call it still work.
+    await backend.uploadFile(localPath, remotePath, {
+      fileSize,
+      transfer,
+      encoding,
+      signal: transfer.signal,
+      openReadStream: () => {
+        const stream = fs.createReadStream(localPath, { highWaterMark: 256 * 1024 });
+        return { stream, completed: Promise.resolve() };
+      },
+      onProgress: (transferred, total) => sendProgress(transferred, total || fileSize),
+    });
+    if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
+    onBytesCommitted?.();
+    return;
   }
 
   await requireSftpChannel(client);
@@ -1895,63 +2268,6 @@ async function uploadFile(
   const initialSource = (transfer.resumable || !transfer.sourceIsOwnedTemp)
     ? await fs.promises.stat(originalLocalPath)
     : null;
-  if (!transfer.sourceIsOwnedTemp) {
-    const digestId = crypto.createHash("sha256")
-      .update(String(transfer.transferId || "upload"))
-      .digest("hex")
-      .slice(0, 16);
-    const digestPath = tempDirBridge.getTransferTempFilePath(
-      `upload-digest-${digestId}`,
-      "ranges.sha256",
-    );
-    transfer.sourceDigestPath = digestPath;
-    await createUploadDigestBaseline(
-      originalLocalPath,
-      digestPath,
-      fileSize,
-      transfer,
-    );
-    if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
-    const sourceAfterBaseline = await fs.promises.stat(originalLocalPath);
-    // Digest was just built + verified; only size/content matter from here.
-    assertSourceMetadataUnchanged(initialSource, sourceAfterBaseline, fileSize, {
-      contentVerifiedSeparately: true,
-    });
-  }
-
-  const cleanupSourceDigest = async () => {
-    if (!transfer.sourceDigestPath) return;
-    const digestPath = transfer.sourceDigestPath;
-    transfer.sourceDigestPath = null;
-    await fs.promises.rm(digestPath, { force: true }).catch(() => {});
-  };
-
-  const finishSuccessfulUpload = async () => {
-    try {
-      if (initialSource) {
-        const latestSource = await fs.promises.stat(originalLocalPath);
-        // Prefer digest re-scan for same-size rewrites. Hard-failing on ctime
-        // alone false-positives long pause/resume uploads on macOS.
-        assertSourceMetadataUnchanged(initialSource, latestSource, fileSize, {
-          contentVerifiedSeparately: Boolean(transfer.sourceDigestPath),
-        });
-      }
-      // Metadata alone cannot catch same-size rewrites with unchanged/coarse
-      // timestamps (e.g. all ranges already verified before the rewrite).
-      // Re-scan the source against the digest baseline before promotion.
-      if (transfer.sourceDigestPath) {
-        await verifyUploadDigestBaseline(
-          originalLocalPath,
-          transfer.sourceDigestPath,
-          fileSize,
-          transfer,
-        );
-      }
-      await assertRemoteUploadSize(client, remotePath, fileSize);
-    } finally {
-      await cleanupSourceDigest();
-    }
-  };
 
   /** @type {Error | null} */
   let lastPipelineError = null;
@@ -1960,9 +2276,26 @@ async function uploadFile(
     else lastPipelineError = new Error(String(err || "SFTP upload failed"));
   };
 
+  // Industry-standard SFTP clients (FileZilla / WinSCP / OpenSSH) resume by
+  // size only — no whole-file content digest before or during the body transfer.
+  // Pause/resume durability lives in checkpointBytes + the remote .part stage.
+
+  const finishSuccessfulUpload = async () => {
+    if (initialSource) {
+      const latestSource = await fs.promises.stat(originalLocalPath);
+      // Soft size + mtime/ino (no full-file re-hash). Do not claim separate
+      // content proof — same-size rewrites that bump mtime still fail closed.
+      // ignoreCtime: macOS xattr/Spotlight noise must not abort a true match.
+      assertSourceMetadataUnchanged(initialSource, latestSource, fileSize, {
+        ignoreCtime: true,
+      });
+    }
+    await assertRemoteUploadSize(client, remotePath, fileSize);
+  };
+
   // Prefer an isolated SFTP channel so cancellation cannot kill the browse session.
+  let isolated = null;
   if (!client.__netcattySudoMode) {
-    let isolated = null;
     try {
       isolated = await openIsolatedSftpChannel(client, transfer?.signal);
     } catch (err) {
@@ -1972,151 +2305,155 @@ async function uploadFile(
         err.message || String(err),
       );
     }
+  }
+  if (isolated && transfer.cancelled) {
+    try { isolated.end?.(); } catch { /* ignore */ }
+    isolated = null;
+    throw new Error("Transfer cancelled");
+  }
 
-    if (isolated) {
-      let concurrentIsolatedOk = false;
-      try {
-        transfer.uploadStrategy = "concurrent-isolated";
-        logTransferDiag(transfer, "strategy", {
-          strategy: "concurrent-isolated",
-          fields: {
-            chunk: formatDiagBytes(TRANSFER_CHUNK_SIZE),
-            concurrency: UPLOAD_TRANSFER_CONCURRENCY,
-          },
-        });
-        await uploadFileConcurrent(
-          localPath,
-          remotePath,
-          isolated,
-          fileSize,
-          transfer,
-          sendProgress,
-          { disposeChannel: true, onBytesCommitted, generatedStagePath },
-        );
-        concurrentIsolatedOk = true;
-      } catch (err) {
-        // uploadFileConcurrent ends the isolated channel itself.
-        isolated = null;
-        if (transfer.cancelled) throw err;
-        if (err?.noTransferFallback) throw err;
-        rememberPipelineError(err);
-        if (transfer.resumable) {
-          await prepareUploadFallbackCheckpoint(transfer, client, fileSize, sendProgress);
-        } else {
-          transfer.checkpointBytes = 0;
+  if (isolated) {
+    let concurrentIsolatedOk = false;
+    try {
+      transfer.uploadStrategy = "concurrent-isolated";
+      logTransferDiag(transfer, "strategy", {
+        strategy: "concurrent-isolated",
+        fields: {
+          chunk: formatDiagBytes(TRANSFER_CHUNK_SIZE),
+          concurrency: UPLOAD_TRANSFER_CONCURRENCY,
+        },
+      });
+      await uploadFileConcurrent(
+        localPath,
+        remotePath,
+        isolated,
+        fileSize,
+        transfer,
+        sendProgress,
+        { disposeChannel: true, onBytesCommitted, generatedStagePath },
+      );
+      concurrentIsolatedOk = true;
+    } catch (err) {
+      // uploadFileConcurrent ends the isolated channel itself.
+      isolated = null;
+      if (transfer.cancelled) throw err;
+      if (err?.noTransferFallback || transfer.noTransferFallback) {
+        if (err && typeof err === "object" && transfer.noTransferFallback) {
+          err.noTransferFallback = true;
         }
-        console.warn(
-          "[transferBridge] concurrent isolated upload failed, trying next pipelined strategy:",
-          err?.message || String(err),
-        );
+        throw err;
       }
-      // Verification errors must not fall through into other strategies.
-      if (concurrentIsolatedOk) {
-        await finishSuccessfulUpload();
-        return;
-      }
-    }
-
-    if (!isolated) {
-      try {
-        isolated = await openIsolatedSftpChannel(client, transfer?.signal);
-      } catch (err) {
-        rememberPipelineError(err);
-        console.warn(
-          "[transferBridge] Failed to reopen isolated SFTP channel for fastPut:",
-          err.message || String(err),
-        );
-      }
-    }
-
-    // fastPut always truncates and rewrites from offset 0 — skip when we
-    // already have a durable resume checkpoint from a prior concurrent attempt.
-    // fastPut is not pause-aware; do not advertise pause while it runs.
-    const hasResumeCheckpoint = Math.max(0, Number(transfer.checkpointBytes) || 0) > 0;
-    if (
-      isolated
-      && typeof isolated.fastPut === "function"
-      && !hasResumeCheckpoint
-      && !transfer.resumable
-    ) {
-      let fastPutOk = false;
-      let fastPutSourcePath = localPath;
-      let fastPutSnapshotPath = null;
-      try {
-        // Wait for any prior/in-flight write OPEN on this path (including our
-        // own concurrent attempt's still-pending OPEN) before fastPut truncates
-        // the same stage (Codex P1 on 7872a304).
-        if (typeof transfer.pendingWriteOpenPathGate?.then === "function") {
-          await transfer.pendingWriteOpenPathGate;
-        }
-        if (transfer.cancelled) throw new Error("Transfer cancelled");
-        transfer.uploadStrategy = "fastPut-isolated";
-        logTransferDiag(transfer, "strategy", { strategy: "fastPut-isolated" });
-        transfer.pauseSupported = false;
-        transfer.pauseUnavailableReason = "Pause is unavailable during fastPut upload";
-        if (!transfer.sourceIsOwnedTemp) {
-          const snapshotId = crypto.createHash("sha256")
-            .update(String(transfer.transferId || localPath))
-            .digest("hex")
-            .slice(0, 16);
-          fastPutSnapshotPath = tempDirBridge.getTransferTempFilePath(
-            `upload-source-${snapshotId}`,
-            "snapshot.bin",
-          );
-          await createVerifiedUploadSnapshot(
-            originalLocalPath,
-            fastPutSnapshotPath,
-            transfer.sourceDigestPath,
-            fileSize,
-            transfer,
-          );
-          fastPutSourcePath = fastPutSnapshotPath;
-        }
-        sendProgress(Math.max(0, Number(transfer.checkpointBytes) || 0), fileSize, {
-          force: true,
-        });
-        await uploadViaFastPut(
-          fastPutSourcePath,
-          remotePath,
-          isolated,
-          fileSize,
-          transfer,
-          sendProgress,
-          { disposeChannel: true },
-        );
-        fastPutOk = true;
-      } catch (err) {
-        isolated = null;
-        // Restore pause capability for subsequent pause-aware strategies.
-        transfer.pauseSupported = Boolean(transfer.resumable);
-        transfer.pauseUnavailableReason = transfer.resumable
-          ? undefined
-          : transfer.pauseUnavailableReason;
-        if (transfer.cancelled) throw err;
-        // Source-change / hard safety errors must not be retried on another path.
-        if (err?.noTransferFallback || err?.sourceChanged) throw err;
-        rememberPipelineError(err);
-        // fastPut progress is not a durable contiguous checkpoint — reset so
-        // concurrent-shared does not resume past holes left by the failed put.
+      rememberPipelineError(err);
+      if (transfer.resumable) {
+        await prepareUploadFallbackCheckpoint(transfer, client, fileSize, sendProgress);
+      } else {
         transfer.checkpointBytes = 0;
-        sendProgress(0, fileSize, { force: true, checkpointBytes: 0 });
-        console.warn(
-          "[transferBridge] isolated fastPut failed, trying next pipelined strategy:",
-          err?.message || String(err),
-        );
-      } finally {
-        if (fastPutSnapshotPath) {
-          await fs.promises.rm(fastPutSnapshotPath, { force: true }).catch(() => {});
-        }
       }
-      if (fastPutOk) {
-        onBytesCommitted?.();
-        await finishSuccessfulUpload();
-        return;
-      }
-    } else if (isolated && typeof isolated.end === "function") {
-      try { isolated.end(); } catch { /* ignore */ }
+      console.warn(
+        "[transferBridge] concurrent isolated upload failed, trying next pipelined strategy:",
+        err?.message || String(err),
+      );
     }
+    // Verification errors must not fall through into other strategies.
+    if (concurrentIsolatedOk) {
+      await finishSuccessfulUpload();
+      return;
+    }
+  }
+
+  if (!isolated && !client.__netcattySudoMode) {
+    try {
+      isolated = await openIsolatedSftpChannel(client, transfer?.signal);
+    } catch (err) {
+      rememberPipelineError(err);
+      console.warn(
+        "[transferBridge] Failed to reopen isolated SFTP channel for fastPut:",
+        err.message || String(err),
+      );
+    }
+  }
+
+  // fastPut always truncates and rewrites from offset 0; skip when we
+  // already have a durable resume checkpoint from a prior concurrent attempt.
+  // fastPut is not pause-aware; do not advertise pause while it runs.
+  // In-place OPEN poison is terminal for this transfer: do not wait on/race
+  // the unreleased path gate with another same-path strategy (Codex P1 on 3d4cecfa).
+  if (transfer.noTransferFallback) {
+    const cause = lastPipelineError || new Error("SFTP pipelined upload failed");
+    if (typeof cause === "object" && cause) cause.noTransferFallback = true;
+    throw cause;
+  }
+  const hasResumeCheckpoint = Math.max(0, Number(transfer.checkpointBytes) || 0) > 0;
+  if (
+    isolated
+    && typeof isolated.fastPut === "function"
+    && !hasResumeCheckpoint
+    && !transfer.resumable
+  ) {
+    let fastPutOk = false;
+    try {
+      // Wait for any prior/in-flight write OPEN on this path (including our
+      // own concurrent attempt's still-pending OPEN) before fastPut truncates
+      // the same stage (Codex P1 on 7872a304). Bounded + cancelable: a dead
+      // isolated OPEN never settles the path gate; hang or ignore cancel pins
+      // the transfer/lease (#2755 / Codex P2 on 667e9115).
+      await waitForPendingWriteOpenPathGate(transfer, {
+        timeoutMs: 2_000,
+        timeoutMessage: "Timed out waiting for prior write OPEN to settle before fastPut",
+      });
+      if (transfer.cancelled) throw new Error("Transfer cancelled");
+      transfer.uploadStrategy = "fastPut-isolated";
+      logTransferDiag(transfer, "strategy", { strategy: "fastPut-isolated" });
+      transfer.pauseSupported = false;
+      transfer.pauseUnavailableReason = "Pause is unavailable during fastPut upload";
+      // Stream the live local path (no whole-file snapshot / digest sidecar).
+      sendProgress(Math.max(0, Number(transfer.checkpointBytes) || 0), fileSize, {
+        force: true,
+      });
+      await uploadViaFastPut(
+        originalLocalPath,
+        remotePath,
+        isolated,
+        fileSize,
+        transfer,
+        sendProgress,
+        { disposeChannel: true },
+      );
+      fastPutOk = true;
+    } catch (err) {
+      // Gate-wait / fastPut failure: end the reopened isolated channel before
+      // nulling. Rethrow paths skip the post-block else-if end, and fallthrough
+      // also clears isolated; either way we must not leak the SSH subsystem
+      // opened for this attempt (#2755 Bugbot).
+      if (isolated && typeof isolated.end === "function") {
+        try { isolated.end(); } catch { /* ignore */ }
+      }
+      isolated = null;
+      // Restore pause capability for subsequent pause-aware strategies.
+      transfer.pauseSupported = Boolean(transfer.resumable);
+      transfer.pauseUnavailableReason = transfer.resumable
+        ? undefined
+        : transfer.pauseUnavailableReason;
+      if (transfer.cancelled) throw err;
+      // Source-change / hard safety errors must not be retried on another path.
+      if (err?.noTransferFallback || err?.sourceChanged) throw err;
+      rememberPipelineError(err);
+      // fastPut progress is not a durable contiguous checkpoint; reset so
+      // concurrent-shared does not resume past holes left by the failed put.
+      transfer.checkpointBytes = 0;
+      sendProgress(0, fileSize, { force: true, checkpointBytes: 0 });
+      console.warn(
+        "[transferBridge] isolated fastPut failed, trying next pipelined strategy:",
+        err?.message || String(err),
+      );
+    }
+    if (fastPutOk) {
+      onBytesCommitted?.();
+      await finishSuccessfulUpload();
+      return;
+    }
+  } else if (isolated && typeof isolated.end === "function") {
+    try { isolated.end(); } catch { /* ignore */ }
   }
 
   // Concurrent WRITEs on the shared browse channel — still pipelined, does not
@@ -2177,7 +2514,10 @@ async function uploadFile(
   const error = new Error(message, cause ? { cause } : undefined);
   if (cause?.code !== undefined) error.code = cause.code;
   if (cause?.noTransferFallback) error.noTransferFallback = true;
-  await cleanupSourceDigest();
+  if (transfer.sourceDigestPath) {
+    try { await fs.promises.rm(transfer.sourceDigestPath, { force: true }); } catch { /* ignore */ }
+    transfer.sourceDigestPath = null;
+  }
   throw error;
 }
 
@@ -2234,7 +2574,9 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
     : null;
   // Expose a promise that resolves when this OPEN's path gate is released so
   // same-transfer fallbacks (fastPut) can wait instead of racing a still-
-  // pending truncating OPEN (Codex P1 on 7872a304).
+  // pending truncating OPEN (Codex P1 on 7872a304). Also expose fail so a
+  // fail-closed fastPut timeout can poison the shared path gate for later
+  // same-path waiters (Codex P2 on dca41093).
   if (pathGate && transfer && typeof transfer === "object") {
     let resolvePathGate;
     const pending = new Promise((resolve) => { resolvePathGate = resolve; });
@@ -2245,6 +2587,10 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
         transfer.pendingWriteOpenPathGate = null;
       }
       transfer._resolvePendingWriteOpenPathGate = null;
+      transfer._failPendingWriteOpenPathGate = null;
+    };
+    transfer._failPendingWriteOpenPathGate = (error) => {
+      try { pathGate.fail?.(error); } catch { /* ignore */ }
     };
   }
   // Re-check ownership at unlink time: a same-id retry may already own
@@ -2340,12 +2686,57 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
     let drainForceTimer = null;
     const previousAbort = transfer.abort;
     let pathGateReleased = false;
+    // True when we released the path gate without an OPEN callback (timeout
+    // after channel error / cancel). A late truncating OPEN can then wipe
+    // same-transfer fastPut/shared fallback bytes - invalidate that attempt.
+    let pathGateForceReleased = false;
 
-    const releasePathGate = () => {
+    const releasePathGate = (options = {}) => {
       if (!pathGate || pathGateReleased) return;
       pathGateReleased = true;
+      if (options.forced === true) pathGateForceReleased = true;
       pathGate.release();
       try { transfer._resolvePendingWriteOpenPathGate?.(); } catch { /* ignore */ }
+    };
+
+    // In-place truncating OPEN must stay poisoned until the OPEN callback
+    // settles. Force-releasing lets fastPut/shared fallback finish, then a late
+    // OPEN truncates the already-reported destination and invalidation cannot
+    // restore it after sendComplete (Codex P1 on e2cc8241). Generated stages
+    // still force-release: promotion checks staleOpenTruncatedStage.
+    const mayForceReleasePathGate = () => !(
+      isTruncatingOpenNow() && !generatedStagePath
+    );
+
+    // When we keep in-place poison without force-release, same-path strategy
+    // fallbacks must not run: concurrent-shared would wait forever on the
+    // unreleased prior gate (Codex P1 on 3d4cecfa). Also poison the shared path
+    // map so later same-path waiters fail promptly (Codex P2 on dca41093).
+    const markInPlaceOpenPoisonTerminal = () => {
+      try {
+        transfer.noTransferFallback = true;
+        transfer.inPlaceWriteOpenPoisoned = true;
+      } catch { /* ignore */ }
+      try {
+        pathGate?.fail?.(createPoisonedWriteOpenPathGateError(
+          "Prior write OPEN never settled; path gate is fail-closed",
+        ));
+      } catch { /* ignore */ }
+    };
+
+    const invalidateSameTransferAfterForcedGateRelease = () => {
+      if (!pathGateForceReleased || !isTruncatingOpenNow() || !transfer) return;
+      const transferId = transfer.transferId;
+      const active = transferId != null && transferId !== ""
+        ? activeTransfers.get(transferId)
+        : null;
+      const target = active || transfer;
+      target.staleOpenTruncatedStage = true;
+      if (target.sharedWriteOpenAccepted === true) {
+        try { target.abort?.(); } catch { /* ignore */ }
+      } else {
+        try { target.checkpointBytes = 0; } catch { /* ignore */ }
+      }
     };
 
     const clearDrainForceTimer = () => {
@@ -2375,7 +2766,7 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
       drainForceTimer = setTimeout(() => {
         drainForceTimer = null;
         // Free the transfer/lease only. Path gate stays held until the OPEN
-        // callback actually settles (or never, if the channel is dead — safer
+        // callback actually settles (or never, if the channel is dead - safer
         // than reusing a path that a stale truncating OPEN can still wipe).
         completeSharedWriteDrain();
       }, 2000);
@@ -2462,6 +2853,9 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
     // after drain force-complete (Codex P2 on 1a8cac20).
     const finishLateSharedWriteOpen = (handle) => {
       invalidateRetryStageIfStaleOpen();
+      // Same-transfer fallback may already be writing after a forced gate
+      // release; this late truncating OPEN wiped those bytes (Codex P1).
+      invalidateSameTransferAfterForcedGateRelease();
       const afterClose = () => {
         const finish = () => {
           completeSharedWriteDrain();
@@ -2500,9 +2894,10 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
       transfer.cancelled = true;
       // Any write OPEN (shared or isolated) can truncate/create the remote path.
       // A settle timeout unblocks the transfer UX; the path gate stays held until
-      // the OPEN callback finishes (or isolated force-release after end()) so a
-      // same-path retry cannot race a still-in-flight truncating OPEN (Codex P1
-      // on 76015575). Shared drain stays pending until callback/force-complete.
+      // the OPEN callback finishes so a same-path retry cannot race a still-
+      // in-flight truncating OPEN (Codex P1 on 76015575 / c30e1734). Shared drain
+      // stays pending until callback/force-complete. In-place truncating OPEN
+      // also marks this transfer terminal and poisons the shared barrier.
       if (isWriteOpen && !settled) {
         try { abortChannel?.(); } catch { /* ignore */ }
         if (!openDrainTimer) {
@@ -2510,11 +2905,11 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
             settle(reject, new Error("Transfer cancelled"));
             if (trackSharedWriteDrain) {
               armSharedWriteDrainForceComplete();
+            } else if (!mayForceReleasePathGate()) {
+              markInPlaceOpenPoisonTerminal();
+              completeSharedWriteDrain();
             }
-            // Isolated write: keep path gate until OPEN callback too. Force-
-            // releasing after sftp.end() lets a same-path retry finish, then a
-            // late truncating OPEN can wipe its destination with no live
-            // activeTransfers entry to invalidate (Codex P1 on c30e1734).
+            // Late OPEN after this still closes/unlinks via finishLateSharedWriteOpen.
           }, 2000);
         }
         return;
@@ -2529,12 +2924,19 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
 
     const onOpenChannelError = (error) => {
       settle(reject, error || new Error("SFTP channel error"));
-      // Write OPEN: keep path gate until OPEN callback (or isolated force-release).
-      // Shared drain also stays pending until callback/force-complete.
+      // Write OPEN: keep path gate until OPEN callback (or shared drain force).
+      // Isolated writes never force-release here: a late truncating OPEN can wipe
+      // a same-path fallback destination after sendComplete (#2755 / Codex P1 on
+      // c30e1734). Generated-stage hang is bounded by fastPut's gate wait timeout
+      // (noTransferFallback). In-place truncating OPEN marks the transfer
+      // terminal so strategy fallbacks do not wait forever (Codex P1 on 3d4cecfa).
       if (trackSharedWriteDrain) {
         armSharedWriteDrainForceComplete();
       } else if (isWriteOpen) {
-        // Isolated write: hold path gate until OPEN callback (same as cancel).
+        if (!mayForceReleasePathGate()) {
+          markInPlaceOpenPoisonTerminal();
+          completeSharedWriteDrain();
+        }
       } else {
         completeSharedWriteDrain();
         releasePathGate();
@@ -2659,14 +3061,22 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
       // Do not release this waiter immediately: beginTruncatingSharedWriteOpen
       // already replaced the map entry with us. Releasing now would leave later
       // same-path attempts with no barrier while the prior OPEN is still in
-      // flight (stale truncating OPEN race). Chain our release to the prior.
+      // flight (stale truncating OPEN race). Chain our release to the prior
+      // settle; on prior *failure* (poison), propagate fail instead of resolve
+      // so a successor waiting on our promise cannot start OPEN (Codex P1).
       pathGate.waitForPrior.then(
         () => {
           pathGate.release();
           try { transfer._resolvePendingWriteOpenPathGate?.(); } catch { /* ignore */ }
         },
-        () => {
-          pathGate.release();
+        (priorErr) => {
+          const failErr = priorErr instanceof Error
+            ? priorErr
+            : createPoisonedWriteOpenPathGateError(String(priorErr?.message || priorErr || ""));
+          if (!failErr.noTransferFallback) failErr.noTransferFallback = true;
+          // Propagate rejection to anyone waiting on our promise, but do not
+          // reinstall ourselves over the OPEN owner's poisoned barrier.
+          try { pathGate.fail?.(failErr, { reinstall: false }); } catch { /* ignore */ }
           try { transfer._resolvePendingWriteOpenPathGate?.(); } catch { /* ignore */ }
         },
       );
@@ -2702,6 +3112,7 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
     const startOpen = () => {
       if (!waiting) return;
       waiting = false;
+      try { pathGate.markOpenIssued?.(); } catch { /* ignore */ }
       // Keep cancel + channel-error wiring active through afterPathGate. A hung
       // post-gate stage stat must still yield to cancel/channel death so the
       // path gate and lease are not pinned forever (Codex P2 on f642580d).
@@ -2766,7 +3177,16 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
       });
     };
 
-    pathGate.waitForPrior.then(startOpen, startOpen);
+    pathGate.waitForPrior.then(
+      startOpen,
+      (err) => {
+        const error = err instanceof Error
+          ? err
+          : createPoisonedWriteOpenPathGateError(String(err?.message || err || ""));
+        if (!error.noTransferFallback) error.noTransferFallback = true;
+        abandonGateWait(error);
+      },
+    );
   });
 }
 
@@ -2779,26 +3199,264 @@ function closeSftpHandle(sftp, handle) {
   });
 }
 
-async function readSftpRange(sftp, handle, buffer, position, length) {
+async function readSftpRange(sftp, handle, buffer, position, length, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
+  const signal = options.signal;
+  const abortGate = options.abortGate;
   let received = 0;
   while (received < length) {
     const bytesRead = await new Promise((resolve, reject) => {
-      sftp.read(
-        handle,
-        buffer,
-        received,
-        length - received,
-        position + received,
-        (error, count) => {
-          if (error) reject(error);
-          else resolve(Number(count) || 0);
-        },
-      );
+      let settled = false;
+      let timer = null;
+      let unwatchAbort = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        unwatchAbort?.();
+        unwatchAbort = null;
+        signal?.removeEventListener?.("abort", onAbort);
+      };
+      const finish = (error, count) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve(Number(count) || 0);
+      };
+      const onAbort = () => {
+        const error = new Error("Transfer cancelled");
+        error.code = "ABORT_ERR";
+        finish(error);
+      };
+      if (signal?.aborted || abortGate?.aborted) {
+        onAbort();
+        return;
+      }
+      if (abortGate) {
+        unwatchAbort = abortGate.watch(onAbort);
+      } else {
+        signal?.addEventListener?.("abort", onAbort, { once: true });
+      }
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const error = new Error(`SFTP READ timed out after ${timeoutMs} ms`);
+          error.code = "SFTP_READ_TIMEOUT";
+          error.sftpRequestTimedOut = true;
+          finish(error);
+        }, timeoutMs);
+      }
+      try {
+        sftp.read(
+          handle,
+          buffer,
+          received,
+          length - received,
+          position + received,
+          (error, count) => finish(error, count),
+        );
+      } catch (error) {
+        finish(error);
+      }
     });
     if (bytesRead <= 0) {
       throw new Error("Download stream finished before the full source was received");
     }
     received += bytesRead;
+  }
+}
+
+function createSharedAbortGate(signal) {
+  const waiters = new Set();
+  const notify = () => {
+    const error = new Error("Transfer cancelled");
+    error.code = "ABORT_ERR";
+    for (const reject of [...waiters]) {
+      try { reject(error); } catch { /* ignore */ }
+    }
+    waiters.clear();
+  };
+  const onAbort = () => notify();
+  if (signal?.aborted) {
+    return {
+      get aborted() { return true; },
+      watch(onAbortWatch) {
+        onAbortWatch();
+        return () => {};
+      },
+      dispose() {},
+    };
+  }
+  signal?.addEventListener?.("abort", onAbort, { once: true });
+  return {
+    get aborted() { return Boolean(signal?.aborted); },
+    watch(onAbortWatch) {
+      if (signal?.aborted) {
+        onAbortWatch();
+        return () => {};
+      }
+      waiters.add(onAbortWatch);
+      return () => waiters.delete(onAbortWatch);
+    },
+    dispose() {
+      signal?.removeEventListener?.("abort", onAbort);
+      waiters.clear();
+    },
+  };
+}
+
+async function closeSftpHandleBestEffort(sftp, handle, timeoutMs = 2_000) {
+  let timer = null;
+  let timedOut = false;
+  let failed = false;
+  try {
+    await Promise.race([
+      closeSftpHandle(sftp, handle),
+      new Promise((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, timeoutMs);
+      }),
+    ]);
+  } catch {
+    // Verification cleanup must not mask the content check result.
+    failed = true;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return { timedOut, failed, unclean: timedOut || failed };
+}
+
+function openSftpReadHandle(sftp, remotePath, signal, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+    };
+    const finish = (error, handle) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(handle);
+    };
+    const onAbort = () => {
+      const error = new Error("Transfer cancelled");
+      error.code = "ABORT_ERR";
+      finish(error);
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        const error = new Error(`SFTP OPEN timed out after ${timeoutMs} ms`);
+        error.code = "SFTP_OPEN_TIMEOUT";
+        error.sftpRequestTimedOut = true;
+        finish(error);
+      }, timeoutMs);
+    }
+    try {
+      sftp.open(remotePath, "r", (error, handle) => {
+        if (settled) {
+          if (handle) closeSftpHandle(sftp, handle).catch(() => {});
+          return;
+        }
+        finish(error, handle);
+      });
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+async function hashRemotePrefixWithSftpRanges(client, remotePath, bytes, options = {}) {
+  if (!Number.isFinite(bytes) || bytes <= 0 || isScpModeClient(client)) return null;
+  await requireSftpChannel(client, { signal: options.signal });
+  const sftp = client.sftp;
+  if (typeof sftp?.open !== "function" || typeof sftp?.read !== "function") return null;
+
+  const chunkSize = TRANSFER_CHUNK_SIZE;
+  const rangeCount = Math.ceil(bytes / chunkSize);
+  const concurrency = Math.min(DOWNLOAD_TRANSFER_CONCURRENCY, rangeCount);
+  let completedBytes = 0;
+  const openTimeoutMs = Number(options.sftpOpenTimeoutMs) > 0
+    ? Number(options.sftpOpenTimeoutMs)
+    : SFTP_OPEN_TIMEOUT_MS;
+  const readTimeoutMs = Number(options.sftpReadTimeoutMs) > 0
+    ? Number(options.sftpReadTimeoutMs)
+    : SFTP_REQUEST_TIMEOUT_MS;
+  const handle = await openSftpReadHandle(sftp, remotePath, options.signal, openTimeoutMs);
+  const abortGate = createSharedAbortGate(options.signal);
+  try {
+    // Hash windows in order so peak retained buffers stay within the concurrency
+    // fanout (~2MB), not the full multi-GB prefix.
+    const hash = crypto.createHash("sha256");
+    for (let windowStart = 0; windowStart < rangeCount; windowStart += concurrency) {
+      const windowCount = Math.min(concurrency, rangeCount - windowStart);
+      const windowBuffers = new Array(windowCount);
+      // One inactivity watchdog for the whole window. Per-request deadlines would
+      // fire together after readTimeoutMs even while earlier reads keep landing
+      // on a slow/serialized server.
+      let inactivityTimer = null;
+      let rejectInactivity = null;
+      const clearInactivity = () => {
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        inactivityTimer = null;
+      };
+      const armInactivity = () => {
+        if (!(readTimeoutMs > 0) || options.signal?.aborted || abortGate.aborted) return;
+        clearInactivity();
+        inactivityTimer = setTimeout(() => {
+          const error = new Error(`SFTP READ timed out after ${readTimeoutMs} ms`);
+          error.code = "SFTP_READ_TIMEOUT";
+          error.sftpRequestTimedOut = true;
+          rejectInactivity?.(error);
+        }, readTimeoutMs);
+      };
+      const inactivityWait = readTimeoutMs > 0
+        ? new Promise((_, reject) => { rejectInactivity = reject; })
+        : null;
+      armInactivity();
+      try {
+        await Promise.race([
+          Promise.all(Array.from({ length: windowCount }, async (_, offset) => {
+            const index = windowStart + offset;
+            const position = index * chunkSize;
+            const length = Math.min(chunkSize, bytes - position);
+            const buffer = Buffer.allocUnsafe(length);
+            await readSftpRange(sftp, handle, buffer, position, length, {
+              abortGate,
+            });
+            windowBuffers[offset] = buffer;
+            completedBytes += length;
+            options.onProgress?.(completedBytes);
+            armInactivity();
+          })),
+          ...(inactivityWait ? [inactivityWait] : []),
+        ]);
+      } finally {
+        clearInactivity();
+        rejectInactivity = null;
+      }
+      for (const buffer of windowBuffers) hash.update(buffer);
+    }
+    return hash.digest("hex");
+  } finally {
+    abortGate.dispose();
+    const closeResult = await closeSftpHandleBestEffort(
+      sftp,
+      handle,
+      Number(options.sftpCloseTimeoutMs) > 0 ? Number(options.sftpCloseTimeoutMs) : 2_000,
+    );
+    // A timed-out/failed CLOSE leaves an unresolved request on the shared
+    // channel; drop it so later browse/transfer work cannot reuse it.
+    if (closeResult?.unclean) {
+      abandonWedgedVerificationSftpChannel(client);
+    }
   }
 }
 
@@ -2941,10 +3599,20 @@ function isTransferCancelled(transfer) {
 }
 
 const UPLOAD_DIGEST_SCAN_SIZE = TRANSFER_CHUNK_SIZE * 128;
+const EMPTY_DIGEST_SLOT = Buffer.alloc(32);
+
+function uploadDigestByteLength(fileSize) {
+  return Math.ceil(Math.max(0, Number(fileSize) || 0) / TRANSFER_CHUNK_SIZE) * 32;
+}
+
+function isUnsetDigestSlot(buffer, bytesRead) {
+  if (bytesRead !== 32) return true;
+  return buffer.equals(EMPTY_DIGEST_SLOT);
+}
 
 async function assertUploadDigestCapacity(digestPath, fileSize) {
   if (typeof fs.promises.statfs !== "function") return;
-  const requiredBytes = BigInt(Math.ceil(fileSize / TRANSFER_CHUNK_SIZE)) * 32n;
+  const requiredBytes = BigInt(uploadDigestByteLength(fileSize));
   let stats;
   try {
     stats = await fs.promises.statfs(path.dirname(digestPath), { bigint: true });
@@ -2961,12 +3629,31 @@ async function assertUploadDigestCapacity(digestPath, fileSize) {
   }
 }
 
-async function verifyUploadDigestBaseline(sourcePath, digestPath, fileSize, transfer) {
+/**
+ * Allocate an empty per-chunk digest sidecar without reading the source.
+ * Chunk digests are filled on first verified read during the upload pass so
+ * multi-GB files no longer wait on a full pre-hash before the first WRITE.
+ */
+async function prepareUploadDigestSidecar(digestPath, fileSize) {
+  await fs.promises.rm(digestPath, { force: true });
+  await assertUploadDigestCapacity(digestPath, fileSize);
+  const requiredBytes = uploadDigestByteLength(fileSize);
+  const handle = await fs.promises.open(digestPath, "w");
+  try {
+    if (requiredBytes > 0) await handle.truncate(requiredBytes);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+async function verifyUploadDigestBaseline(sourcePath, digestPath, fileSize, transfer, onProgress = null) {
   let sourceHandle = null;
   let digestHandle = null;
   try {
     sourceHandle = await fs.promises.open(sourcePath, "r");
-    digestHandle = await fs.promises.open(digestPath, "r");
+    // r+ so a lazy sidecar can finish filling any still-empty slots on the
+    // post-upload re-scan (e.g. resume after a crash with a partial digest).
+    digestHandle = await fs.promises.open(digestPath, "r+");
     const buffer = Buffer.allocUnsafe(Math.min(UPLOAD_DIGEST_SCAN_SIZE, Math.max(1, fileSize)));
     let position = 0;
     let chunkIndex = 0;
@@ -2982,12 +3669,24 @@ async function verifyUploadDigestBaseline(sourcePath, digestPath, fileSize, tran
         const actual = crypto.createHash("sha256")
           .update(buffer.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, length)))
           .digest();
-        if (!expected.subarray(index * 32, (index + 1) * 32).equals(actual)) {
+        const slot = expected.subarray(index * 32, (index + 1) * 32);
+        if (isUnsetDigestSlot(slot, 32)) {
+          const writeResult = await digestHandle.write(
+            actual,
+            0,
+            32,
+            (chunkIndex + index) * 32,
+          );
+          if (!writeResult || writeResult.bytesWritten !== 32) {
+            throw new Error("Upload digest sidecar stopped accepting data");
+          }
+        } else if (!slot.equals(actual)) {
           throw createSourceContentChangedError();
         }
       }
       position += length;
       chunkIndex += digestCount;
+      onProgress?.(position, fileSize);
     }
   } finally {
     await sourceHandle?.close().catch(() => {});
@@ -2995,58 +3694,80 @@ async function verifyUploadDigestBaseline(sourcePath, digestPath, fileSize, tran
   }
 }
 
-async function createUploadDigestBaseline(sourcePath, digestPath, fileSize, transfer) {
-  // A crashed attempt may have left this transfer's old baseline behind. It is
-  // fully replaceable and its blocks must be reclaimable before capacity is
-  // evaluated for the new baseline.
-  await fs.promises.rm(digestPath, { force: true });
-  await assertUploadDigestCapacity(digestPath, fileSize);
+async function createUploadDigestBaseline(
+  sourcePath,
+  digestPath,
+  fileSize,
+  transfer,
+  onProgress = null,
+  options = {},
+) {
+  // merge:true — fill/verify an existing sidecar while uploads are in flight.
+  // Default replaces the file (SCP / snapshot callers need a clean baseline).
+  const merge = options.merge === true;
+  if (!merge) {
+    await fs.promises.rm(digestPath, { force: true });
+    await prepareUploadDigestSidecar(digestPath, fileSize);
+  } else {
+    await assertUploadDigestCapacity(digestPath, fileSize);
+    try {
+      await fs.promises.access(digestPath);
+    } catch {
+      await prepareUploadDigestSidecar(digestPath, fileSize);
+    }
+  }
   let sourceHandle = null;
   let digestHandle = null;
   let completed = false;
   try {
     sourceHandle = await fs.promises.open(sourcePath, "r");
-    digestHandle = await fs.promises.open(digestPath, "w");
+    digestHandle = await fs.promises.open(digestPath, "r+");
     const buffer = Buffer.allocUnsafe(Math.min(UPLOAD_DIGEST_SCAN_SIZE, Math.max(1, fileSize)));
     let position = 0;
-    let digestPosition = 0;
+    let chunkIndex = 0;
     while (position < fileSize) {
       if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
       const length = Math.min(buffer.length, fileSize - position);
       await readLocalRange(sourceHandle, buffer, position, length);
       if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
       const digestCount = Math.ceil(length / TRANSFER_CHUNK_SIZE);
-      const digests = Buffer.allocUnsafe(digestCount * 32);
       for (let offset = 0, index = 0; offset < length; offset += TRANSFER_CHUNK_SIZE, index += 1) {
-        crypto.createHash("sha256")
+        const actual = crypto.createHash("sha256")
           .update(buffer.subarray(offset, Math.min(offset + TRANSFER_CHUNK_SIZE, length)))
-          .digest()
-          .copy(digests, index * 32);
-      }
-      let written = 0;
-      while (written < digests.length) {
-        const result = await digestHandle.write(
-          digests,
-          written,
-          digests.length - written,
-          digestPosition + written,
-        );
-        if (!result || result.bytesWritten <= 0) {
-          throw new Error("Upload digest baseline stopped accepting data");
-        }
-        written += result.bytesWritten;
+          .digest();
+        const slotIndex = chunkIndex + index;
+        const digestOffset = slotIndex * 32;
+        await withDigestSlotLock(digestHandle, slotIndex, async () => {
+          const expected = Buffer.allocUnsafe(32);
+          const digestResult = await digestHandle.read(expected, 0, 32, digestOffset);
+          if (isUnsetDigestSlot(expected, digestResult.bytesRead)) {
+            const writeResult = await digestHandle.write(actual, 0, 32, digestOffset);
+            if (!writeResult || writeResult.bytesWritten !== 32) {
+              throw new Error("Upload digest baseline stopped accepting data");
+            }
+          } else if (!expected.equals(actual)) {
+            throw createSourceContentChangedError();
+          }
+        });
       }
       position += length;
-      digestPosition += digests.length;
+      chunkIndex += digestCount;
+      // Report scan progress so large uploads do not look stuck at 0 B/s while
+      // hashing (#2712 / #2556). Bytes here are local read progress, not remote.
+      onProgress?.(position, fileSize);
+    }
+    if (typeof digestHandle.sync === "function") {
+      await digestHandle.sync().catch(() => {});
     }
     completed = true;
   } finally {
     await sourceHandle?.close().catch(() => {});
     await digestHandle?.close().catch(() => {});
-    if (!completed) await fs.promises.rm(digestPath, { force: true }).catch(() => {});
+    // Background filler must not delete a sidecar still used by live uploads.
+    if (!completed && !merge) {
+      await fs.promises.rm(digestPath, { force: true }).catch(() => {});
+    }
   }
-
-  await verifyUploadDigestBaseline(sourcePath, digestPath, fileSize, transfer);
 }
 
 async function createVerifiedUploadSnapshot(
@@ -3063,7 +3784,7 @@ async function createVerifiedUploadSnapshot(
   let completed = false;
   try {
     sourceHandle = await fs.promises.open(sourcePath, "r");
-    digestHandle = await fs.promises.open(digestPath, "r");
+    digestHandle = await fs.promises.open(digestPath, "r+");
     snapshotHandle = await fs.promises.open(snapshotPath, "w");
     const sourceStats = await sourceHandle.stat();
     let position = 0;
@@ -3115,7 +3836,7 @@ function createVerifiedUploadReadStream(
     let digestHandle = null;
     try {
       sourceHandle = await fs.promises.open(sourcePath, "r");
-      digestHandle = await fs.promises.open(digestPath, "r");
+      digestHandle = await fs.promises.open(digestPath, "r+");
       let position = 0;
       while (position < fileSize) {
         if (isTransferCancelled(transfer)) throw new Error("Transfer cancelled");
@@ -3140,13 +3861,39 @@ function createVerifiedUploadReadStream(
   return { stream, completed };
 }
 
+async function withDigestSlotLock(digestHandle, chunkIndex, fn) {
+  // Per-chunk locks keep pipelined uploads concurrent across ranges while still
+  // serializing r+ ops on the same 32-byte digest slot.
+  if (!digestHandle.__netcattySlotLocks) {
+    digestHandle.__netcattySlotLocks = new Map();
+  }
+  const locks = digestHandle.__netcattySlotLocks;
+  const previous = locks.get(chunkIndex) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  locks.set(chunkIndex, previous.then(() => gate, () => gate));
+  try {
+    await previous;
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 async function readVerifiedUploadRange(
   localHandle,
   digestHandle,
   position,
   length,
   fileSize,
+  options = {},
 ) {
+  // allowCreate: first pass fills empty digest slots while uploading (no full
+  // pre-hash). Resume re-reads must require an existing non-empty slot so a
+  // rewritten source cannot silently mint a new identity for already-sent bytes.
+  const allowCreate = options.allowCreate !== false;
   const output = Buffer.allocUnsafe(length);
   let outputOffset = 0;
   while (outputOffset < length) {
@@ -3154,13 +3901,25 @@ async function readVerifiedUploadRange(
     const chunkStart = Math.floor(rangePosition / TRANSFER_CHUNK_SIZE) * TRANSFER_CHUNK_SIZE;
     const chunkLength = Math.min(TRANSFER_CHUNK_SIZE, fileSize - chunkStart);
     const chunk = Buffer.allocUnsafe(chunkLength);
+    // Local reads may run concurrently; only digest-slot mutations are locked.
     await readLocalRange(localHandle, chunk, chunkStart, chunkLength);
-    const expected = Buffer.allocUnsafe(32);
-    const chunkIndex = Math.floor(chunkStart / TRANSFER_CHUNK_SIZE);
-    const digestResult = await digestHandle.read(expected, 0, 32, chunkIndex * 32);
-    if (digestResult.bytesRead !== 32) throw createSourceContentChangedError();
     const actual = crypto.createHash("sha256").update(chunk).digest();
-    if (!expected.equals(actual)) throw createSourceContentChangedError();
+    const chunkIndex = Math.floor(chunkStart / TRANSFER_CHUNK_SIZE);
+    const digestOffset = chunkIndex * 32;
+    await withDigestSlotLock(digestHandle, chunkIndex, async () => {
+      const expected = Buffer.allocUnsafe(32);
+      const digestResult = await digestHandle.read(expected, 0, 32, digestOffset);
+      if (isUnsetDigestSlot(expected, digestResult.bytesRead)) {
+        if (!allowCreate) throw createSourceContentChangedError();
+        // Record identity for this chunk as we upload it (single local read).
+        const writeResult = await digestHandle.write(actual, 0, 32, digestOffset);
+        if (!writeResult || writeResult.bytesWritten !== 32) {
+          throw new Error("Upload digest sidecar stopped accepting data");
+        }
+      } else if (!expected.equals(actual)) {
+        throw createSourceContentChangedError();
+      }
+    });
     const chunkOffset = rangePosition - chunkStart;
     const copyLength = Math.min(length - outputOffset, chunkLength - chunkOffset);
     chunk.copy(output, outputOffset, chunkOffset, chunkOffset + copyLength);
@@ -3188,7 +3947,7 @@ async function readVerifiedUploadRange(
  * @param {object|null|undefined} initialSource
  * @param {object|null|undefined} latestSource
  * @param {number} expectedSize
- * @param {{ contentVerifiedSeparately?: boolean, allowSourceGrowth?: boolean }} [options]
+ * @param {{ contentVerifiedSeparately?: boolean, allowSourceGrowth?: boolean, ignoreCtime?: boolean }} [options]
  */
 function assertSourceMetadataUnchanged(initialSource, latestSource, expectedSize, options = {}) {
   const latestSize = Number(latestSource?.size);
@@ -3215,8 +3974,11 @@ function assertSourceMetadataUnchanged(initialSource, latestSource, expectedSize
     return;
   }
   // No digest / per-range content proof: timestamps + inode are the durable
-  // same-size rewrite signal (remote SFTP download path).
-  const versionFields = ["mtimeMs", "ctimeMs", "mtime", "ctime", "ino"];
+  // same-size rewrite signal. Upload finish may set ignoreCtime so macOS
+  // xattr/Spotlight ctime bumps do not abort after a true size match.
+  const versionFields = options.ignoreCtime
+    ? ["mtimeMs", "mtime", "ino"]
+    : ["mtimeMs", "ctimeMs", "mtime", "ctime", "ino"];
   const changed = versionFields.some((field) => {
     const before = Number(initialSource?.[field]);
     const after = Number(latestSource?.[field]);
@@ -3237,6 +3999,17 @@ function assertSourceMetadataUnchanged(initialSource, latestSource, expectedSize
  * @param {number} prefixBytes planned snapshot size
  * @param {{ signal?: AbortSignal, onProgress?: (n: number) => void }} [options]
  */
+function abandonWedgedVerificationSftpChannel(client) {
+  const sftp = client?.sftp;
+  if (!client || !sftp) return;
+  // Drop the cached channel first so requireSftpChannel cannot hand the wedged
+  // object back to later browse/transfer work (hasSftpChannelApi only checks
+  // method presence). Non-sudo sessions can reopen; sudo recovery stays disabled.
+  client.sftp = null;
+  try { sftp.end?.(); } catch { /* ignore */ }
+  try { sftp.destroy?.(); } catch { /* ignore */ }
+}
+
 async function assertLocalDownloadMatchesRemotePrefix(
   localPath,
   client,
@@ -3249,22 +4022,61 @@ async function assertLocalDownloadMatchesRemotePrefix(
     // SCP cannot range-hash portably; fail closed when growth needs proof.
     throw createSourceContentChangedError();
   }
-  await requireSftpChannel(client, { signal: options.signal });
-  if (typeof client.sftp?.createReadStream !== "function") {
-    throw createSourceContentChangedError();
-  }
-  const [localHash, remoteHash] = await Promise.all([
-    hashLocalFile(localPath, options),
-    hashReadable(
-      client.sftp.createReadStream(remotePath, {
-        start: 0,
-        end: prefixBytes - 1,
-      }),
-      options,
-    ),
-  ]);
-  if (!localHash || !remoteHash || localHash !== remoteHash) {
-    throw createSourceContentChangedError();
+  try {
+    await requireSftpChannel(client, { signal: options.signal });
+    const remoteHash = (async () => {
+      const commandDigest = await hashRemotePrefixViaSshCommand(
+        client,
+        remotePath,
+        prefixBytes,
+        options,
+      );
+      if (commandDigest) return commandDigest;
+      if (options.preferSftpRanges !== false) {
+        try {
+          const rangeDigest = await hashRemotePrefixWithSftpRanges(
+            client,
+            remotePath,
+            prefixBytes,
+            options,
+          );
+          if (rangeDigest) return rangeDigest;
+        } catch (error) {
+          if (options.signal?.aborted || error?.sftpRequestTimedOut) throw error;
+        }
+      }
+      if (typeof client.sftp?.createReadStream !== "function") {
+        throw createSourceContentChangedError();
+      }
+      return hashReadable(
+        client.sftp.createReadStream(remotePath, {
+          start: 0,
+          end: prefixBytes - 1,
+        }),
+        {
+          ...options,
+          inactivityTimeoutMs: Number(options.sftpReadTimeoutMs) > 0
+            ? Number(options.sftpReadTimeoutMs)
+            : SFTP_REQUEST_TIMEOUT_MS,
+        },
+      );
+    })();
+    const [localHash, verifiedRemoteHash] = await Promise.all([
+      hashLocalFile(localPath, options),
+      remoteHash,
+    ]);
+    if (!localHash || !verifiedRemoteHash || localHash !== verifiedRemoteHash) {
+      throw createSourceContentChangedError();
+    }
+  } catch (error) {
+    // Verification OPEN/READ/stream watchdogs must fail closed — downloadFile's
+    // isolated→shared catch would otherwise retry body transfer on a channel
+    // that still owns the timed-out request and can hang indefinitely.
+    if (error && typeof error === "object" && error.sftpRequestTimedOut) {
+      error.noTransferFallback = true;
+      abandonWedgedVerificationSftpChannel(client);
+    }
+    throw error;
   }
 }
 
@@ -3281,6 +4093,8 @@ async function assertDownloadSourceAfterTransfer(
     client,
     remotePath,
     signal,
+    preferSftpRanges = true,
+    ...verificationOptions
   } = {},
 ) {
   if (!initialSource) return;
@@ -3297,7 +4111,7 @@ async function assertDownloadSourceAfterTransfer(
       client,
       remotePath,
       expectedSize,
-      { signal },
+      { signal, preferSftpRanges, ...verificationOptions },
     );
     assertSourceMetadataUnchanged(initialSource, latestSource, expectedSize, {
       allowSourceGrowth: true,
@@ -3569,8 +4383,6 @@ async function uploadFileConcurrent(
   transfer.abort = abortEarly;
 
   let localHandle = null;
-  let digestHandle = null;
-  let ephemeralDigestPath = null;
   let initialSource = null;
   let remoteHandle = null;
   let failed = false;
@@ -3587,29 +4399,8 @@ async function uploadFileConcurrent(
       throw localOpenError;
     }
     if (transfer.cancelled) throw new Error("Transfer cancelled");
-    if (transfer.sourceDigestPath) {
-      digestHandle = await fs.promises.open(transfer.sourceDigestPath, "r");
-    } else if (!transfer.sourceIsOwnedTemp) {
-      // Non-resumable range uploads do not receive uploadFile's persistent
-      // digest sidecar. Build the same stable baseline here so every range is
-      // verified immediately before its remote WRITE instead of relying on a
-      // before/after whole-file fingerprint that temporary rewrites can evade.
+    if (!transfer.sourceIsOwnedTemp) {
       initialSource = await localHandle.stat();
-      const digestId = crypto.createHash("sha256")
-        .update(String(transfer.transferId || localPath))
-        .digest("hex")
-        .slice(0, 16);
-      ephemeralDigestPath = tempDirBridge.getTransferTempFilePath(
-        `upload-digest-${digestId}`,
-        "ranges.sha256",
-      );
-      await createUploadDigestBaseline(localPath, ephemeralDigestPath, fileSize, transfer);
-      if (transfer.cancelled) throw new Error("Transfer cancelled");
-      const sourceAfterBaseline = await localHandle.stat();
-      assertSourceMetadataUnchanged(initialSource, sourceAfterBaseline, fileSize, {
-        contentVerifiedSeparately: true,
-      });
-      digestHandle = await fs.promises.open(ephemeralDigestPath, "r");
     }
     if (transfer.cancelled) throw new Error("Transfer cancelled");
     remoteHandle = await openSftpHandleForTransfer(
@@ -3677,19 +4468,10 @@ async function uploadFileConcurrent(
         checkpoint,
         concurrency: UPLOAD_TRANSFER_CONCURRENCY,
         copyRange: async (position, length) => {
-          const buffer = digestHandle
-            ? await readVerifiedUploadRange(
-              localHandle,
-              digestHandle,
-              position,
-              length,
-              fileSize,
-            )
-            : await (async () => {
-              const directBuffer = Buffer.allocUnsafe(length);
-              await readLocalRange(localHandle, directBuffer, position, length);
-              return directBuffer;
-            })();
+          // Size-based resume: read the source range at `position` and WRITE it.
+          // No per-chunk content digest (FileZilla / WinSCP style).
+          const buffer = Buffer.allocUnsafe(length);
+          await readLocalRange(localHandle, buffer, position, length);
           if (transfer.cancelled) throw new Error("Transfer cancelled");
           await writeSftpRange(sftp, remoteHandle, buffer, position, length);
         },
@@ -3703,15 +4485,12 @@ async function uploadFileConcurrent(
       // published at this point, so stop accepting cancellation before source
       // revalidation and handle cleanup; staged uploads pass no callback.
       options.onBytesCommitted?.();
-      const contentVerifiedSeparately = Boolean(digestHandle || ephemeralDigestPath || transfer.sourceDigestPath);
       if (initialSource) {
         const latestSource = await localHandle.stat();
+        // Soft size + mtime/ino only — no digest, but not fail-open either.
         assertSourceMetadataUnchanged(initialSource, latestSource, fileSize, {
-          contentVerifiedSeparately,
+          ignoreCtime: true,
         });
-      }
-      if (ephemeralDigestPath) {
-        await verifyUploadDigestBaseline(localPath, ephemeralDigestPath, fileSize, transfer);
       }
     } catch (error) {
       failed = true;
@@ -3744,12 +4523,6 @@ async function uploadFileConcurrent(
     transfer.abort = null;
     if (localHandle) {
       await localHandle.close().catch(() => {});
-    }
-    if (digestHandle) {
-      await digestHandle.close().catch(() => {});
-    }
-    if (ephemeralDigestPath) {
-      await fs.promises.rm(ephemeralDigestPath, { force: true }).catch(() => {});
     }
     let remoteCloseError = null;
     // Close remote handles while the channel is still live. On disposeChannel
@@ -4017,13 +4790,25 @@ async function downloadFile(
     }
     sendProgress(fileSize, fileSize, { force: true, checkpointBytes: fileSize });
     if (initialSource) {
-      const latestSource = await runCancelablePreflight(() => client.stat(remotePath));
-      await assertDownloadSourceAfterTransfer(initialSource, latestSource, fileSize, {
-        localPath,
-        client,
-        remotePath,
-        signal: transfer.signal,
-      });
+      // Growth verification may use concurrent prefix ranges (especially sudo,
+      // which skips unprivileged SSH digests). Hold the session fast-download
+      // slot so those READs do not race another download's fanout.
+      let holdSessionSlot = false;
+      try {
+        await acquireSessionFastDownloadSlot(client, transfer);
+        holdSessionSlot = true;
+        const latestSource = await runCancelablePreflight(() => client.stat(remotePath));
+        await assertDownloadSourceAfterTransfer(initialSource, latestSource, fileSize, {
+          localPath,
+          client,
+          remotePath,
+          signal: transfer.signal,
+        });
+      } finally {
+        if (holdSessionSlot) {
+          releaseSessionFastDownloadSlot(client);
+        }
+      }
     }
     return;
   }
@@ -4049,15 +4834,33 @@ async function downloadFile(
 
   const finishSuccessfulDownload = async () => {
     if (!initialSource) return;
-    const latestSource = await runCancelablePreflight(() => client.stat(remotePath));
-    // Downloads capture a fixed snapshot; remote appends (live logs) are OK
-    // only when the full planned prefix still matches the staged file.
-    await assertDownloadSourceAfterTransfer(initialSource, latestSource, fileSize, {
-      localPath,
-      client,
-      remotePath,
-      signal: transfer.signal,
-    });
+    const previousPhase = transfer.phase;
+    let lastVerificationProgressAt = 0;
+    transfer.phase = "verifying";
+    transfer.publishCurrentProgress?.();
+    try {
+      const latestSource = await runCancelablePreflight(() => client.stat(remotePath));
+      // Downloads capture a fixed snapshot; remote appends (live logs) are OK
+      // only when the full planned prefix still matches the staged file.
+      await assertDownloadSourceAfterTransfer(initialSource, latestSource, fileSize, {
+        localPath,
+        client,
+        remotePath,
+        signal: transfer.signal,
+        onProgress: () => {
+          const now = Date.now();
+          if (now - lastVerificationProgressAt < 250) return;
+          lastVerificationProgressAt = now;
+          transfer.publishCurrentProgress?.();
+        },
+      });
+      transfer.publishCurrentProgress?.();
+    } finally {
+      transfer.phase = previousPhase || "transferring";
+      if (!transfer.cancelled && !transfer.signal?.aborted) {
+        transfer.publishCurrentProgress?.();
+      }
+    }
   };
 
   // One session-wide fast-path slot for isolated + shared READ fanout (#1507).
@@ -4655,7 +5458,9 @@ async function startTransferNow(event, payload, onProgress) {
         mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs
           : (Number.isFinite(st.mtime) ? st.mtime * 1000 : undefined);
       } else {
-        await requireSftpChannel(client);
+        // Race channel reopen against cancel (Codex P2): a dead sftp handle can
+        // sit in requireSftpChannel for ~10s; cancel must not wait that out.
+        await requireSftpChannel(client, { signal: transfer.signal });
         const encoded = encodePathForSession(sourceSftpId, sourcePath, sourceEncoding);
         const st = await client.stat(encoded);
         size = st.size;
@@ -4678,8 +5483,16 @@ async function startTransferNow(event, payload, onProgress) {
   transfer.captureSourceSoftIdentity = async () => {
     try {
       transfer.sourceSoftIdentity = await readSourceSoftIdentity();
-    } catch {
-      // Best-effort baseline for soft resume.
+    } catch (error) {
+      // Propagate cancel/abort so preflight racing can settle; other failures
+      // stay best-effort (soft resume simply lacks a baseline).
+      if (
+        transfer.cancelled
+        || transfer.signal?.aborted
+        || /cancel|abort/i.test(String(error?.message || error))
+      ) {
+        throw error;
+      }
     }
   };
 
@@ -4913,10 +5726,13 @@ async function startTransferNow(event, payload, onProgress) {
     // and soft resume compare against the original plan, not a grown remote.
     transfer.totalBytes = fileSize;
 
-    // Baseline for soft resume (size + mtime + head sample). Full SHA-256 remains
-    // for hard reconnect / crash recovery.
-    if (transfer.resumable && typeof transfer.captureSourceSoftIdentity === "function") {
-      void transfer.captureSourceSoftIdentity();
+    // Baseline for soft resume and destination mtime preserve (size + mtime +
+    // head sample). Capture before bytes move so non-resumable / SCP paths stamp
+    // the pre-transfer identity (Codex P1). Full SHA-256 remains for hard
+    // reconnect / crash recovery. Run through cancelable preflight so a hung
+    // SFTP reopen cannot outlive cancel (Codex P2).
+    if (typeof transfer.captureSourceSoftIdentity === "function") {
+      await runCancelablePreflight(() => transfer.captureSourceSoftIdentity());
     }
 
     const sourceClient = sourceType === "sftp" ? sftpClients.get(sourceSftpId) : null;
@@ -5013,24 +5829,10 @@ async function startTransferNow(event, payload, onProgress) {
                 ))
             : 0;
           sendProgress(transfer.checkpointBytes, fileSize, { force: true });
-          if (usesStage && transfer.checkpointBytes > 0) {
-            const verifyBytes = resumeContentVerifyBytes(
-              transfer.checkpointBytes,
-              transfer.sourceFingerprint,
-            );
-            await verifyResumeContent(
-              verifyBytes,
-              (options) => hashLocalPrefix(sourcePath, verifyBytes, options),
-              (options) => hashRemotePrefix(
-                client,
-                targetSftpId,
-                uploadTargetPath,
-                targetEncoding,
-                verifyBytes,
-                options,
-              ),
-            );
-          }
+          // Resume is size-based only (WinSCP/FileZilla): the durable .part size
+          // is the checkpoint. Do not re-hash [0, checkpoint) on both ends —
+          // that blocked large-file resume for seconds-to-minutes with no bytes
+          // moving.
           await uploadFile(
             sourcePath,
             encodedUploadPath,
@@ -5487,6 +6289,8 @@ async function startTransferNow(event, payload, onProgress) {
     }
 
     sendProgress(fileSize, fileSize);
+    // Stamp destination mtime from the source so skip-unchanged can match later.
+    await preserveTransferredDestinationMtime(transfer);
     logTransferDiag(transfer, "done", {
       transferred: fileSize,
       total: fileSize,
@@ -6468,6 +7272,8 @@ module.exports = {
   releaseSftpTransferSession,
   listTransferSftpIds,
   _promoteLocalTransferForTests: promoteLocalTransfer,
+  _preserveTransferredDestinationMtimeForTests: preserveTransferredDestinationMtime,
+  _waitForPendingWriteOpenPathGateForTests: waitForPendingWriteOpenPathGate,
   _stableLocalFileIdentityForTests: stableLocalFileIdentity,
   _getWorkerTransferLifecycleEpochCountForTests: () => workerTransferLifecycleEpochs.size,
   _setWorkerTransferLifecycleEpochForTests: (transferId, epoch) => {
