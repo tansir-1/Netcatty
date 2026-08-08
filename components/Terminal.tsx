@@ -66,6 +66,7 @@ import { useStoredBoolean } from "../application/state/useStoredBoolean";
 import { readOptionalStoredStringValue, useStoredString } from "../application/state/useStoredString";
 import { useSessionLogBackend } from "../application/state/useSessionLogBackend";
 import { useTerminalLayoutSuppressActive } from "../application/state/terminalLayoutSuppressStore";
+import { useAppearanceChromeStore } from "../application/state/appearanceChromeStore";
 import {
   shouldPublishPluginTerminalSessionMountLifecycle,
   usePluginTerminalSessionLifecycle,
@@ -116,6 +117,7 @@ import {
   shouldUseFreshSshConnectionForAutomation,
 } from "@/domain/hostConnectScripts.ts";
 import { isVaultInitialized } from "@/application/state/vaultInitStore.ts";
+import { useVaultSnapshotField } from "@/application/state/vaultSnapshotStore.ts";
 import { netcattyBridge } from "@/infrastructure/services/netcattyBridge.ts";
 import { ScriptExecutionOverlay } from "./terminal/ScriptExecutionOverlay";
 import { isScriptSnippet } from "@/domain/snippetScript.ts";
@@ -260,8 +262,6 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   fontSize,
   terminalTheme,
   followAppTerminalTheme = false,
-  accentMode = "theme",
-  customAccent = "",
   terminalSettings,
   sessionId,
   workspaceId,
@@ -353,6 +353,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     const message = openExternalErrorTextRef.current;
     toast.error(message.body, message.title);
   }, []);
+  // Reactive vault-ready flag so restored panes re-arm boot after hydration
+  // (module isVaultInitialized() alone is not a React dependency).
+  const vaultInitialized = useVaultSnapshotField("isVaultInitialized");
   const connectScriptsConsumedRef = useRef(false);
   const connectScriptsCompletedIdsRef = useRef(new Set<string>());
   const connectScriptsInFlightRef = useRef(false);
@@ -1264,22 +1267,31 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     });
   }, [availableFonts, fontFamilyId, hasFontFamilyOverride, host.fontFamily, terminalSettings?.fallbackFont]);
 
+  const { accentMode, customAccent } = useAppearanceChromeStore();
+
   const baseEffectiveTheme = useMemo(() => {
-    if (appearanceTheme) return appearanceTheme;
-    if (followAppTerminalTheme) {
-      return applyCustomAccentToTerminalTheme(terminalTheme, accentMode, customAccent);
-    }
-    const themeId = resolveHostTerminalThemeId(
-      { theme: host.theme, themeOverride: host.themeOverride } as Pick<Host, 'theme' | 'themeOverride'>,
-      terminalTheme.id,
-    );
-    let baseTheme = terminalTheme;
-    if (themeId) {
-      const hostTheme = getBuiltinTerminalThemeById(themeId)
-        || customThemes.find((t) => t.id === themeId);
-      if (hostTheme) baseTheme = hostTheme;
-    }
-    return applyCustomAccentToTerminalTheme(baseTheme, accentMode, customAccent);
+    // Always re-apply appearanceChromeStore accent. appearanceTheme from the
+    // layer may still carry a previously baked custom accent while TerminalLayer
+    // memo ignores accent churn — re-resolve the catalog theme by id first.
+    const resolveBase = (): typeof terminalTheme => {
+      if (appearanceTheme) {
+        const clean = getBuiltinTerminalThemeById(appearanceTheme.id)
+          || customThemes.find((t) => t.id === appearanceTheme.id);
+        if (clean) return clean;
+      }
+      if (followAppTerminalTheme) return terminalTheme;
+      const themeId = resolveHostTerminalThemeId(
+        { theme: host.theme, themeOverride: host.themeOverride } as Pick<Host, 'theme' | 'themeOverride'>,
+        terminalTheme.id,
+      );
+      if (themeId) {
+        const hostTheme = getBuiltinTerminalThemeById(themeId)
+          || customThemes.find((t) => t.id === themeId);
+        if (hostTheme) return hostTheme;
+      }
+      return terminalTheme;
+    };
+    return applyCustomAccentToTerminalTheme(resolveBase(), accentMode, customAccent);
   }, [accentMode, appearanceTheme, customAccent, customThemes, followAppTerminalTheme, host.theme, host.themeOverride, terminalTheme]);
 
   const resolvedChainHosts =
@@ -3159,6 +3171,13 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     retryTokenRef.current = null;
     reconnectPreparationTokenRef.current = null;
     restoreCwdIntentRef.current = null;
+    // Cancel must invalidate the boot the same way Disconnect does. Unmount is
+    // no longer the only path that flips boot-active: under StrictMode the pane
+    // can survive this click, so a late startSSH/startMosh attach could revive
+    // the aborted attempt. Bump the epoch here and let closeSession target the
+    // pre-bump epoch.
+    invalidateBootEpochForClose();
+    isBootActiveRef.current = false;
     setIsCancelling(true);
     auth.setNeedsAuth(false);
     auth.setAuthRetryMessage(null);
@@ -3999,7 +4018,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     onWake: wakeFromHibernateRuntime,
   });
 
-  useTerminalEffects({ CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, chainHosts: resolvedChainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, bootEpochRef, isBroadcastEnabledRef, isComposeBarOpen: effectiveComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing: deferTerminalResize, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, kittyKeyboardProtocolEnabledForSession, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOpenExternalError, onOutputTriggerUserInputRef: noteOutputTriggerUserInputRef, onPluginRuntimeCwdChange: pluginAwareOnRuntimeCwdChange, onSnippetShortkeyRef, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, pluginDecorationRefreshRef, pluginDecorationRules, pluginDecorationRulesRef, pluginTerminalLifecycle, pluginTerminalProviderRevision, isPluginTerminalProviderAvailable, requestPluginTerminalProviders, prepareRestoredReconnect, prepareInitialCwdIntent, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef: recorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setShowLogs, setStatus, setTimeLeft, shellType, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, attachExistingSession, attachAuthorization, attachHomeWebContentsIdRef, snippetsRef, splitResizeActive: isResizing, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, terminalTitleRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, workspaceId, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState });
+  useTerminalEffects({ CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, chainHosts: resolvedChainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, bootEpochRef, isBroadcastEnabledRef, isComposeBarOpen: effectiveComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing: deferTerminalResize, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, kittyKeyboardProtocolEnabledForSession, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOpenExternalError, onOutputTriggerUserInputRef: noteOutputTriggerUserInputRef, onPluginRuntimeCwdChange: pluginAwareOnRuntimeCwdChange, onSnippetShortkeyRef, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, pluginDecorationRefreshRef, pluginDecorationRules, pluginDecorationRulesRef, pluginTerminalLifecycle, pluginTerminalProviderRevision, isPluginTerminalProviderAvailable, requestPluginTerminalProviders, prepareRestoredReconnect, prepareInitialCwdIntent, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef: recorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setShowLogs, setStatus, setTimeLeft, shellType, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, vaultInitialized, attachExistingSession, attachAuthorization, attachHomeWebContentsIdRef, snippetsRef, splitResizeActive: isResizing, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, terminalTitleRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, workspaceId, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState });
 
   return (
     <>

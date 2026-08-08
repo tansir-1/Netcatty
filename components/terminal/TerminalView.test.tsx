@@ -425,6 +425,117 @@ test("manual disconnect keeps the session pane for reconnect", () => {
   assert.match(startersSource, /bootEpoch,/);
 });
 
+test("cancel connect invalidates the boot epoch like disconnect", () => {
+  const source = readFileSync(new URL("../Terminal.tsx", import.meta.url), "utf8");
+  const cancelStart = source.indexOf("const handleCancelConnect = () => {");
+  const cancelEnd = source.indexOf("const handleDisconnect = () => {", cancelStart);
+  assert.notEqual(cancelStart, -1);
+  assert.notEqual(cancelEnd, -1);
+  const body = source.slice(cancelStart, cancelEnd);
+
+  assert.match(body, /invalidateBootEpochForClose\(\)/);
+  assert.match(body, /isBootActiveRef\.current = false/);
+  // Both must land before cleanupSession so the close targets the pre-bump epoch.
+  assert.ok(
+    body.indexOf("invalidateBootEpochForClose()") < body.indexOf("void cleanupSession()"),
+    "cancel must invalidate the boot epoch before cleanupSession",
+  );
+  assert.ok(
+    body.indexOf("isBootActiveRef.current = false") < body.indexOf("void cleanupSession()"),
+    "cancel must clear boot-active before cleanupSession",
+  );
+});
+
+test("terminal boot is cancelable and closes eagerly on cleanup", () => {
+  const effectsSource = readFileSync(new URL("./useTerminalEffects.ts", import.meta.url), "utf8");
+  const startersSource = readFileSync(
+    new URL("./runtime/createTerminalSessionStarters.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(effectsSource, /const bootAbort = new AbortController\(\)/);
+  assert.match(effectsSource, /const bootStartOptions = \{ signal: bootAbort\.signal \}/);
+  assert.match(
+    effectsSource,
+    /queueMicrotask\(\(\) => \{\s*\n\s*if \(disposed\) return;\s*\n\s*void boot\(\);/,
+    "backend boot must defer past StrictMode's synchronous re-invoke",
+  );
+  for (const starter of [
+    "startPluginConnection",
+    "startSerial",
+    "startLocal",
+    "startTelnet",
+    "startMosh",
+    "startEt",
+    "startSSH",
+  ]) {
+    assert.match(
+      effectsSource,
+      new RegExp(`sessionStarters\\.${starter}\\(term, bootStartOptions\\)`),
+      `${starter} must receive the boot abort signal`,
+    );
+  }
+
+  // Cleanup order: abort, then eager close + sync dispose for never-connected
+  // boots (StrictMode remount), else the async capture/teardown path.
+  const cleanupStart = effectsSource.indexOf("      disposed = true;");
+  assert.notEqual(cleanupStart, -1);
+  const cleanup = effectsSource.slice(cleanupStart);
+  const abortAt = cleanup.indexOf("bootAbort.abort()");
+  const neverConnectedAt = cleanup.indexOf("if (!hasConnectedRef.current)");
+  assert.ok(abortAt !== -1 && neverConnectedAt !== -1);
+  assert.ok(abortAt < neverConnectedAt, "cleanup must abort before the never-connected close branch");
+  const neverConnectedBranch = cleanup.slice(
+    neverConnectedAt,
+    cleanup.indexOf("const persistCloseCapture", neverConnectedAt),
+  );
+  const closeAt = neverConnectedBranch.indexOf("terminalBackend.closeSession(");
+  const syncDisposeAt = neverConnectedBranch.indexOf("disposeOwnedRuntime();");
+  const earlyReturnAt = neverConnectedBranch.indexOf("return;");
+  assert.ok(closeAt !== -1 && syncDisposeAt !== -1 && earlyReturnAt !== -1);
+  assert.ok(closeAt < syncDisposeAt, "eager close must run before sync runtime dispose");
+  assert.ok(
+    syncDisposeAt < earlyReturnAt,
+    "never-connected boots must sync-dispose before leaving cleanup",
+  );
+  // Owner panes close the pending backend; attach popups only dispose xterm.
+  assert.match(neverConnectedBranch, /if \(!attachExistingSession\)/);
+  assert.match(effectsSource, /let ownedRuntime:/);
+  assert.match(
+    cleanup,
+    /void completeClose\(\)/,
+    "connected boots still use the async capture path",
+  );
+
+  // An aborted boot must stop counting as the current attempt so the existing
+  // orphan-close / attach-refusal guards cover cancellation too.
+  assert.match(
+    startersSource,
+    /options\?\.signal\?\.aborted !== true && isBootEpochCurrent\(\)/,
+  );
+  for (const starter of [
+    "startSSH",
+    "startTelnet",
+    "startMosh",
+    "startEt",
+    "startPluginConnection",
+    "startLocal",
+    "startSerial",
+  ]) {
+    assert.match(
+      startersSource,
+      new RegExp(
+        `const ${starter} = async \\(term: XTerm, options\\?: TerminalSessionStartOptions\\)`,
+      ),
+      `${starter} must accept an abort signal`,
+    );
+  }
+  // The plugin path holds its own in-flight request controller; the boot abort
+  // has to reach it or the extension request outlives the pane.
+  assert.match(startersSource, /options\?\.signal\?\.addEventListener\("abort", onBootAborted/);
+  assert.match(startersSource, /options\?\.signal\?\.removeEventListener\("abort", onBootAborted\)/);
+});
+
 test("hidden host information reveals actions without permanently covering terminal content", () => {
   const source = readFileSync(new URL("./TerminalView.tsx", import.meta.url), "utf8");
 

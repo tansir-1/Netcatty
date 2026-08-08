@@ -64,6 +64,7 @@ export function resetExternalMcpStartupReadyForTests(): void {
   externalMcpStartupReadyWaitPromise = null;
   externalMcpStartupReadyWaitResolve = null;
   externalMcpEnableGeneration = 0;
+  externalMcpStartupSyncPromise = null;
 }
 
 export function getExternalMcpEnableGenerationForTests(): number {
@@ -144,10 +145,24 @@ export function readExternalMcpMode(): ExternalMcpMode {
   return normalizeExternalMcpMode(localStorageAdapter.readString(STORAGE_KEY_AI_EXTERNAL_MCP_MODE));
 }
 
+export function writeExternalMcpMode(mode: ExternalMcpMode): ExternalMcpMode {
+  const normalized = normalizeExternalMcpMode(mode);
+  localStorageAdapter.writeString(STORAGE_KEY_AI_EXTERNAL_MCP_MODE, normalized);
+  emitAIStateChanged(STORAGE_KEY_AI_EXTERNAL_MCP_MODE);
+  return normalized;
+}
+
 export function readExternalMcpIdleTimeoutMinutes(): number {
   return normalizeExternalMcpIdleTimeoutMinutes(
     localStorageAdapter.readNumber(STORAGE_KEY_AI_EXTERNAL_MCP_IDLE_TIMEOUT_MINUTES),
   );
+}
+
+export function writeExternalMcpIdleTimeoutMinutes(minutes: number): number {
+  const normalized = normalizeExternalMcpIdleTimeoutMinutes(minutes);
+  localStorageAdapter.writeNumber(STORAGE_KEY_AI_EXTERNAL_MCP_IDLE_TIMEOUT_MINUTES, normalized);
+  emitAIStateChanged(STORAGE_KEY_AI_EXTERNAL_MCP_IDLE_TIMEOUT_MINUTES);
+  return normalized;
 }
 
 /** Whether host_open should surface/focus the main window. Defaults to true (existing behavior). */
@@ -185,6 +200,13 @@ export function readSessionIdleTimeoutMinutes(): number {
   return normalizeSessionIdleTimeoutMinutes(
     localStorageAdapter.readNumber(STORAGE_KEY_AI_SESSION_IDLE_TIMEOUT_MINUTES),
   );
+}
+
+export function writeSessionIdleTimeoutMinutes(minutes: number): number {
+  const normalized = normalizeSessionIdleTimeoutMinutes(minutes);
+  localStorageAdapter.writeNumber(STORAGE_KEY_AI_SESSION_IDLE_TIMEOUT_MINUTES, normalized);
+  emitAIStateChanged(STORAGE_KEY_AI_SESSION_IDLE_TIMEOUT_MINUTES);
+  return normalized;
 }
 
 export function shouldStartExternalMcpOnStartup({
@@ -287,6 +309,26 @@ export async function syncExternalMcpStartupState(
     // surface can recover without wiping always-on intent.
   }
   return plan;
+}
+
+let externalMcpStartupSyncPromise: Promise<ExternalMcpStartupSyncPlan> | null = null;
+
+/**
+ * Startup reconcile runs exactly once per renderer load. A remounted App must
+ * await the same settled promise instead of pushing a second enable/disable to
+ * the main process, which would fight the user's live toggle.
+ */
+export function syncExternalMcpStartupStateOnce(
+  bridge: ExternalMcpBridge | undefined = netcattyBridge.get(),
+): Promise<ExternalMcpStartupSyncPlan> {
+  if (!externalMcpStartupSyncPromise) {
+    externalMcpStartupSyncPromise = syncExternalMcpStartupState(bridge);
+  }
+  return externalMcpStartupSyncPromise;
+}
+
+export function resetExternalMcpStartupSyncOnceForTests(): void {
+  externalMcpStartupSyncPromise = null;
 }
 
 export function useExternalMcpToggleState() {

@@ -165,7 +165,7 @@ export function resolveSelectionOverlayPosition(term: any, container: HTMLElemen
 }
 
 export function useTerminalEffects(ctx: TerminalEffectsContext) {
-  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, chainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, bootEpochRef, isBroadcastEnabledRef, isComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, kittyKeyboardProtocolEnabledForSession, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOpenExternalError, onOutputTriggerUserInputRef, onPluginRuntimeCwdChange, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, pluginDecorationRules, pluginTerminalLifecycle, pluginTerminalProviderRevision, isPluginTerminalProviderAvailable, requestPluginTerminalProviders, prepareRestoredReconnect, prepareInitialCwdIntent, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setShowLogs, setStatus, setTimeLeft, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, attachExistingSession, attachAuthorization, attachHomeWebContentsIdRef, onSnippetShortkeyRef, snippetsRef, splitResizeActive, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, terminalTitleRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState } = ctx;
+  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, chainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, bootEpochRef, isBroadcastEnabledRef, isComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, kittyKeyboardProtocolEnabledForSession, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOpenExternalError, onOutputTriggerUserInputRef, onPluginRuntimeCwdChange, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, pluginDecorationRules, pluginTerminalLifecycle, pluginTerminalProviderRevision, isPluginTerminalProviderAvailable, requestPluginTerminalProviders, prepareRestoredReconnect, prepareInitialCwdIntent, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setShowLogs, setStatus, setTimeLeft, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, attachExistingSession, attachAuthorization, attachHomeWebContentsIdRef, onSnippetShortkeyRef, snippetsRef, splitResizeActive, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, terminalTitleRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState, vaultInitialized } = ctx;
   const effectiveTerminalProtocol = resolveEffectiveTerminalProtocol(host);
   const hibernateHiddenTabs = resolveTerminalHibernateEnabledForProtocol(
     terminalSettings,
@@ -401,8 +401,20 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
 
   useEffect(() => {
+    // Restored sessions can mount while vault init has published hosts but not
+    // yet decrypted keys. Wait for hydration (and re-run when it flips) so the
+    // first SSH dial does not go out with an empty keychain.
+    if (!attachExistingSession && !vaultInitialized) {
+      return;
+    }
+
     let disposed = false;
     let initialFitTimer: ReturnType<typeof setTimeout> | undefined;
+    let ownedRuntime: { dispose: () => void } | null = null;
+    // Every boot owns a controller so cleanup can cancel an in-flight start
+    // instead of waiting for the async capture/teardown below to finish.
+    const bootAbort = new AbortController();
+    const bootStartOptions = { signal: bootAbort.signal };
     const closeGeneration = ++terminalBootCloseGenerationRef.current;
     if (bootEpochRef) {
       bootEpochRef.current += 1;
@@ -420,6 +432,25 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     setIsCancelling(false);
     setIsDisconnectedDialogDismissed(false);
     promptLineBreakStateRef.current = createPromptLineBreakState();
+
+    const disposeOwnedRuntime = () => {
+      const runtime = ownedRuntime;
+      ownedRuntime = null;
+      if (!runtime) return;
+      if (xtermRuntimeRef.current === runtime) {
+        xtermRuntimeRef.current = null;
+        termRef.current = null;
+        fitAddonRef.current = null;
+        serializeAddonRef.current = null;
+        searchAddonRef.current = null;
+        hasRuntimeRef.current = false;
+      }
+      try {
+        runtime.dispose();
+      } catch (err) {
+        logger.warn("Failed to dispose terminal runtime on unmount", err);
+      }
+    };
 
     const boot = async () => {
       try {
@@ -510,6 +541,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
           return;
         }
 
+        ownedRuntime = runtime;
         xtermRuntimeRef.current = runtime;
         termRef.current = runtime.term;
         fitAddonRef.current = runtime.fitAddon;
@@ -713,32 +745,32 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
         if (effectiveTerminalProtocol.startsWith("plugin:")) {
           setBackendConnectingStatus();
           setProgressLogs(["Initializing plugin connection..."]);
-          await sessionStarters.startPluginConnection(term);
+          await sessionStarters.startPluginConnection(term, bootStartOptions);
           if (!bootStillActive()) return;
         } else if (effectiveTerminalProtocol === "serial") {
           setBackendConnectingStatus();
           setProgressLogs(["Initializing serial connection..."]);
-          await sessionStarters.startSerial(term);
+          await sessionStarters.startSerial(term, bootStartOptions);
           if (!bootStillActive()) return;
         } else if (effectiveTerminalProtocol === "local") {
           setBackendConnectingStatus();
           setProgressLogs(["Initializing local shell..."]);
-          await sessionStarters.startLocal(term);
+          await sessionStarters.startLocal(term, bootStartOptions);
           if (!bootStillActive()) return;
         } else if (effectiveTerminalProtocol === "telnet") {
           setBackendConnectingStatus();
           setProgressLogs(["Initializing Telnet connection..."]);
-          await sessionStarters.startTelnet(term);
+          await sessionStarters.startTelnet(term, bootStartOptions);
           if (!bootStillActive()) return;
         } else if (effectiveTerminalProtocol === "mosh") {
           setBackendConnectingStatus();
           setProgressLogs(["Initializing Mosh connection..."]);
-          await sessionStarters.startMosh(term);
+          await sessionStarters.startMosh(term, bootStartOptions);
           if (!bootStillActive()) return;
         } else if (effectiveTerminalProtocol === "et") {
           setBackendConnectingStatus();
           setProgressLogs(["Initializing EternalTerminal connection..."]);
-          await sessionStarters.startEt(term);
+          await sessionStarters.startEt(term, bootStartOptions);
           if (!bootStillActive()) return;
         } else {
           const resolvedAuth = resolveHostAuth({ host, keys, identities });
@@ -759,7 +791,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
           setBackendConnectingStatus();
           setProgressLogs(["Initializing secure channel..."]);
-          await sessionStarters.startSSH(term);
+          await sessionStarters.startSSH(term, bootStartOptions);
           if (!bootStillActive()) return;
         }
       } catch (err) {
@@ -770,14 +802,45 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       }
     };
 
-    boot();
+    queueMicrotask(() => {
+      if (disposed) return;
+      void boot();
+    });
 
     return () => {
       disposed = true;
       if (initialFitTimer !== undefined) clearTimeout(initialFitTimer);
+      // Abort first: a start still awaiting the bridge must stop counting as
+      // the current attempt before anything below yields to a microtask.
+      bootAbort.abort();
       isBootActiveRef.current = false;
       if (hibernatedRef?.current) {
         forceCloseHibernatedSession?.();
+        disposeOwnedRuntime();
+        return;
+      }
+
+      // A boot that never reached "connected" has nothing worth capturing, and
+      // the teardown below awaits terminal drain plus serialization before it
+      // closes anything. Tell the main process now so it can abort the pending
+      // boot (passphrase prompt, TCP dial) for this epoch instead of letting it
+      // finish against a pane that is already gone. Attached popups never own
+      // the backend session (skip closeSession) but still sync-dispose xterm.
+      if (!hasConnectedRef.current) {
+        if (!attachExistingSession) {
+          try {
+            const closeResult = terminalBackend.closeSession(
+              sessionRef.current ?? sessionId,
+              { bootEpoch: bootEpochRef ? bootEpochRef.current : undefined },
+            );
+            void Promise.resolve(closeResult).catch((err: unknown) => {
+              logger.warn("Failed to cancel pending terminal boot on unmount", err);
+            });
+          } catch (err) {
+            logger.warn("Failed to cancel pending terminal boot on unmount", err);
+          }
+        }
+        disposeOwnedRuntime();
         return;
       }
 
@@ -801,13 +864,25 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
             closeGeneration,
             terminalBootCloseGenerationRef.current,
           )) {
+            // Remount already replaced the live refs; still drop this boot's
+            // orphaned DOM node if dispose was deferred past the generation bump.
+            disposeOwnedRuntime();
             return;
           }
           if (!flushed) {
             logger.warn("Terminal output did not drain before close capture; skipping stale capture");
             teardown();
+            ownedRuntime = null;
             return;
           }
+        }
+
+        if (!isTerminalCloseGenerationCurrent(
+          closeGeneration,
+          terminalBootCloseGenerationRef.current,
+        )) {
+          disposeOwnedRuntime();
+          return;
         }
 
         const connectionLogPayload = !terminalDataCapturedRef.current
@@ -819,6 +894,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
             connectionLogPayload.source,
             connectionLogPayload.data.length,
           );
+          ownedRuntime = null;
           scheduleTerminalCloseTeardown(teardown);
           return;
         }
@@ -832,32 +908,44 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
               closeGeneration,
               terminalBootCloseGenerationRef.current,
             )) {
+              disposeOwnedRuntime();
               return;
             }
             if (payload) {
               persistCloseCapture(payload.data, payload.source, payload.data.length);
             }
+            ownedRuntime = null;
             scheduleTerminalCloseTeardown(teardown);
           } catch (err) {
             if (!isTerminalCloseGenerationCurrent(
               closeGeneration,
               terminalBootCloseGenerationRef.current,
             )) {
+              disposeOwnedRuntime();
               return;
             }
             logger.warn("Failed to serialize terminal data on unmount:", err);
+            ownedRuntime = null;
             scheduleTerminalCloseTeardown(teardown);
           }
           return;
         }
 
+        ownedRuntime = null;
         teardown();
       };
 
       void completeClose();
     };
      
-  }, [forceCloseHibernatedSession, handleTerminalDataCaptureOnce, host.id, sessionId]);
+  }, [
+    attachExistingSession,
+    forceCloseHibernatedSession,
+    handleTerminalDataCaptureOnce,
+    host.id,
+    sessionId,
+    vaultInitialized,
+  ]);
 
 
   // Connection timeline and timeout visuals

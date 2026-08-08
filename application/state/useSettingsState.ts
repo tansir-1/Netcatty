@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
 
 import { runThemeTransition, type ThemeTransitionMode } from './themeTransition';
+import { publishAppearanceChromeSnapshot } from './appearanceChromeStore';
+import {
+  publishSettingsChromeSnapshot,
+  registerSettingsChromeActions,
+} from './settingsChromeStore';
+import {
+  publishTerminalSettingsSnapshot,
+  registerTerminalSettingsActions,
+} from './terminalSettingsStore';
 import { SyncConfig, TerminalSettings, HotkeyScheme, CustomKeyBindings, DEFAULT_KEY_BINDINGS, KeyBinding, UILanguage, SessionLogFormat, normalizeTerminalSettings } from '../../domain/models';
 import {
   DEFAULT_HTTP_NETWORK_PROXY,
@@ -747,7 +756,10 @@ export const useSettingsState = (options: { enableSettingsSync?: boolean; enable
 
   // Push idle TTL to the main-process transport registry on load and whenever
   // it changes (including cross-window IPC/storage updates to local state).
+  const lastPushedSshTransportIdleTtlRef = useRef<number | null>(null);
   useEffect(() => {
+    if (lastPushedSshTransportIdleTtlRef.current === sshTransportIdleTtlMs) return;
+    lastPushedSshTransportIdleTtlRef.current = sshTransportIdleTtlMs;
     notifySettingsChanged(STORAGE_KEY_SSH_TRANSPORT_IDLE_TTL_MS, sshTransportIdleTtlMs);
   }, [sshTransportIdleTtlMs, notifySettingsChanged]);
 
@@ -967,6 +979,8 @@ export const useSettingsState = (options: { enableSettingsSync?: boolean; enable
     const persistedAppearanceChanged = previousAppearance === null
       || hasPersistedAppearanceChanged(previousAppearance, appearanceRender);
     previousAppearanceRenderRef.current = appearanceRender;
+    // Terminal leaves subscribe here so accent drag does not rebuild TerminalLayer.
+    publishAppearanceChromeSnapshot({ accentMode, customAccent });
     const tokens = getUiThemeById(resolvedTheme, resolvedTheme === 'dark' ? darkUiThemeId : lightUiThemeId).tokens;
     const apply = () => applyThemeTokens(theme, resolvedTheme, tokens, accentMode, customAccent);
     const transitionMode = appearanceTransitionModeRef.current;
@@ -1631,11 +1645,13 @@ export const useSettingsState = (options: { enableSettingsSync?: boolean; enable
     notifySettingsChanged,
   });
 
-  // Fix 1: Mark all persist effects as mounted.
-  // This MUST be declared AFTER all persist useEffects so that React runs it last
-  // during the initial mount cycle (effects fire in declaration order).
+  // Mark persist effects mounted AFTER all persist useEffects so React runs
+  // this last (declaration order). Cleanup clears the latch for remount.
   useEffect(() => {
     persistMountedRef.current = true;
+    return () => {
+      persistMountedRef.current = false;
+    };
   }, []);
 
   // Get merged key bindings (defaults + custom overrides)
@@ -1705,6 +1721,142 @@ export const useSettingsState = (options: { enableSettingsSync?: boolean; enable
     const tokens = getUiThemeById(resolvedTheme, resolvedTheme === 'dark' ? darkUiThemeId : lightUiThemeId).tokens;
     applyThemeTokens(theme, resolvedTheme, tokens, accentMode, customAccent);
   }, [theme, resolvedTheme, lightUiThemeId, darkUiThemeId, accentMode, customAccent]);
+
+  const setEditorWordWrap = useCallback((enabled: boolean) => {
+    setEditorWordWrapState(enabled);
+    localStorageAdapter.writeString(STORAGE_KEY_EDITOR_WORD_WRAP, String(enabled));
+    notifySettingsChanged(STORAGE_KEY_EDITOR_WORD_WRAP, enabled);
+  }, [notifySettingsChanged]);
+
+  // Main-window chrome subscribes to this slice instead of receiving the whole
+  // settings object through the App domain bags. The store dedupes field by
+  // field, so unrelated settings churn never notifies chrome consumers.
+  useLayoutEffect(() => {
+    publishSettingsChromeSnapshot({
+      theme,
+      resolvedTheme,
+      lightUiThemeId,
+      darkUiThemeId,
+      uiLanguage,
+      windowOpacity,
+      showSftpTab,
+      showHostTreeSidebar,
+      showRecentHosts,
+      hostClickBehavior,
+      showOnlyUngroupedHostsInRoot,
+      dynamicTabTitleMode: terminalSettings.dynamicTabTitleMode,
+      disableTerminalFontZoom,
+      restoreTerminalCwd,
+      terminalSidePanelAutoOpen,
+      terminalSidePanelAutoOpenTab,
+    });
+  }, [
+    darkUiThemeId,
+    disableTerminalFontZoom,
+    hostClickBehavior,
+    lightUiThemeId,
+    resolvedTheme,
+    restoreTerminalCwd,
+    showHostTreeSidebar,
+    showOnlyUngroupedHostsInRoot,
+    showRecentHosts,
+    showSftpTab,
+    terminalSettings.dynamicTabTitleMode,
+    terminalSidePanelAutoOpen,
+    terminalSidePanelAutoOpenTab,
+    theme,
+    uiLanguage,
+    windowOpacity,
+  ]);
+
+  useLayoutEffect(() => {
+    registerSettingsChromeActions({ setTheme, setWindowOpacity });
+    return () => {
+      registerSettingsChromeActions(null);
+    };
+  }, [setTheme, setWindowOpacity]);
+
+  // TerminalHost / terminal domain bags subscribe here instead of receiving
+  // settings through the App mega-subscriber.
+  useLayoutEffect(() => {
+    publishTerminalSettingsSnapshot({
+      terminalThemeId,
+      terminalThemeDarkId,
+      terminalThemeLightId,
+      followAppTerminalTheme,
+      terminalFontFamilyId,
+      terminalFontSize,
+      terminalSettings,
+      hotkeyScheme,
+      keyBindings,
+      isHotkeyRecording,
+      sftpDoubleClickBehavior,
+      sftpAutoSync,
+      sftpShowHiddenFiles,
+      sftpUseCompressedUpload,
+      sftpAutoOpenSidebar,
+      sftpFollowTerminalCwd,
+      sftpDefaultViewMode,
+      editorWordWrap,
+      sessionLogsEnabled,
+      sessionLogsDir,
+      sessionLogsFormat,
+      sessionLogsTimestampsEnabled,
+      sshDebugLogsEnabled,
+    });
+  }, [
+    editorWordWrap,
+    followAppTerminalTheme,
+    hotkeyScheme,
+    isHotkeyRecording,
+    keyBindings,
+    sessionLogsDir,
+    sessionLogsEnabled,
+    sessionLogsFormat,
+    sessionLogsTimestampsEnabled,
+    sftpAutoOpenSidebar,
+    sftpAutoSync,
+    sftpDefaultViewMode,
+    sftpDoubleClickBehavior,
+    sftpFollowTerminalCwd,
+    sftpShowHiddenFiles,
+    sftpUseCompressedUpload,
+    sshDebugLogsEnabled,
+    terminalFontFamilyId,
+    terminalFontSize,
+    terminalSettings,
+    terminalThemeDarkId,
+    terminalThemeId,
+    terminalThemeLightId,
+  ]);
+
+  useLayoutEffect(() => {
+    registerTerminalSettingsActions({
+      setTerminalThemeId,
+      setTerminalThemeDarkId,
+      setTerminalThemeLightId,
+      setFollowAppTerminalTheme: setFollowAppTerminalThemeState,
+      setTerminalFontFamilyId,
+      setTerminalFontSize,
+      updateTerminalSetting,
+      setSftpFollowTerminalCwd,
+      setEditorWordWrap,
+      applyAppTheme,
+    });
+    return () => {
+      registerTerminalSettingsActions(null);
+    };
+  }, [
+    applyAppTheme,
+    setEditorWordWrap,
+    setSftpFollowTerminalCwd,
+    setTerminalFontFamilyId,
+    setTerminalFontSize,
+    setTerminalThemeDarkId,
+    setTerminalThemeId,
+    setTerminalThemeLightId,
+    updateTerminalSetting,
+  ]);
 
   return {
     theme,
@@ -1795,11 +1947,7 @@ export const useSettingsState = (options: { enableSettingsSync?: boolean; enable
     setSshTransportIdleTtlMs,
     // Editor Settings
     editorWordWrap,
-    setEditorWordWrap: useCallback((enabled: boolean) => {
-      setEditorWordWrapState(enabled);
-      localStorageAdapter.writeString(STORAGE_KEY_EDITOR_WORD_WRAP, String(enabled));
-      notifySettingsChanged(STORAGE_KEY_EDITOR_WORD_WRAP, enabled);
-    }, [notifySettingsChanged]),
+    setEditorWordWrap,
     // Session Logs
     sessionLogsEnabled,
     setSessionLogsEnabled,
@@ -1841,7 +1989,7 @@ export const useSettingsState = (options: { enableSettingsSync?: boolean; enable
     // Opaque version that changes when any synced setting changes, used by useAutoSync.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     settingsVersion: useMemo(() => Math.random(), [
-      theme, lightUiThemeId, darkUiThemeId, accentMode, customAccent,
+      theme, lightUiThemeId, darkUiThemeId, accentMode,
       uiFontFamilyId, uiLanguage, customCSS,
       terminalThemeId, terminalFontFamilyId, terminalFontSize, terminalSettings,
       customKeyBindings, editorWordWrap,

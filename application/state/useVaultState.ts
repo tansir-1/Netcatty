@@ -65,8 +65,18 @@ import {
 } from "../../domain/connectionLogTerminalData";
 import { getNextVaultOrder, normalizeVaultOrder } from "../../domain/vaultOrder";
 import { loadSanitizedShellHistory } from "./shellHistoryPersistence";
+import {
+  publishConnectionLogsSnapshot,
+  registerConnectionLogsActions,
+} from "./connectionLogsStore";
+import {
+  publishNotesSnapshot,
+  registerNotesActions,
+} from "./notesStore";
+import { commitVaultNotesWrite } from "./vaultNotesPersistence";
 import { publishShellHistorySnapshot } from "./shellHistoryStore";
 import { setVaultInitialized } from "./vaultInitStore";
+import { notify } from "../notification";
 import {
   decryptGroupConfigs,
   decryptHosts,
@@ -280,9 +290,14 @@ export const useVaultState = () => {
   const customGroupsRef = useRef<string[]>([]);
   const managedSourcesRef = useRef<ManagedSource[]>([]);
   const hostsRef = useRef<Host[]>([]);
+  const notesRef = useRef<VaultNote[]>([]);
+  const noteGroupsRef = useRef<string[]>([]);
+  const notesPersistFailureNotifiedAtRef = useRef(0);
   customGroupsRef.current = customGroups;
   managedSourcesRef.current = managedSources;
   hostsRef.current = hosts;
+  notesRef.current = notes;
+  noteGroupsRef.current = noteGroups;
 
   // Write-version counters prevent out-of-order async writes from overwriting
   // newer data.  Each update bumps the counter; the .then() callback only
@@ -590,15 +605,37 @@ export const useVaultState = () => {
   }, []);
 
   const updateNotes = useCallback((data: Partial<VaultNote>[]) => {
-    const cleaned = normalizeVaultNotes(data);
+    const { notes: cleaned, persisted } = commitVaultNotesWrite({
+      data,
+      write: (key, value) => localStorageAdapter.write(key, value),
+    });
+    // Keep the in-session catalog updated so an autosave quota failure does not
+    // snap the editor back to stale props and discard the user's draft. Disk
+    // may still be behind — surface that explicitly.
+    notesRef.current = cleaned;
     setNotes(cleaned);
-    localStorageAdapter.write(STORAGE_KEY_NOTES, cleaned);
+    publishNotesSnapshot({ notes: cleaned, noteGroups: noteGroupsRef.current });
+    if (!persisted) {
+      const now = Date.now();
+      // Debounced autosave can hit quota repeatedly; avoid toast spam.
+      if (now - notesPersistFailureNotifiedAtRef.current > 10_000) {
+        notesPersistFailureNotifiedAtRef.current = now;
+        notify.error(
+          "Notes could not be saved. Free some local storage space and try again.",
+          "Notes",
+        );
+      }
+      return false;
+    }
+    return true;
   }, []);
 
   const updateNoteGroups = useCallback((data: unknown) => {
     const cleaned = normalizeNoteGroups(data);
+    noteGroupsRef.current = cleaned;
     setNoteGroups(cleaned);
     localStorageAdapter.write(STORAGE_KEY_NOTE_GROUPS, cleaned);
+    publishNotesSnapshot({ notes: notesRef.current, noteGroups: cleaned });
   }, []);
 
   const updateCustomGroups = useCallback((
@@ -828,6 +865,18 @@ export const useVaultState = () => {
     publishShellHistorySnapshot(shellHistory);
   }, [shellHistory]);
 
+  // Notes catalog for Notes / AI side panels — keep TerminalLayer off the hot path.
+  useLayoutEffect(() => {
+    publishNotesSnapshot({ notes, noteGroups });
+  }, [notes, noteGroups]);
+
+  useLayoutEffect(() => {
+    registerNotesActions({ updateNotes, updateNoteGroups });
+    return () => {
+      registerNotesActions(null);
+    };
+  }, [updateNotes, updateNoteGroups]);
+
   const addShellHistoryEntry = useCallback(
     (entry: Omit<ShellHistoryEntry, "id" | "timestamp">) => {
       setShellHistory((prev) => {
@@ -923,6 +972,28 @@ export const useVaultState = () => {
     });
   }, [persistConnectionLogState]);
 
+  // Connection logs for Vault logs section — keep App domain bags off session churn.
+  useLayoutEffect(() => {
+    publishConnectionLogsSnapshot({ connectionLogs });
+  }, [connectionLogs]);
+
+  useLayoutEffect(() => {
+    registerConnectionLogsActions({
+      updateConnectionLog,
+      toggleConnectionLogSaved,
+      deleteConnectionLog,
+      clearUnsavedConnectionLogs,
+    });
+    return () => {
+      registerConnectionLogsActions(null);
+    };
+  }, [
+    updateConnectionLog,
+    toggleConnectionLogSaved,
+    deleteConnectionLog,
+    clearUnsavedConnectionLogs,
+  ]);
+
   // Convert a known host to a managed host
   const convertKnownHostToHost = useCallback((knownHost: KnownHost): Host => {
     const newHost: Host = {
@@ -968,11 +1039,13 @@ export const useVaultState = () => {
   }, [hosts]);
 
   useEffect(() => {
+    let cancelled = false;
     const init = async () => {
       try {
         await withVaultImportLock("vault", async () => {
           recoverPluginImporterTransaction(localStorageAdapter, PLUGIN_IMPORT_TRANSACTION_KEYS);
         });
+        if (cancelled) return;
         const savedHosts = localStorageAdapter.read<Host[]>(STORAGE_KEY_HOSTS);
 
         if (savedHosts) {
@@ -981,6 +1054,7 @@ export const useVaultState = () => {
           // and causes this stale result to be discarded.
           const ver = ++hostsWriteVersion.current;
           const decrypted = await decryptHosts(savedHosts);
+          if (cancelled) return;
           if (ver === hostsWriteVersion.current) {
             const sanitized = normalizeVaultOrder(
               migrateHostsFromLegacyLineTimestamps(
@@ -1027,6 +1101,7 @@ export const useVaultState = () => {
           // Decrypt sensitive fields (passphrase, privateKey)
           const keyVer = ++keysWriteVersion.current;
           const decryptedKeys = await decryptKeys(migratedKeys);
+          if (cancelled) return;
           if (keyVer === keysWriteVersion.current) {
             const orderedKeys = normalizeVaultOrder(decryptedKeys);
             setKeys(orderedKeys);
@@ -1047,6 +1122,7 @@ export const useVaultState = () => {
         if (savedIdentities) {
           const idVer = ++identitiesWriteVersion.current;
           const decryptedIds = await decryptIdentities(savedIdentities);
+          if (cancelled) return;
           if (idVer === identitiesWriteVersion.current) {
             const orderedIdentities = normalizeVaultOrder(decryptedIds);
             setIdentities(orderedIdentities);
@@ -1062,6 +1138,7 @@ export const useVaultState = () => {
         if (savedProxyProfiles) {
           const proxyVer = ++proxyProfilesWriteVersion.current;
           const decryptedProfiles = await decryptProxyProfiles(savedProxyProfiles);
+          if (cancelled) return;
           if (proxyVer === proxyProfilesWriteVersion.current) {
             const orderedProfiles = normalizeVaultOrder(decryptedProfiles);
             setProxyProfiles(orderedProfiles);
@@ -1071,6 +1148,8 @@ export const useVaultState = () => {
             });
           }
         }
+
+        if (cancelled) return;
 
         // Read remaining non-encrypted data fresh after all async gaps above
         const savedGroups = localStorageAdapter.read<string[]>(STORAGE_KEY_GROUPS);
@@ -1148,6 +1227,7 @@ export const useVaultState = () => {
         if (savedGroupConfigs) {
           const gcVer = ++groupConfigsWriteVersion.current;
           const decryptedGC = await decryptGroupConfigs(savedGroupConfigs);
+          if (cancelled) return;
           if (gcVer === groupConfigsWriteVersion.current) {
             const sanitizedGC = normalizeVaultOrder(decryptedGC.map(sanitizeGroupConfig));
             setGroupConfigs(sanitizedGC);
@@ -1158,12 +1238,19 @@ export const useVaultState = () => {
           }
         }
       } finally {
-        setIsInitialized(true);
-        setVaultInitialized(true);
+        // StrictMode remount cancels the first init; only the surviving effect
+        // may publish "vault ready" or terminals can boot against empty keys.
+        if (!cancelled) {
+          setIsInitialized(true);
+          setVaultInitialized(true);
+        }
       }
     };
 
-    init();
+    void init();
+    return () => {
+      cancelled = true;
+    };
   }, [updateHosts, updateSnippets]);
 
   useEffect(() => {
@@ -1375,9 +1462,12 @@ export const useVaultState = () => {
 
   const updateHostLastConnected = useCallback((hostId: string) => {
     setHosts((prev) => {
-      const next = prev.map((h) =>
-        h.id === hostId ? { ...h, lastConnectedAt: Date.now() } : h,
-      );
+      const idx = prev.findIndex((h) => h.id === hostId);
+      if (idx < 0) return prev;
+      const now = Date.now();
+      if (prev[idx].lastConnectedAt === now) return prev;
+      const next = prev.slice();
+      next[idx] = { ...prev[idx], lastConnectedAt: now };
       const ver = ++hostsWriteVersion.current;
       const encryptPromise = encryptHosts(next);
       hostsEncryptPendingRef.current = encryptPromise.then(() => undefined);

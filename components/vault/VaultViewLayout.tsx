@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import React from "react";
+import React, { useCallback } from "react";
 import { deleteVaultKey } from "../../application/defaultKeyPassphrases";
 import { usePluginImporterCommit } from "../../application/state/usePluginImporterCommit";
 import { preserveConcurrentHostLineTimestampUpdate } from "../../domain/host";
@@ -18,6 +18,8 @@ import {
   vaultHeaderIconButtonClass,
   vaultHeaderSecondaryButtonClass,
 } from "./VaultPageHeader";
+import { useConnectionLogsStore } from "../../application/state/connectionLogsStore";
+import { useNotesStore } from "../../application/state/notesStore";
 import { LazyLoadBoundary } from "../ui/lazy-load-boundary";
 import { toast } from "../ui/toast";
 import { AppWordmark } from "../AppWordmark";
@@ -30,6 +32,95 @@ const VaultSectionLoading = () => (
     aria-hidden="true"
   />
 );
+
+/**
+ * Notes section subscribes to notesStore instead of taking notes as VaultView
+ * props, so note edits never invalidate the App vault domain bag.
+ *
+ * While inactive (retained but hidden), freeze hosts and drop the store
+ * subscription so Hosts/Keys churn and note publishes do not reconcile the
+ * heavy NotesManager + MDXEditor tree.
+ */
+function VaultNotesSection({
+  NotesManager,
+  hosts,
+  isActive,
+  openNoteId,
+  onOpenNoteIdHandled,
+  onOpenHost,
+}: {
+  NotesManager: React.ComponentType<any>;
+  hosts: any[];
+  isActive: boolean;
+  openNoteId: string | null;
+  onOpenNoteIdHandled: () => void;
+  onOpenHost: (host: any, source?: { noteId?: string }) => void;
+}) {
+  const { notes, noteGroups, updateNotes, updateNoteGroups } = useNotesStore({
+    enabled: isActive,
+  });
+  return (
+    <NotesManager
+      notes={notes}
+      noteGroups={noteGroups}
+      hosts={hosts}
+      onUpdateNotes={updateNotes}
+      onUpdateNoteGroups={updateNoteGroups}
+      isActive={isActive}
+      openNoteId={openNoteId}
+      onOpenNoteIdHandled={onOpenNoteIdHandled}
+      onOpenHost={onOpenHost}
+    />
+  );
+}
+
+const MemoVaultNotesSection = React.memo(
+  VaultNotesSection,
+  (prev, next) => {
+    if (
+      prev.isActive !== next.isActive
+      || prev.openNoteId !== next.openNoteId
+      || prev.NotesManager !== next.NotesManager
+      || prev.onOpenNoteIdHandled !== next.onOpenNoteIdHandled
+      || prev.onOpenHost !== next.onOpenHost
+    ) {
+      return false;
+    }
+    if (next.isActive && prev.hosts !== next.hosts) return false;
+    return true;
+  },
+);
+
+/**
+ * Logs section subscribes to connectionLogsStore so every session start/exit
+ * append stays out of the App vault/chrome domain bags.
+ */
+function VaultConnectionLogsSection({
+  ConnectionLogsManager,
+  hosts,
+  onOpenLogView,
+}: {
+  ConnectionLogsManager: React.ComponentType<any>;
+  hosts: any[];
+  onOpenLogView: (log: any) => void;
+}) {
+  const {
+    connectionLogs,
+    toggleConnectionLogSaved,
+    deleteConnectionLog,
+    clearUnsavedConnectionLogs,
+  } = useConnectionLogsStore();
+  return (
+    <ConnectionLogsManager
+      logs={connectionLogs}
+      hosts={hosts}
+      onToggleSaved={toggleConnectionLogSaved}
+      onDelete={deleteConnectionLog}
+      onClearUnsaved={clearUnsavedConnectionLogs}
+      onOpenLogView={onOpenLogView}
+    />
+  );
+}
 
 export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
   const {
@@ -52,7 +143,6 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     Clock,
     cn,
     commitInlineGroupRename,
-    connectionLogs,
     connectSelectedHosts,
     ContextMenu,
     ContextMenuContent,
@@ -148,16 +238,13 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     Network,
     newFolderName,
     newHostGroupPath,
-    onClearUnsavedConnectionLogs,
     onConnectSerial,
     onCreateLocalTerminal,
-    onDeleteConnectionLog,
     onDeleteHost,
     onImportOrReuseKey,
     onOpenLogView,
     onOpenSettings,
     onRunSnippet,
-    onToggleConnectionLogSaved,
     onUpdateCustomGroups,
     onUpdateGroupConfigs,
     onUpdateHosts,
@@ -280,15 +367,11 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
   } = ctx;
   const {
     knownHosts,
-    noteGroups,
     NotebookText,
-    notes,
     NotesManager,
     onOpenHostFromNote,
     onOpenNoteIdHandled,
     onOpenSnippetIdHandled,
-    onUpdateNoteGroups,
-    onUpdateNotes,
     openNoteId,
     openSnippetId,
   } = ctx;
@@ -306,6 +389,13 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
         source.groupName === path || source.groupName.startsWith(path + "/"),
     ),
   );
+  const handleNotesOpenHost = useCallback((host: any, source?: { noteId?: string }) => {
+    if (source?.noteId && onOpenHostFromNote) {
+      onOpenHostFromNote(host, source);
+      return;
+    }
+    handleHostConnect(host);
+  }, [handleHostConnect, onOpenHostFromNote]);
   const visibleTreeGroupPaths = React.useMemo(
     () => collectVisibleVaultGroupPaths(treeViewGroupTree),
     [treeViewGroupTree],
@@ -1181,21 +1271,13 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
               )}
               data-section="vault-notes-retained"
             >
-              <NotesManager
-                notes={notes}
-                noteGroups={noteGroups}
+              <MemoVaultNotesSection
+                NotesManager={NotesManager}
                 hosts={hosts}
-                onUpdateNotes={onUpdateNotes}
-                onUpdateNoteGroups={onUpdateNoteGroups}
+                isActive={currentSection === "notes"}
                 openNoteId={openNoteId ?? null}
                 onOpenNoteIdHandled={onOpenNoteIdHandled}
-                onOpenHost={(host: any, source: any) => {
-                  if (source?.noteId && onOpenHostFromNote) {
-                    onOpenHostFromNote(host, source);
-                    return;
-                  }
-                  handleHostConnect(host);
-                }}
+                onOpenHost={handleNotesOpenHost}
               />
             </div>
             {currentSection === "keys" && (
@@ -1310,12 +1392,9 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 resetKey="connection-logs"
               >
                 <Suspense fallback={<VaultSectionLoading />}>
-                  <LazyConnectionLogsManager
-                    logs={connectionLogs}
+                  <VaultConnectionLogsSection
+                    ConnectionLogsManager={LazyConnectionLogsManager}
                     hosts={hosts}
-                    onToggleSaved={onToggleConnectionLogSaved}
-                    onDelete={onDeleteConnectionLog}
-                    onClearUnsaved={onClearUnsavedConnectionLogs}
                     onOpenLogView={onOpenLogView}
                   />
                 </Suspense>

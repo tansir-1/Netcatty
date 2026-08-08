@@ -29,6 +29,7 @@ import { ExternalLink } from "lucide-react";
 import {
   $createRangeSelection,
   $getNearestNodeFromDOMNode,
+  $getSelection,
   $isTextNode,
   $setSelection,
   getNearestEditorFromDOMNode,
@@ -221,6 +222,41 @@ export const isNotePasteInsideCodeBlock = (target: EventTarget | null): boolean 
       ? target.parentElement
       : null;
   return Boolean(element?.closest(".cm-editor, [class*=\"_codeMirrorWrapper_\"]"));
+};
+
+/** True when Lexical currently has a selection that insertMarkdown can target. */
+export const hasActiveLexicalTextSelection = (target: EventTarget | null): boolean => {
+  if (typeof Element === "undefined" || typeof Node === "undefined") return false;
+  const element = target instanceof Element
+    ? target
+    : target instanceof Node
+      ? target.parentElement
+      : null;
+  if (!element) return false;
+  const lexicalEditor = getNearestEditorFromDOMNode(element);
+  if (!lexicalEditor) return false;
+  let hasSelection = false;
+  lexicalEditor.getEditorState().read(() => {
+    hasSelection = $getSelection() !== null;
+  });
+  return hasSelection;
+};
+
+/**
+ * Decide whether markdown paste should call preventDefault + insertMarkdown.
+ * When selection is missing, return false so the browser can paste plain text
+ * instead of swallowing the clipboard with a no-op insert.
+ */
+export const shouldInterceptNoteMarkdownPaste = (input: {
+  editorMode: NoteEditorMode;
+  pasteInsideCodeBlock: boolean;
+  clipboardText: string;
+  canInsertMarkdownAtSelection: boolean;
+}): boolean => {
+  if (input.editorMode !== "edit") return false;
+  if (input.pasteInsideCodeBlock) return false;
+  if (!shouldInsertClipboardTextAsMarkdown(input.clipboardText)) return false;
+  return input.canInsertMarkdownAtSelection;
 };
 
 export const resolveHostPickerPopupPosition = ({
@@ -437,7 +473,7 @@ const deleteLexicalTextRange = (range: Range, onUpdate: () => void): boolean => 
   return didDelete;
 };
 
-export function InlineMarkdownEditor({
+export const InlineMarkdownEditor = React.memo(function InlineMarkdownEditor({
   value,
   placeholder,
   onChange,
@@ -450,6 +486,8 @@ export function InlineMarkdownEditor({
   const { t } = useI18n();
   const editorRef = useRef<MDXEditorMethods>(null);
   const latestMarkdownRef = useRef(value);
+  const syncedPropValueRef = useRef(value);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const lastLinkActivationRef = useRef<{ href: string; at: number } | null>(null);
   const [hostPicker, setHostPicker] = useState<HostPickerState>({
@@ -494,7 +532,14 @@ export function InlineMarkdownEditor({
   }, [hostCandidates, hostPicker.query]);
 
   useEffect(() => {
-    if (latestMarkdownRef.current === value) return;
+    if (latestMarkdownRef.current === value) {
+      syncedPropValueRef.current = value;
+      return;
+    }
+    if (latestMarkdownRef.current !== syncedPropValueRef.current) {
+      return;
+    }
+    syncedPropValueRef.current = value;
     latestMarkdownRef.current = value;
     editorRef.current?.setMarkdown(value);
   }, [value]);
@@ -614,9 +659,32 @@ export function InlineMarkdownEditor({
   }, [hosts]);
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(annotateHostLinks);
-    return () => window.cancelAnimationFrame(frame);
-  }, [annotateHostLinks, value]);
+    const container = containerRef.current;
+    if (!container) return;
+
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        annotateHostLinks();
+      });
+    };
+
+    schedule();
+    if (editorMode !== "preview") {
+      return () => {
+        if (frame) window.cancelAnimationFrame(frame);
+      };
+    }
+
+    const observer = new MutationObserver(schedule);
+    observer.observe(container, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, [annotateHostLinks, editorMode]);
 
   const annotateCodeBlockCopyButtons = useCallback(() => {
     const container = containerRef.current;
@@ -846,12 +914,19 @@ export function InlineMarkdownEditor({
   }, []);
 
   const handlePasteCapture = useCallback((event: React.ClipboardEvent<HTMLDivElement>) => {
-    if (editorMode !== "edit") return;
-    if (isNotePasteInsideCodeBlock(event.target)) return;
     const markdown = event.clipboardData.getData("text/plain");
-    if (!shouldInsertClipboardTextAsMarkdown(markdown)) return;
-
     const editor = editorRef.current;
+    if (
+      !shouldInterceptNoteMarkdownPaste({
+        editorMode,
+        pasteInsideCodeBlock: isNotePasteInsideCodeBlock(event.target),
+        clipboardText: markdown,
+        canInsertMarkdownAtSelection: Boolean(editor)
+          && hasActiveLexicalTextSelection(event.target),
+      })
+    ) {
+      return;
+    }
     if (!editor) return;
 
     event.preventDefault();
@@ -958,4 +1033,4 @@ export function InlineMarkdownEditor({
       )}
     </div>
   );
-}
+});
