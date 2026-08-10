@@ -26,6 +26,8 @@ interface TerminalAutocompleteProps {
   protocol?: string;
   workspaceId?: string;
   status?: "connecting" | "connected" | "disconnected";
+  /** Pane visibility fallback when paneVisibilityStore has no entry (popup terminals). */
+  isVisible?: boolean;
   getCwd?: () => string | undefined;
   onAcceptText: (text: string) => void;
   snippets?: Snippet[];
@@ -66,6 +68,7 @@ export function TerminalAutocomplete({
   protocol,
   workspaceId,
   status = "connected",
+  isVisible = true,
   getCwd,
   onAcceptText,
   snippets,
@@ -84,8 +87,10 @@ export function TerminalAutocomplete({
   allowHostStyleGreaterThanPrompt = false,
 }: TerminalAutocompleteProps) {
   // Self-subscribe to this pane's visibility so toggling it doesn't have to
-  // flow through (and re-render) the TerminalView ctx.
-  const visible = usePaneVisible(sessionId);
+  // flow through (and re-render) the TerminalView ctx. Popup / standalone
+  // Terminal mounts never publish the store — fall back to the isVisible prop
+  // (same contract as hibernate).
+  const visible = usePaneVisible(sessionId, isVisible);
   const provideCompletions = useCallback(async (
     input: string,
     options: Parameters<typeof import("./autocomplete/completionEngine").getCompletions>[1] & {
@@ -95,6 +100,7 @@ export function TerminalAutocomplete({
   ) => {
     const normalizedProtocol: NetcattyTerminalSessionSnapshot['protocol'] = protocol ?? "ssh";
     const pluginRegistry = isPluginCompletionProviderAvailable?.() === false
+      || options.allowExternalProviders === false
       || !shouldUsePluginTerminalCompletionProvider({
         sensitiveInputActive: sensitiveInputActiveRef.current === true,
         promptText: options.promptText,
@@ -118,6 +124,7 @@ export function TerminalAutocomplete({
       maximum: options.maxResults ?? 15,
       historyScope: options.historyScope ?? settings?.historyScope,
       signal: options.signal,
+      onLatePathSuggestions: options.onLatePathSuggestions,
     });
   }, [allowHostStyleGreaterThanPrompt, hostId, hostOs, isPluginCompletionProviderAvailable, protocol, sensitiveInputActiveRef, sessionId, settings?.historyScope, status, workspaceId]);
   const autocomplete = useTerminalAutocomplete({
@@ -132,6 +139,7 @@ export function TerminalAutocomplete({
     onAcceptSnippet,
     protocol,
     getCwd,
+    sensitiveInputActiveRef,
     provideCompletions,
   });
 
