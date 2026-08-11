@@ -1,6 +1,6 @@
 
 
-import React, { useCallback, useEffect, useDeferredValue, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { useWindowControls } from '../application/state/useWindowControls';
@@ -30,9 +30,9 @@ import { subscribeUserSkillsStatusChanged } from './ai/userSkillsStatusEvents';
 import {
   applyDraftEntrySelection,
   applyHistorySessionSelection,
-  panelViewsEqual,
   resolveDisplayedPanelView,
   resolveDisplayedSession,
+  shouldForceDraftViewSync,
 } from './ai/aiPanelViewState';
 import {
   endSendForKey,
@@ -51,6 +51,7 @@ import {
   type DefaultTargetSessionHint,
 } from '../application/state/useAIChatStreaming';
 import { getScopedHistorySessions } from './ai/scopedHistorySessions';
+import { resolveInheritedAIActiveSessionId } from '../domain/aiWorkspaceScopeInherit';
 import { aiSessionIdSetEqual, exactScopeAISessionsEqual } from '../domain/aiSessionsForScope';
 import { buildExternalAgentHistoryMessagesForBridge } from './ai/externalAgentHistory';
 import { canSendWithAgent, findEnabledExternalAgent } from './ai/agentSendEligibility';
@@ -286,6 +287,7 @@ const AIChatSidePanelActive: React.FC<AIChatSidePanelProps> = ({
   scopeTargetId,
   scopeHostIds,
   scopeLabel,
+  focusedSessionId,
   terminalSessions = [],
   resolveExecutorContext,
   isVisible = true,
@@ -345,24 +347,48 @@ const AIChatSidePanelActive: React.FC<AIChatSidePanelProps> = ({
     return sessionIds;
   }, [activeSessionIdMap, scopeKey]);
 
-  const deferredSessions = useDeferredValue(sessions);
+  const workspaceMemberTerminalIds = useMemo(() => {
+    if (scopeType !== 'workspace') return undefined;
+    return new Set(
+      terminalSessions
+        .map((session) => session.sessionId)
+        .filter((sessionId): sessionId is string => Boolean(sessionId)),
+    );
+  }, [scopeType, terminalSessions]);
+
+  // Use live sessions for history + view resolution. Deferring the list used to
+  // lag one paint behind createSession, so normalizePanelView treated the new
+  // chat as missing and the draft-sync effect forced showDraftView — which
+  // parked the just-sent session into history under StrictMode.
   const historySessions = useMemo(
     () => profileAIPanelCalculation(
       'AIChatSidePanel.historySessions',
       () => getScopedHistorySessions(
-        deferredSessions,
+        sessions,
         scopeType,
         scopeTargetId,
         scopeHostIds,
         activeTerminalSessionIds,
+        workspaceMemberTerminalIds,
       ),
     ),
-    [deferredSessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalSessionIds],
+    [sessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalSessionIds, workspaceMemberTerminalIds],
   );
 
   const explicitPanelView = panelViewByScope[scopeKey];
   const currentDraft = draftsByScope[scopeKey] ?? null;
-  const persistedSessionId = activeSessionIdMap[scopeKey] ?? null;
+  const visibleHistorySessionIds = useMemo(
+    () => new Set(historySessions.map((session) => session.id)),
+    [historySessions],
+  );
+  const persistedSessionId = resolveInheritedAIActiveSessionId({
+    scopeType,
+    scopeTargetId,
+    activeSessionIdMap,
+    memberTerminalIds: terminalSessions.map((session) => session.sessionId).filter(Boolean),
+    preferredTerminalId: focusedSessionId,
+    visibleSessionIds: visibleHistorySessionIds,
+  });
   const normalizedPanelView = useMemo<AIPanelView>(
     () => resolveDisplayedPanelView(explicitPanelView, currentDraft != null, historySessions, persistedSessionId, scopeType),
     [explicitPanelView, currentDraft, historySessions, persistedSessionId, scopeType],
@@ -424,9 +450,17 @@ const AIChatSidePanelActive: React.FC<AIChatSidePanelProps> = ({
 
   useEffect(() => {
     if (!isVisible) return;
-    if (!explicitPanelView || panelViewsEqual(normalizedPanelView, explicitPanelView)) return;
+    // Predicate must match normalizePanelView's list (scoped history), not the
+    // global store — out-of-scope sessions must still demote to draft.
+    if (!shouldForceDraftViewSync(
+      explicitPanelView,
+      normalizedPanelView,
+      (sessionId) => historySessions.some((session) => session.id === sessionId),
+    )) {
+      return;
+    }
     showDraftView(scopeKey);
-  }, [isVisible, normalizedPanelView, explicitPanelView, scopeKey, showDraftView]);
+  }, [isVisible, normalizedPanelView, explicitPanelView, scopeKey, historySessions, showDraftView]);
 
   useEffect(() => {
     if (!activeSession) return;
@@ -445,9 +479,24 @@ const AIChatSidePanelActive: React.FC<AIChatSidePanelProps> = ({
   useEffect(() => {
     if (!isVisible) return;
     if (normalizedPanelView.mode !== 'draft') return;
+    // Keep ownership while an explicit session is still displayable in this
+    // scope (normalize has not demoted it). Out-of-scope / missing ids clear.
+    if (
+      explicitPanelView?.mode === 'session'
+      && historySessions.some((session) => session.id === explicitPanelView.sessionId)
+    ) {
+      return;
+    }
     if (persistedSessionId == null) return;
     setActiveSessionId(null);
-  }, [isVisible, normalizedPanelView.mode, persistedSessionId, setActiveSessionId]);
+  }, [
+    isVisible,
+    normalizedPanelView.mode,
+    explicitPanelView,
+    historySessions,
+    persistedSessionId,
+    setActiveSessionId,
+  ]);
 
   const ensureScopeDraft = useCallback((agentId: string) => {
     ensureDraftForScope(scopeKey, agentId);
@@ -1579,6 +1628,7 @@ export function aiChatSidePanelPropsAreEqual(
   if (prev.scopeType !== next.scopeType) return false;
   if (prev.scopeTargetId !== next.scopeTargetId) return false;
   if (prev.scopeLabel !== next.scopeLabel) return false;
+  if ((prev.focusedSessionId ?? '') !== (next.focusedSessionId ?? '')) return false;
   if ((prev.isVisible ?? true) !== (next.isVisible ?? true)) return false;
   if (prev.scopeHostIds !== next.scopeHostIds) return false;
   if (prev.terminalSessions !== next.terminalSessions) return false;
@@ -1597,10 +1647,45 @@ export function aiChatSidePanelPropsAreEqual(
   // resume whose stored scope.targetId is an older terminal.
   // Fuzzy history still receives the full list; drawer open forces re-render
   // via isVisible / other prop paths when the user actually needs it.
-  const scopeKey = `${prev.scopeType}:${prev.scopeTargetId ?? ''}`;
-  const selectedSessionId = prev.activeSessionIdMap[scopeKey]
-    ?? next.activeSessionIdMap[scopeKey]
-    ?? null;
+  // Keep visibleSessionIds in sync with the live panel so inheritance that
+  // skips non-history chats does not leave memo pinned to a different id.
+  const resolveSelectedSessionId = (
+    props: AIChatSidePanelProps,
+  ): string | null => {
+    const scopeKey = `${props.scopeType}:${props.scopeTargetId ?? ''}`;
+    const memberTerminalIds = (props.terminalSessions ?? [])
+      .map((session) => session.sessionId)
+      .filter((sessionId): sessionId is string => Boolean(sessionId));
+    const workspaceMemberTerminalIds = props.scopeType === 'workspace'
+      ? new Set(memberTerminalIds)
+      : undefined;
+    const activeTerminalSessionIds = new Set<string>();
+    for (const [sessionScopeKey, sessionId] of Object.entries(props.activeSessionIdMap) as Array<[string, string | null]>) {
+      if (!sessionScopeKey.startsWith('terminal:') || !sessionId) continue;
+      if (sessionScopeKey === scopeKey) continue;
+      activeTerminalSessionIds.add(sessionId);
+    }
+    const visibleSessionIds = new Set(
+      getScopedHistorySessions(
+        props.sessions,
+        props.scopeType,
+        props.scopeTargetId,
+        props.scopeHostIds,
+        activeTerminalSessionIds,
+        workspaceMemberTerminalIds,
+      ).map((session) => session.id),
+    );
+    return resolveInheritedAIActiveSessionId({
+      scopeType: props.scopeType,
+      scopeTargetId: props.scopeTargetId,
+      activeSessionIdMap: props.activeSessionIdMap,
+      memberTerminalIds,
+      preferredTerminalId: props.focusedSessionId,
+      visibleSessionIds,
+    });
+  };
+  const selectedSessionId = resolveSelectedSessionId(prev)
+    ?? resolveSelectedSessionId(next);
   if (!exactScopeAISessionsEqual(
     prev.sessions,
     next.sessions,
