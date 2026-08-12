@@ -30,6 +30,8 @@ export const STORAGE_KEY_HOTKEY_RECORDING = 'netcatty_hotkey_recording_v1';
 export const STORAGE_KEY_CUSTOM_CSS = 'netcatty_custom_css_v1';
 export const STORAGE_KEY_UI_LANGUAGE = 'netcatty_ui_language_v1';
 export const STORAGE_KEY_PORT_FORWARDING = 'netcatty_port_forwarding_v1';
+/** Width (px) shared by port forwarding edit, wizard, and host picker panels. */
+export const STORAGE_KEY_PORT_FORWARDING_PANEL_WIDTH = 'netcatty_port_forwarding_panel_width_v1';
 export const STORAGE_KEY_PF_PREFER_FORM_MODE = 'netcatty_pf_prefer_form_mode_v1';
 export const STORAGE_KEY_PF_VIEW_MODE = 'netcatty_pf_view_mode_v1';
 export const STORAGE_KEY_KNOWN_HOSTS = 'netcatty_known_hosts_v1';
@@ -239,6 +241,9 @@ export const STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR = 'netcatty_show_host_tree_sideb
 
 // Shortcuts: Cmd/Ctrl+[1...9] and Ctrl+Tab skip pinned Vault/SFTP tabs
 export const STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS = 'netcatty_shell_only_tab_number_shortcuts_v1';
+
+// Shortcuts: show 1...9 badge on tabs that match number switch shortcuts
+export const STORAGE_KEY_SHOW_TAB_NUMBER_BADGES = 'netcatty_show_tab_number_badges_v1';
 
 // Shortcuts: disable terminal font zoom shortcuts
 export const STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM = 'netcatty_disable_terminal_font_zoom_v1';

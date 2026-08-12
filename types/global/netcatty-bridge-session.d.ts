@@ -229,7 +229,11 @@ declare global {
     /** Get current working directory from an active SSH session */
     getSessionPwd?(
       sessionId: string,
-      options?: { allowHomeFallback?: boolean; timeoutMs?: number },
+      options?: {
+        allowHomeFallback?: boolean;
+        allowLoginShellFallback?: boolean;
+        timeoutMs?: number;
+      },
     ): Promise<{ success: boolean; cwd?: string; error?: string }>;
     /**
      * Get metadata about an already-connected SSH session — currently the
@@ -293,10 +297,12 @@ declare global {
         diskUsed: number | null;      // Disk used in GB
         diskTotal: number | null;     // Total disk in GB
         disks: Array<{                // All mounted disks
+          capacityKey?: string;       // Filesystem or shared-pool identity
           mountPoint: string;
           used: number;               // Used in GB
           total: number;              // Total in GB
           percent: number;            // Usage percentage
+          filesystemType?: string;    // Filesystem type reported by df
         }>;
         netRxSpeed: number;           // Total network receive speed (bytes/sec)
         netTxSpeed: number;           // Total network transmit speed (bytes/sec)

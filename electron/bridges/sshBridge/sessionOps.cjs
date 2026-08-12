@@ -238,6 +238,11 @@ function createSessionOpsApi(ctx) {
     async function getSessionPwd(event, payload) {
       const { sessionId } = payload;
       const allowHomeFallback = payload?.allowHomeFallback !== false;
+      // Login-shell fallback defaults to the same gate as ~ guessing so callers
+      // that pass allowHomeFallback: false (e.g. captureInheritedCwd) keep the
+      // pre-#2886 failure path and can fall through to lastCwd. SFTP fresh-cwd
+      // probes opt in explicitly with allowLoginShellFallback: true.
+      const allowLoginShellFallback = payload?.allowLoginShellFallback ?? allowHomeFallback;
       const requestedTimeoutMs = Number(payload?.timeoutMs);
       const timeoutMs = Number.isFinite(requestedTimeoutMs)
         ? Math.min(Math.max(requestedTimeoutMs, 100), 5000)
@@ -282,14 +287,17 @@ function createSessionOpsApi(ctx) {
         //   2. Follows foreground child shells only, which covers bash->fish
         //      without mistaking background shell scripts for the active shell.
         //   3. Reads /proc/<pid>/cwd via readlink.
-        //   4. Falls back to the user's home directory if the caller allows it.
+        //   4. If the active (su'd) shell cwd is unreadable, falls back to the
+        //      same-uid login shell cwd when allowed.
+        //   5. Falls back to the user's home directory if the caller allows it.
         //
         // `exec` makes sh replace the user's login shell (fish/bash/...)
         // so sh keeps the same PID and $PPID = sshd. Starting another shell
         // without exec would make $PPID point at the intermediate shell instead.
         const posixScript = `SELF=$$
     TARGET_LOGIN=${targetLoginPid}
-    ALLOW_FALLBACK=${allowHomeFallback ? "1" : "0"}
+    ALLOW_HOME_FALLBACK=${allowHomeFallback ? "1" : "0"}
+    ALLOW_LOGIN_FALLBACK=${allowLoginShellFallback ? "1" : "0"}
     # Find the user's interactive shell on this SSH connection.
     # Prefer the one attached to a controlling tty (the user's shell): probe exec
     # channels like this one have no tty ("?"), and ps output is unsorted, so
@@ -396,13 +404,14 @@ function createSessionOpsApi(ctx) {
       # perms on /proc, lsof permissions on macOS/BSD), so this unprivileged
       # exec channel cannot read a su'd / sudo'd shell owned by another user.
       # Fall back to the same-uid login shell's cwd before giving up to the
-      # home directory (#1065 review).
-      if [ -z "$cwd" ] && [ "$pid" != "$login" ] && [ "$ALLOW_FALLBACK" = "1" ]; then
+      # home directory (#1065 review). Callers that need this after disabling
+      # ~ guessing (SFTP preferFreshBackend) must set ALLOW_LOGIN_FALLBACK (#2886).
+      if [ -z "$cwd" ] && [ "$pid" != "$login" ] && [ "$ALLOW_LOGIN_FALLBACK" = "1" ]; then
         cwd=$(read_shell_cwd "$login")
       fi
       [ -n "$cwd" ] && printf '%s\\n' "$cwd" && exit 0
     fi
-    [ "$ALLOW_FALLBACK" = "1" ] || exit 1
+    [ "$ALLOW_HOME_FALLBACK" = "1" ] || exit 1
     emit_home() {
       case "$1" in
         /*) printf '%s\\n' "$1"; exit 0 ;;
@@ -815,6 +824,74 @@ function createSessionOpsApi(ctx) {
         `loadavg=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1" "$2" "$3"}')`,
         `echo "CPU:$cpupct|CORES:$cores|MEMINFO:$memtotal $memfree 0 $memcached $swaptotal $swapfree|PROCS:$procs|DISKS:$disks|NET:$net|HOST:$hostname_value|OS:$osname|KERNEL:$kernel|UPTIME:$uptime|LOAD:$loadavg"`,
       ].join('; ');
+
+      // Prefer df's filesystem type column so FUSE mounts can be identified
+      // even when their source name looks like an ordinary remote path.
+      // Fall back to the old layout for BusyBox builds without df -T.
+      const linuxDiskAwk = String.raw`awk '
+        $0 == "__NETCATTY_DF__" { in_df = 1; next }
+        !in_df {
+          on_marker = index($0, " on ");
+          if (on_marker > 1) {
+            mount_rest = substr($0, on_marker + 4);
+            type_marker = index(mount_rest, " type ");
+            if (type_marker > 1) {
+              mount_point = substr(mount_rest, 1, type_marker - 1);
+              filesystem_type = substr(mount_rest, type_marker + 6);
+              sub(/[[:space:]].*$/, "", filesystem_type);
+              mount_filesystem_types[mount_point] = filesystem_type;
+            }
+          }
+          next
+        }
+        $1 == "Filesystem" { has_type = ($2 == "Type"); next }
+        NF > 0 {
+          source = $1;
+          if (has_type) {
+            filesystem_type = $2;
+            total_kb = $3;
+            used_kb = $4;
+            percent = $6;
+            mount_point = $7;
+          } else {
+            filesystem_type = "";
+            total_kb = $2;
+            used_kb = $3;
+            percent = $5;
+            mount_point = $6;
+          }
+          if ((filesystem_type == "" || filesystem_type == "-") && (mount_point in mount_filesystem_types)) {
+            filesystem_type = mount_filesystem_types[mount_point];
+          }
+          if (mount_point == "") next;
+          if (source ~ /^\/dev\/loop/ && mount_point != "/") next;
+          if (mount_point != "/" && mount_point ~ /^\/(etc|proc|sys|dev|snap)(\/|$)/) next;
+          if (mount_point != "/" && source ~ /^(overlay|overlayfs)(\/|$|:)/) next;
+          fstype = tolower(filesystem_type);
+          source_lower = tolower(source);
+          is_network_or_fuse = 0;
+          if (fstype ~ /^fuse\.(rclone|sshfs|s3fs|gcsfuse|ufs|mergerfs|unionfs|unionfs-fuse|ceph|ceph-fuse|cephfs|glusterfs)$/) is_network_or_fuse = 1;
+          if (fstype ~ /clouddrive/) is_network_or_fuse = 1;
+          if (fstype ~ /^(fuse|rclone|sshfs|s3fs|gcsfuse|mergerfs|unionfs|unionfs-fuse|nfs|nfs4|cifs|smb|smb3|smbfs|afs|ceph|cephfs|glusterfs)$/) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower ~ /clouddrive/) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower ~ /^(fuse|fuse\..*|rclone|rclone:.*|sshfs|s3fs|gcsfuse|mergerfs|unionfs|unionfs-fuse|ceph|ceph-fuse|cephfs|gluster|glusterfs|ufs)$/) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower ~ /^\/\//) is_network_or_fuse = 1;
+          if ((filesystem_type == "" || filesystem_type == "-") && source_lower !~ /^(apfs|overlay|overlayfs):/ && source_lower ~ /^([a-z0-9._-]+|\[[0-9a-f:]+(%[a-z0-9._-]+)?\]):\//) is_network_or_fuse = 1;
+          if (is_network_or_fuse) next;
+          pseudo_type = (fstype != "" && fstype != "-") ? fstype : source_lower;
+          if (mount_point != "/" && pseudo_type ~ /^(tmpfs|shm|devtmpfs|udev|none|proc|sysfs|cgroup|cgroup2|devpts|mqueue|hugetlbfs|debugfs|tracefs|securityfs|pstore|bpf|fusectl|configfs|ramfs|rpc_pipefs|binfmt_misc|efivarfs)$/) next;
+          total = total_kb / 1048576;
+          used = used_kb / 1048576;
+          if (total <= 0) next;
+          gsub(/%/, "", percent);
+          if (percent !~ /^[0-9]+$/) percent = int(used * 100 / total + 0.5);
+          metadata = source;
+          if (filesystem_type != "" && filesystem_type != "-") metadata = "fs=" filesystem_type ":" source;
+          printf "%s:%.6f:%.6f:%s:%s,", mount_point, used, total, percent, metadata;
+        }
+      '`;
+      const linuxDiskTable = `{ LC_ALL=C mount 2>/dev/null; printf "%s\\n" "__NETCATTY_DF__"; LC_ALL=C df -kPT 2>/dev/null || LC_ALL=C df -kP 2>/dev/null; }`;
+      const linuxDiskRoot = `{ LC_ALL=C mount 2>/dev/null; printf "%s\\n" "__NETCATTY_DF__"; LC_ALL=C df -kPT / 2>/dev/null || LC_ALL=C df -kP / 2>/dev/null; }`;
     
       // Command to get CPU (overall + per-core), Memory, Disk, and Network stats
       // This command is designed to work across most Linux distributions
@@ -834,14 +911,19 @@ function createSessionOpsApi(ctx) {
         // GNU ps: ps -eo pid,%mem,comm --sort=-%mem
         // BusyBox fallback: top exposes %VSZ/%CPU; minimal builds without top use plain ps VSZ.
         `procs=$(if procraw=$(ps -eo pid,%mem,comm --sort=-%mem 2>/dev/null); then printf "%s\n" "$procraw" | awk 'NR>1 && NR<=11 {gsub(/;/, "_", $3); printf "%s;%.1f;%s,", $1, $2, $3}' | sed 's/,$//'; elif topraw=$(top -b -n 1 2>/dev/null); then printf "%s\n" "$topraw" | awk '$1 == "PID" {for(i=1;i<=NF;i++){if($i=="%VSZ") mem_col=i; else if($i=="COMMAND") cmd_col=i} next} $1 ~ /^[0-9]+$/ && mem_col && cmd_col {pct=$(mem_col); gsub(/%/, "", pct); cmd=$(cmd_col); gsub(/;/, "_", cmd); print pct ";" $1 ";" cmd}' | sort -t ';' -k1,1rn | head -10 | awk -F';' '{printf "%s;%.1f;%s,", $2, $1, $3}' | sed 's/,$//'; else ps ww 2>/dev/null | awk -v total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo) '$1 ~ /^[0-9]+$/ {v=$3; unit=substr(v,length(v),1); mult=1; if(unit=="m"||unit=="M")mult=1024; else if(unit=="g"||unit=="G")mult=1048576; sub(/[mMgG]$/, "", v); pct=total>0?v*mult*100/total:0; cmd=$5; gsub(/;/, "_", cmd); print pct, $1, cmd}' | sort -rn | head -10 | awk '{printf "%s;%.1f;%s,", $2, $1, $3}' | sed 's/,$//'; fi)`,
-        // Get mounted disk info. POSIX -kP works on GNU and BusyBox.
+        // Get mounted disk info. GNU and BusyBox support df -T; the awk
+        // parser also accepts the legacy POSIX -kP layout as a fallback.
         // PVE/LXC guests often expose ZFS datasets and host bind mounts without a
         // /dev/* source, so keep non-pseudo filesystems (not only block devices).
+        // Skip FUSE/cloud/NFS/CIFS network mounts (rclone, CloudDrive, mergerfs,
+        // nfs, cifs, …): their quotas inflate System Overview totals and are not
+        // local block capacity. Keep a loop-backed rootfs (some CT images) while
+        // still dropping snap loop mounts under /snap.
         // When Capacity is "-" (some CT/cgroup views), derive percent from used/total.
         // If the full table yields nothing, fall back to df on "/" alone.
         // Do not blanket-skip /run: udisks may mount real volumes under /run/media;
         // tmpfs/udev/shm rows are dropped by filesystem-source checks instead.
-        `disks=$(df -kP 2>/dev/null | awk 'NR>1 && $1 !~ /^\\/dev\\/loop/ {mp=$6; fs=$1; if(mp!="/"&&mp~/^\\/(etc|proc|sys|dev|snap)(\\/|$)/) next; if(mp!="/"&&fs~/^(overlay|overlayfs)(\\/|$|:)/) next; if(mp!="/"&&fs~/^(tmpfs|shm|devtmpfs|udev|none|proc|sysfs|cgroup|cgroup2|devpts|mqueue|hugetlbfs|debugfs|tracefs|securityfs|pstore|bpf|fusectl|configfs|ramfs|rpc_pipefs|binfmt_misc|efivarfs)$/) next; total=$2/1048576; used=$3/1048576; if(total<=0) next; pct=$5; gsub(/%/,"",pct); if(pct!~/^[0-9]+$/) pct=int(used*100/total+0.5); printf "%s:%.6f:%.6f:%s:%s,", mp, used, total, pct, fs}' | sed 's/,$//'); [ -n "$disks" ] || disks=$(df -kP / 2>/dev/null | awk 'NR>1 {total=$2/1048576; used=$3/1048576; if(total<=0) next; pct=$5; gsub(/%/,"",pct); if(pct!~/^[0-9]+$/) pct=int(used*100/total+0.5); printf "%s:%.6f:%.6f:%s:%s,", $6, used, total, pct, $1}' | sed 's/,$//')`,
+        `disks=$( { ${linuxDiskTable}; } | ${linuxDiskAwk} | sed 's/,$//' ); [ -n "$disks" ] || disks=$( { ${linuxDiskRoot}; } | ${linuxDiskAwk} | sed 's/,$//' )`,
         // Get network interface stats from /proc/net/dev (interface:rx_bytes:tx_bytes), excluding lo and virtual interfaces
         `net=$(cat /proc/net/dev 2>/dev/null | awk 'NR>2 {gsub(/^[ \\t]+/, ""); split($0, a, ":"); iface=a[1]; if(iface != "lo" && iface !~ /^veth/ && iface !~ /^docker/ && iface !~ /^br-/) {split(a[2], b); printf "%s:%s:%s,", iface, b[1], b[9]}}' | sed 's/,$//' || echo "")`,
         `hostname_value=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo "")`,
@@ -1000,13 +1082,23 @@ function createSessionOpsApi(ctx) {
                         percent = Math.round((used / total) * 100);
                       }
                       if (!Number.isNaN(used) && !Number.isNaN(total) && !Number.isNaN(percent) && total > 0) {
-                        const capacityKey = diskParts.slice(4).join(':').trim();
+                        const diskMetadata = diskParts.slice(4).join(':').trim();
+                        let capacityKey = diskMetadata;
+                        let filesystemType;
+                        if (diskMetadata.startsWith('fs=')) {
+                          const separator = diskMetadata.indexOf(':');
+                          if (separator > 3) {
+                            filesystemType = diskMetadata.slice(3, separator).trim();
+                            capacityKey = diskMetadata.slice(separator + 1).trim();
+                          }
+                        }
                         disks.push({
                           mountPoint,
                           used,
                           total,
                           percent,
                           ...(capacityKey ? { capacityKey } : {}),
+                          ...(filesystemType ? { filesystemType } : {}),
                         });
                       }
                     }
