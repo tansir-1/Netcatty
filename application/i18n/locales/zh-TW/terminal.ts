@@ -338,6 +338,12 @@ export const zhTWTerminalMessages: Messages = {
   'settings.terminal.behavior.dynamicTabTitle.off': '關閉',
   'settings.terminal.behavior.dynamicTabTitle.agent': '僅 Agent',
   'settings.terminal.behavior.dynamicTabTitle.all': '全部工作階段',
+  'settings.terminal.behavior.oscNotifications': 'OSC 桌面通知',
+  'settings.terminal.behavior.oscNotifications.desc':
+    '當程式發出 OSC 9、OSC 777 notify 或 kitty OSC 99 時顯示系統通知。Codex 等 Agent 會用它提示回合完成或等待核准。',
+  'settings.terminal.behavior.oscNotifications.off': '關閉',
+  'settings.terminal.behavior.oscNotifications.unfocused': '未聚焦時',
+  'settings.terminal.behavior.oscNotifications.always': '一律',
   'settings.terminal.behavior.osc52Clipboard': 'OSC-52 剪貼簿',
   'settings.terminal.behavior.osc52Clipboard.desc':
     '允許遠端程式（tmux、vim 等）透過 OSC-52 轉義序列存取本機剪貼簿。',
@@ -833,7 +839,7 @@ export const zhTWTerminalMessages: Messages = {
   'snippets.shortkey.recording': '請按下快捷鍵組合...',
   'snippets.shortkey.hint': '在終端中按下此快捷鍵可快速傳送指令。',
   'snippets.shortkey.clear': '清除快捷鍵',
-  'snippets.shortkey.error.systemConflict': '此快捷鍵與系統快捷鍵衝突',
+  'snippets.shortkey.error.systemConflict': '此快捷鍵與「{name}」衝突',
   'snippets.shortkey.error.snippetConflict': '此快捷鍵已被程式碼片段使用：{name}',
 
   'snippets.variables.dialogTitle': '填寫變數',

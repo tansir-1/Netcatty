@@ -41,6 +41,12 @@ import {
   resolveHostTerminalFontWeight,
 } from "../../../domain/terminalAppearance";
 import { DEFAULT_TERMINAL_SCROLLBACK } from "../../../domain/models/terminal";
+import {
+  Osc99Assembler,
+  parseOsc777Payload,
+  parseOsc9Payload,
+  type OscNotification,
+} from "../../../domain/terminalOscNotifications";
 import { resolveFontWeightBold } from "../../../lib/fontWeightAvailability";
 import { isPluginHostProtocol } from "../../../domain/pluginConnection";
 import { resolveTerminalFontFamilyId } from "../../../infrastructure/config/fonts";
@@ -51,6 +57,7 @@ import {
   clearTerminalViewportAndSyncPty,
   installEraseInDisplayHandlers,
 } from "../clearTerminalViewport";
+import { pulseCopyOnSelectUserCommand } from "../copyOnSelect";
 import { getTerminalSelectionForClipboard } from "../normalizeTerminalSelection";
 import {
   createKittyKeyboardSessionStateStore,
@@ -114,12 +121,22 @@ import {
   terminalFontSizeWheelListenerOptions,
 } from "./terminalFontZoom";
 import {
-  getHistoryPreviewLines,
+  HISTORY_PREVIEW_HIDE_EVENT,
+  HISTORY_PREVIEW_OVERLAY_ATTR,
+  HISTORY_PREVIEW_WRAP_ATTR,
+  encodeHistoryPreviewWrapFlags,
+  getHistoryPreviewRows,
+  getHistoryPreviewSelectionFromRoot,
   forcedHistoryScrollLinesForWheel,
   forcedHistoryScrollPageToLines,
   forcedHistoryScrollPagesForKey,
   forcedHistoryScrollWheelListenerOptions,
+  isHistoryPreviewDismissClick,
+  isHistoryPreviewPointerTarget,
   nextHistoryPreviewTop,
+  selectHistoryPreviewAll,
+  shouldHideHistoryPreviewOnMouseDown,
+  shouldKeepHistoryPreviewOnKey,
 } from "./terminalHistoryScrollOverride";
 import { shouldPassThroughCopyShortcut } from "./terminalCopyShortcut";
 import { shouldUseUrgentTerminalInterrupt } from "./terminalInterruptShortcut";
@@ -340,6 +357,9 @@ export type CreateXTermRuntimeContext = {
 
   // Callback when the shell rings the terminal bell
   onBell?: () => void;
+
+  // Callback when a remote program requests a desktop notification via OSC 9/777/99
+  onOscNotification?: (notification: OscNotification) => void;
 
   // Callback when remote requests clipboard read in 'prompt' mode; resolves to user's decision
   onOsc52ReadRequest?: () => Promise<boolean>;
@@ -695,7 +715,28 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
 
   // Intercept native copy (Edit > Copy, browser/Electron copy event) before
   // xterm's built-in handler writes selectionText, so normalizeTextOnCopy applies.
+  const writePreviewSelectionToClipboard = (event: ClipboardEvent, previewSelection: string) => {
+    if (event.clipboardData) {
+      event.clipboardData.setData("text/plain", previewSelection);
+    } else {
+      void navigator.clipboard.writeText(previewSelection).catch((err) => {
+        logger.warn("[XTerm] History preview copy failed:", err);
+      });
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+  const handlePreviewNativeCopy = (event: ClipboardEvent) => {
+    const previewSelection = getHistoryPreviewSelectionFromRoot(ctx.container);
+    if (!previewSelection) return;
+    writePreviewSelectionToClipboard(event, previewSelection);
+  };
   const handleNativeCopy = (event: ClipboardEvent) => {
+    const previewSelection = getHistoryPreviewSelectionFromRoot(ctx.container);
+    if (previewSelection) {
+      writePreviewSelectionToClipboard(event, previewSelection);
+      return;
+    }
     if (!term.hasSelection()) return;
     const normalize = ctx.terminalSettingsRef.current?.normalizeTextOnCopy ?? true;
     if (!normalize) return; // let xterm write raw selectionText
@@ -712,6 +753,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     event.stopImmediatePropagation();
   };
   term.element?.addEventListener("copy", handleNativeCopy, true);
+  ctx.container.addEventListener("copy", handleNativeCopy, true);
 
   let webglLoaded = false;
   let runtimeDisposed = false;
@@ -898,15 +940,37 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   };
   let historyPreviewOverlay: HTMLPreElement | null = null;
   let historyPreviewTop: number | null = null;
+  let historyPreviewPointerDown: { clientX: number; clientY: number } | null = null;
   const hideHistoryPreview = () => {
-    historyPreviewOverlay?.remove();
+    if (!historyPreviewOverlay) {
+      historyPreviewPointerDown = null;
+      document.removeEventListener("copy", handlePreviewNativeCopy, true);
+      return;
+    }
+    historyPreviewOverlay.remove();
     historyPreviewOverlay = null;
     historyPreviewTop = null;
+    historyPreviewPointerDown = null;
+    document.removeEventListener("copy", handlePreviewNativeCopy, true);
+    term.focus();
+  };
+  const copyHistoryPreviewSelectionIfEnabled = () => {
+    if (!ctx.terminalSettingsRef.current?.copyOnSelect) return;
+    if (ctx.isRestoringSelectionRef?.current) return;
+    const selection = getHistoryPreviewSelectionFromRoot(ctx.container);
+    if (selection) {
+      void navigator.clipboard.writeText(selection).catch((err) => {
+        logger.warn("[XTerm] History preview copy-on-select failed:", err);
+      });
+    }
   };
   const ensureHistoryPreviewOverlay = () => {
     if (historyPreviewOverlay) return historyPreviewOverlay;
     const overlay = document.createElement("pre");
-    overlay.setAttribute("aria-hidden", "true");
+    overlay.setAttribute(HISTORY_PREVIEW_OVERLAY_ATTR, "");
+    overlay.setAttribute("role", "document");
+    overlay.addEventListener(HISTORY_PREVIEW_HIDE_EVENT, hideHistoryPreview);
+    document.addEventListener("copy", handlePreviewNativeCopy, true);
     Object.assign(overlay.style, {
       position: "absolute",
       inset: "0",
@@ -914,7 +978,10 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       margin: "0",
       padding: "0 6px",
       overflow: "hidden",
-      pointerEvents: "none",
+      pointerEvents: "auto",
+      userSelect: "text",
+      webkitUserSelect: "text",
+      cursor: "text",
       whiteSpace: "pre",
       fontFamily: String(term.options.fontFamily ?? fontFamily),
       fontSize: `${currentTerminalFontSize()}px`,
@@ -938,11 +1005,13 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     overlay.style.fontSize = `${currentTerminalFontSize()}px`;
     overlay.style.fontFamily = String(term.options.fontFamily ?? fontFamily);
     overlay.style.lineHeight = String(term.options.lineHeight ?? lineHeight);
-    overlay.textContent = getHistoryPreviewLines({
+    const previewRows = getHistoryPreviewRows({
       buffer: normalBuffer,
       rows: term.rows,
       top: historyPreviewTop,
-    }).join("\n");
+    });
+    overlay.textContent = previewRows.map((row) => row.text).join("\n");
+    overlay.setAttribute(HISTORY_PREVIEW_WRAP_ATTR, encodeHistoryPreviewWrapFlags(previewRows));
     return true;
   };
   const scrollForcedHistoryLines = (lines: number) => {
@@ -1423,6 +1492,8 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       markKittyCompositionPending(true);
     }
 
+    const previewSelection = getHistoryPreviewSelectionFromRoot(ctx.container);
+    const hasCopyableSelection = term.hasSelection() || Boolean(previewSelection);
     const forcedHistoryScrollPages = forcedHistoryScrollPagesForKey(e);
     if (forcedHistoryScrollPages !== null) {
       e.preventDefault();
@@ -1435,7 +1506,24 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       term.scrollPages(forcedHistoryScrollPages);
       return false;
     }
-    hideHistoryPreview();
+    const previewKeepAliveScheme = ctx.hotkeySchemeRef.current;
+    const previewKeepAliveIsMac =
+      previewKeepAliveScheme === "mac"
+      || (previewKeepAliveScheme === "disabled" && isMacPlatform());
+    const previewKeepAliveBindings = ctx.keyBindingsRef.current;
+    const previewKeepAliveAction =
+      previewKeepAliveScheme !== "disabled" && previewKeepAliveBindings.length > 0
+        ? checkAppShortcut(e, previewKeepAliveBindings, previewKeepAliveIsMac)?.action
+        : undefined;
+    if (
+      !shouldKeepHistoryPreviewOnKey(e, {
+        action: previewKeepAliveAction,
+        hasPreviewSelection: Boolean(previewSelection),
+        overlayVisible: Boolean(historyPreviewOverlay),
+      })
+    ) {
+      hideHistoryPreview();
+    }
 
     // Password prompt assist (sudo/su): while pending, Enter confirms the
     // selected/host password; arrows move the picker; Esc soft-dismisses (keeps
@@ -1489,7 +1577,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       // the interrupt path hard-aborts instead (#2191).
       if (
         e.key.length === 1
-        && !shouldUseUrgentTerminalInterrupt(e, { hasSelection: term.hasSelection() })
+        && !shouldUseUrgentTerminalInterrupt(e, { hasSelection: hasCopyableSelection })
       ) {
         sudoAutofill.cancelHint();
         // fall through: key becomes the first char of the manually typed password
@@ -1522,7 +1610,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         : null;
     if (
       (!kittySequenceForKeyDown || kittySequenceForKeyDown === "\x03") &&
-      shouldUseUrgentTerminalInterrupt(e, { hasSelection: term.hasSelection() })
+      shouldUseUrgentTerminalInterrupt(e, { hasSelection: hasCopyableSelection })
     ) {
       const id = ctx.sessionRef.current;
       if (id && ctx.statusRef.current === "connected") {
@@ -1650,14 +1738,18 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
           // No xterm selection: pass Ctrl+C through for SIGINT, and Cmd+C for
           // Kitty Super+C (nested TUIs). Other copy chords stay a safe no-op.
           const shouldForwardCopyToTerminal =
-            shouldPassThroughCopyShortcut(action, term.hasSelection(), e);
+            shouldPassThroughCopyShortcut(
+              action,
+              hasCopyableSelection,
+              e,
+            );
           if (shouldForwardCopyToTerminal && !kittySequenceForKeyDown) return true;
           if (!shouldForwardCopyToTerminal) {
             e.preventDefault();
             e.stopPropagation();
             switch (action) {
             case "copy": {
-              const selection = getTerminalSelectionForClipboard(
+              const selection = previewSelection || getTerminalSelectionForClipboard(
                 term,
                 ctx.terminalSettingsRef.current?.normalizeTextOnCopy ?? true,
               );
@@ -1672,12 +1764,13 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
               break;
             }
             case "pasteSelection": {
-              const selection = getTerminalSelectionForClipboard(
+              const selection = previewSelection || getTerminalSelectionForClipboard(
                 term,
                 ctx.terminalSettingsRef.current?.normalizeTextOnCopy ?? true,
               );
               const id = ctx.sessionRef.current;
               if (selection && id) {
+                hideHistoryPreview();
                 pasteTextIntoTerminal(term, selection, {
                   scrollOnPaste: shouldScrollOnTerminalPaste(ctx.terminalSettingsRef.current),
                   onPasteData: broadcastUserPasteData,
@@ -1686,6 +1779,10 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
               break;
             }
             case "selectAll": {
+              pulseCopyOnSelectUserCommand(term);
+              if (historyPreviewOverlay && selectHistoryPreviewAll(historyPreviewOverlay)) {
+                break;
+              }
               term.selectAll();
               break;
             }
@@ -1797,7 +1894,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         event: kittyEvent,
         fallbackToLegacy: true,
         urgentInterrupt: shouldUseUrgentTerminalInterrupt(e, {
-          hasSelection: term.hasSelection(),
+          hasSelection: hasCopyableSelection,
         }),
       });
       if (forwarded) {
@@ -1896,9 +1993,30 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     ctx.container.dispatchEvent(contextMenuEvent);
   };
 
+  const handleHistoryPreviewMouseDown = (event: MouseEvent) => {
+    if (isHistoryPreviewPointerTarget(event.target, historyPreviewOverlay)) {
+      if (event.button === 0) {
+        historyPreviewPointerDown = { clientX: event.clientX, clientY: event.clientY };
+      }
+      return;
+    }
+    if (!shouldHideHistoryPreviewOnMouseDown(event.target, historyPreviewOverlay)) return;
+    hideHistoryPreview();
+  };
+  const handleHistoryPreviewMouseUp = (event: MouseEvent) => {
+    const down = historyPreviewPointerDown;
+    historyPreviewPointerDown = null;
+    if (!down || !isHistoryPreviewPointerTarget(event.target, historyPreviewOverlay)) return;
+    if (isHistoryPreviewDismissClick(down, event)) {
+      hideHistoryPreview();
+      return;
+    }
+    copyHistoryPreviewSelectionIfEnabled();
+  };
   ctx.container.addEventListener("mousedown", captureMiddleClickTerminalMouseEvent, true);
   ctx.container.addEventListener("mouseup", captureMiddleClickTerminalMouseEvent, true);
-  ctx.container.addEventListener("mousedown", hideHistoryPreview, true);
+  ctx.container.addEventListener("mousedown", handleHistoryPreviewMouseDown, true);
+  ctx.container.addEventListener("mouseup", handleHistoryPreviewMouseUp, true);
   ctx.container.addEventListener("auxclick", handleMiddleClick);
 
   fitAddon.fit();
@@ -2157,6 +2275,25 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     return true;
   });
 
+  // OSC 9 / 777 / 99 — desktop notifications (Codex, iTerm2, rxvt, kitty)
+  const osc99Assembler = new Osc99Assembler();
+  const emitOscNotification = (notification: OscNotification | null) => {
+    if (!notification) return;
+    ctx.onOscNotification?.(notification);
+  };
+  const osc9Disposable = term.parser.registerOscHandler(9, (data) => {
+    emitOscNotification(parseOsc9Payload(data));
+    return true;
+  });
+  const osc777Disposable = term.parser.registerOscHandler(777, (data) => {
+    emitOscNotification(parseOsc777Payload(data));
+    return true;
+  });
+  const osc99Disposable = term.parser.registerOscHandler(99, (data) => {
+    emitOscNotification(osc99Assembler.consume(data));
+    return true;
+  });
+
   // OSC 52 — clipboard integration
   // Format: 52;<target>;<base64-data>  (write)  or  52;<target>;?  (query/read)
   // <target> is typically "c" (clipboard) or "p" (primary selection)
@@ -2303,6 +2440,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       resizeScheduler.dispose();
       webglController.dispose();
       term.element?.removeEventListener("copy", handleNativeCopy, true);
+      ctx.container.removeEventListener("copy", handleNativeCopy, true);
       ctx.container.removeEventListener(
         "wheel",
         handleForcedHistoryScrollWheel,
@@ -2316,7 +2454,8 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       ctx.container.removeEventListener("auxclick", handleMiddleClick);
       ctx.container.removeEventListener("mousedown", captureMiddleClickTerminalMouseEvent, true);
       ctx.container.removeEventListener("mouseup", captureMiddleClickTerminalMouseEvent, true);
-      ctx.container.removeEventListener("mousedown", hideHistoryPreview, true);
+      ctx.container.removeEventListener("mousedown", handleHistoryPreviewMouseDown, true);
+      ctx.container.removeEventListener("mouseup", handleHistoryPreviewMouseUp, true);
       hideHistoryPreview();
       historyPreviewBufferChangeDisposable.dispose();
       stopDprWatch();
@@ -2339,6 +2478,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       clearKittyTransientInputState();
       osc7Disposable.dispose();
       osc133Disposable.dispose();
+      osc9Disposable.dispose();
+      osc777Disposable.dispose();
+      osc99Disposable.dispose();
       osc52Disposable.dispose();
       titleChangeDisposable.dispose();
       bellDisposable.dispose();
