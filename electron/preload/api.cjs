@@ -819,6 +819,19 @@ function createPreloadApi(ctx) {
       sessionId,
       expectedEndpoint: options,
     });
+    if (
+      options?.requireExactSourceSession === true
+      && result.sourceSessionId !== sessionId
+    ) {
+      if (result.sftpId) {
+        try {
+          await ipcRenderer.invoke("netcatty:sftp:close", { sftpId: result.sftpId });
+        } catch {
+          // Best-effort cleanup before rejecting an invalid strict binding.
+        }
+      }
+      throw new Error("The requested terminal connection is no longer available");
+    }
     return result.sftpId;
   },
   listSftp: async (sftpId, path, encoding) => {
@@ -1522,6 +1535,12 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:tray:setCloseToTray", { enabled }),
   isCloseToTray: () =>
     ipcRenderer.invoke("netcatty:tray:isCloseToTray"),
+
+  // Auto Launch at system login (hidden to tray)
+  getAutoLaunch: () =>
+    ipcRenderer.invoke("netcatty:autoLaunch:get"),
+  setAutoLaunch: (enabled) =>
+    ipcRenderer.invoke("netcatty:autoLaunch:set", { enabled }),
 
   // App-level HTTP(S) network proxy (cloud sync / AI providers)
   setHttpNetworkProxy: (settings) =>
