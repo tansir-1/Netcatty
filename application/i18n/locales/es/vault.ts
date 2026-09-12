@@ -116,6 +116,11 @@ export const esVaultMessages: Messages = {
   'vault.import.securecrt.folderDesc': 'Importa todas las sesiones y conserva la estructura de carpetas.',
   'vault.import.securecrt.file': 'Archivo de sesión único',
   'vault.import.securecrt.fileDesc': 'Importa una sesión .ini de SecureCRT.',
+  'vault.import.finalshell.promptTitle': 'Importar desde FinalShell',
+  'vault.import.finalshell.folder': 'Carpeta conn',
+  'vault.import.finalshell.folderDesc': 'Importa todas las conexiones JSON y conserva la estructura de carpetas.',
+  'vault.import.finalshell.file': 'Archivo de conexión único',
+  'vault.import.finalshell.fileDesc': 'Importa una conexión JSON de FinalShell.',
   'vault.import.csv.tip': 'Importación masiva: usa la plantilla CSV.',
   'vault.import.csv.downloadTemplate': 'Descargar plantilla CSV',
   'vault.import.toast.start': 'Importando desde {format}...',
@@ -261,6 +266,8 @@ export const esVaultMessages: Messages = {
   'pf.deleteActive.confirm': 'Detener y eliminar',
   'pf.form.autoStart': 'Inicio automático',
   'pf.form.autoStartDesc': 'Inicia automáticamente esta regla cuando se abra la aplicación',
+  'pf.form.autoReconnect': 'Reconexión automática',
+  'pf.form.autoReconnectDesc': 'Vuelve a conectar automáticamente si se pierde la conexión',
 
   // SFTP
   'sftp.newFolder': 'Nueva carpeta',

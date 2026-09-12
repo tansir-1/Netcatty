@@ -59,6 +59,7 @@ import {
   updatePortForwardingRule,
   validatePortForwardingHost,
 } from '../../domain/portForwardingAgentOps';
+import { isPortForwardingAutoReconnectEnabled } from '../../domain/portForwardingReconnect';
 import { deleteGroup, upsertGroup } from '../../domain/vaultGroupAgentOps';
 import {
   remapSnippetTargetGroupPaths,
@@ -182,6 +183,7 @@ export function sanitizePortForwardRuleForAgent(rule: PortForwardingRule): Recor
     remotePort: rule.remotePort,
     hostId: rule.hostId,
     autoStart: rule.autoStart,
+    autoReconnect: rule.autoReconnect,
     status: rule.status,
     error: rule.error,
     createdAt: rule.createdAt,
@@ -808,7 +810,7 @@ export async function handleVaultAgentOp(
         if (!detected) {
           return {
             ok: false,
-            error: 'Could not detect import format. Specify csv, putty, mobaxterm, securecrt, or ssh_config.',
+            error: 'Could not detect import format. Specify csv, putty, mobaxterm, securecrt, finalshell, or ssh_config.',
           };
         }
         resolvedFormat = detected;
@@ -1393,7 +1395,7 @@ export async function handleVaultAgentOp(
         deps.keys,
         deps.identities,
         undefined,
-        false,
+        isPortForwardingAutoReconnectEnabled(rule),
         deps.terminalSettings,
         deps.knownHosts,
       );

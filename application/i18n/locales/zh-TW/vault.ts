@@ -644,6 +644,7 @@ export const zhTWVaultMessages: Messages = {
   'terminal.customTheme.group.bright': '標示色',
   'terminal.customTheme.color.background': '背景',
   'terminal.customTheme.color.foreground': '前景',
+  'terminal.customTheme.color.foregroundIntense': '高亮前景（粗體）',
   'terminal.customTheme.color.cursor': '游標',
   'terminal.customTheme.color.selection': '選區',
   'terminal.customTheme.color.black': '黑色',
@@ -979,6 +980,8 @@ export const zhTWVaultMessages: Messages = {
   'pf.deleteActive.confirm': '關閉並刪除',
   'pf.form.autoStart': '自動啟動',
   'pf.form.autoStartDesc': '應用程式啟動時自動開啟此規則',
+  'pf.form.autoReconnect': '自動重連',
+  'pf.form.autoReconnectDesc': '連線中斷後自動嘗試重新連線',
 
   // SFTP (pane + conflict)
   'sftp.pane.local': '本機',

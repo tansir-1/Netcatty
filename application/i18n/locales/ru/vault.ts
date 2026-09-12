@@ -154,6 +154,11 @@ export const ruVaultMessages: Messages = {
   'vault.import.securecrt.folderDesc': 'Импортировать все сеансы с сохранением структуры папок.',
   'vault.import.securecrt.file': 'Один файл сеанса',
   'vault.import.securecrt.fileDesc': 'Импортировать один файл сеанса SecureCRT .ini.',
+  'vault.import.finalshell.promptTitle': 'Импорт из FinalShell',
+  'vault.import.finalshell.folder': 'Папка conn',
+  'vault.import.finalshell.folderDesc': 'Импортировать все JSON-подключения с сохранением структуры папок.',
+  'vault.import.finalshell.file': 'Один файл подключения',
+  'vault.import.finalshell.fileDesc': 'Импортировать одно JSON-подключение FinalShell.',
   'vault.import.csv.tip': 'Массовый импорт: используйте шаблон CSV.',
   'vault.import.csv.downloadTemplate': 'Скачать шаблон CSV',
   'vault.import.toast.start': 'Импорт из {format}...',
@@ -299,6 +304,8 @@ export const ruVaultMessages: Messages = {
   'pf.deleteActive.confirm': 'Остановить и удалить',
   'pf.form.autoStart': 'Автозапуск',
   'pf.form.autoStartDesc': 'Автоматически запускать это правило при запуске приложения',
+  'pf.form.autoReconnect': 'Автопереподключение',
+  'pf.form.autoReconnectDesc': 'Автоматически восстанавливать соединение при обрыве',
 
   // SFTP
   'sftp.newFolder': 'Новая папка',

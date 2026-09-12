@@ -644,6 +644,7 @@ export const zhCNVaultMessages: Messages = {
   'terminal.customTheme.group.bright': '高亮色',
   'terminal.customTheme.color.background': '背景',
   'terminal.customTheme.color.foreground': '前景',
+  'terminal.customTheme.color.foregroundIntense': '高亮前景（粗体）',
   'terminal.customTheme.color.cursor': '光标',
   'terminal.customTheme.color.selection': '选区',
   'terminal.customTheme.color.black': '黑色',
@@ -979,6 +980,8 @@ export const zhCNVaultMessages: Messages = {
   'pf.deleteActive.confirm': '关闭并删除',
   'pf.form.autoStart': '自动启动',
   'pf.form.autoStartDesc': '应用启动时自动开启此规则',
+  'pf.form.autoReconnect': '自动重连',
+  'pf.form.autoReconnectDesc': '连接断开后自动尝试重新连接',
 
   // SFTP (pane + conflict)
   'sftp.pane.local': '本地',
