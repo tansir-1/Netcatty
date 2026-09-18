@@ -356,6 +356,9 @@ function createPreloadApi(ctx) {
         : undefined,
     });
   },
+  notifySessionUserInput: (sessionId) => {
+    ipcRenderer.send("netcatty:terminal:user-input", { sessionId });
+  },
   interruptSession: (sessionId, trace) => {
     const sanitizedTrace = sanitizeInterruptTrace(trace);
     if (ctx.terminalUrgentInputPorts?.postInterrupt?.(sessionId, sanitizedTrace)) {
@@ -1636,6 +1639,8 @@ function createPreloadApi(ctx) {
   },
 
   // Get file path from File object (for drag-and-drop)
+  startLocalFileDrag: (payload) => ipcRenderer.invoke("netcatty:local:drag-start", payload),
+  cancelLocalFileDrag: (requestId) => ipcRenderer.send("netcatty:local:drag-cancel", { requestId }),
   getPathForFile: (file) => {
     try {
       return webUtils.getPathForFile(file);
@@ -1801,6 +1806,9 @@ function createPreloadApi(ctx) {
   },
   externalMcpSetConfig: async (config) => {
     return ipcRenderer.invoke("netcatty:external-mcp:set-config", config || {});
+  },
+  externalMcpGetUniversalSetupPrompt: async () => {
+    return ipcRenderer.invoke("netcatty:external-mcp:get-universal-setup-prompt");
   },
   externalMcpCodexGetStatus: async () => {
     return ipcRenderer.invoke("netcatty:external-mcp:codex:get-status");
