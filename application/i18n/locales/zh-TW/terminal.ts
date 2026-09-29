@@ -285,6 +285,8 @@ export const zhTWTerminalMessages: Messages = {
   'settings.terminal.cursor.style.block': '塊',
   'settings.terminal.cursor.style.bar': '豎線',
   'settings.terminal.cursor.style.underline': '下劃線',
+  'settings.terminal.cursor.barWidth': '豎線游標粗細',
+  'settings.terminal.cursor.barWidth.desc': 'vi 等應用程式使用豎線游標時的寬度（1-4 像素）',
   'settings.terminal.cursor.blink': '游標閃爍',
   'settings.terminal.cursor.highlightLine': '高亮目前行',
   'settings.terminal.cursor.highlightLine.desc': '為游標所在行加上淡色背景，方便定位目前輸入位置',
@@ -344,7 +346,10 @@ export const zhTWTerminalMessages: Messages = {
     '在終端中按 Shift+Enter 時傳送設定的文字，而不是一般 Enter。',
   'settings.terminal.behavior.shiftEnterNewlineText': '傳送內容',
   'settings.terminal.behavior.shiftEnterNewlineText.desc':
-    '使用 \\n 表示換行，\\t 表示 Tab，\\\\ 表示反斜線。',
+    '使用 \\n 表示換行，\\t 表示 Tab，\\e 表示 ESC，\\\\ 表示反斜線。',
+  'settings.terminal.behavior.shiftEnterForceText': '在 Win32 輸入模式下也傳送文字',
+  'settings.terminal.behavior.shiftEnterForceText.desc':
+    '本機 Windows ConPTY 工作階段協商 Win32 輸入模式時，仍然傳送上面的文字。Node/Bun 寫的 CLI（Claude Code、CodeBuddy）讀不到主控台輸入記錄中的修飾鍵，需要這個開關才能區分 Shift+Enter。',
   'settings.terminal.behavior.clearWipesScrollback': '`clear` 同時清空捲動緩衝',
   'settings.terminal.behavior.clearWipesScrollback.desc':
     '`clear` 指令同時清空捲動緩衝（POSIX 預設行為）。關閉則保留歷史。',

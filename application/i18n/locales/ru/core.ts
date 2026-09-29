@@ -589,6 +589,8 @@ export const ruCoreMessages: Messages = {
   'settings.terminal.cursor.style.block': 'Блок',
   'settings.terminal.cursor.style.bar': 'Полоса',
   'settings.terminal.cursor.style.underline': 'Подчёркивание',
+  'settings.terminal.cursor.barWidth': 'Толщина курсора-полосы',
+  'settings.terminal.cursor.barWidth.desc': 'Ширина курсоров-полос, используемых приложениями вроде vi (1-4 пикс.)',
   'settings.terminal.cursor.blink': 'Мигание курсора',
   'settings.terminal.cursor.highlightLine': 'Подсветка текущей строки',
   'settings.terminal.cursor.highlightLine.desc':
@@ -656,7 +658,10 @@ export const ruCoreMessages: Messages = {
     'Отправлять настроенный текст вместо обычного Enter при нажатии Shift+Enter в терминале.',
   'settings.terminal.behavior.shiftEnterNewlineText': 'Отправляемый текст',
   'settings.terminal.behavior.shiftEnterNewlineText.desc':
-    'Используйте \\n для перевода строки, \\t для табуляции и \\\\ для обратной косой черты.',
+    'Используйте \\n для перевода строки, \\t для табуляции, \\e для Escape и \\\\ для обратной косой черты.',
+  'settings.terminal.behavior.shiftEnterForceText': 'Отправлять текст и в режиме ввода Win32',
+  'settings.terminal.behavior.shiftEnterForceText.desc':
+    'Отправлять указанный выше текст даже когда локальная сессия Windows ConPTY согласует режим ввода Win32. Нужно для CLI на Node/Bun (Claude Code, CodeBuddy), которые не читают модификаторы из записей ввода консоли.',
   'settings.terminal.behavior.clearWipesScrollback': '`clear` очищает буфер прокрутки',
   'settings.terminal.behavior.clearWipesScrollback.desc':
     'Команда `clear` также будет очищать буфер прокрутки (поведение POSIX по умолчанию). Отключите, чтобы история оставалась видимой после `clear`.',
