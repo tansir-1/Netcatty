@@ -38,6 +38,7 @@ import {
 } from "../../../domain/credentials";
 import { resolveBridgeSshAgentAuth, resolveHostAuth } from "../../../domain/sshAuth";
 import {
+  hostRestrictsExtraSshChannels,
   resolveHostKeepalive,
   resolveTelnetPassword,
   resolveTelnetPort,
@@ -726,7 +727,7 @@ export const createTerminalSessionStarters = (ctx: TerminalSessionStartersContex
           // Only an explicit Copy/Split may share an existing login. Ordinary
           // opens and reconnects must authenticate again to refresh remote groups.
           reuseTransport: sourceSessionId ? undefined : false,
-          skipShellPidDiscovery: ctx.isNetworkDevice === true,
+          skipShellPidDiscovery: ctx.isNetworkDevice === true || hostRestrictsExtraSshChannels(ctx.host),
         });
         if (!requiresFreshSshConnection) {
           ctx.onConnectAutomationSnapshotCommitted?.();
