@@ -698,6 +698,9 @@ function createStartSessionApi(ctx) {
         if (streamExitSignal && sessions.get(sessionId) === session) {
           session._remoteExitSignal = streamExitSignal;
         }
+        if (streamExited && sessions.get(sessionId) === session) {
+          session._remoteExitCode = streamExitCode;
+        }
       });
 
       let closeFinalized = false;
@@ -2478,6 +2481,16 @@ function createStartSessionApi(ctx) {
           });
 
           conn.on("error", (err) => {
+            // ssh2 reports agent failures before trying the next auth method.
+            // Keep the connection and its authentication deadline alive.
+            if (err.level === "agent") {
+              log("non-fatal agent auth error (will try next method)", {
+                sessionId,
+                hostname: options.hostname,
+                error: err.message,
+              });
+              return;
+            }
             clearAuthReadyTimer();
             // After the promise is settled, we can't reject again. But if the
             // session was already established (resolved), we still need to notify
@@ -2664,12 +2677,16 @@ function createStartSessionApi(ctx) {
                   idleTimedOut: false,
                 }));
               } else {
-                safeSendSessionExit({ safeSend, electronModule, sessions }, contents, sessionId, {
+                // Preserve a shell status already received before transport
+                // close; otherwise do not invent a successful exit code.
+                const shellExited = typeof session?._remoteExitCode === "number";
+                safeSendSessionExit({ safeSend, electronModule, sessions }, contents, sessionId, buildRemoteShellExitPayload({
                   sessionId,
-                  exitCode: 0,
-                  reason: "closed",
-                  _terminalSessionGeneration: session?._terminalSessionGeneration,
-                });
+                  generation: session?._terminalSessionGeneration,
+                  exitCode: session?._remoteExitCode,
+                  shellExited,
+                  idleTimedOut: shellExited && looksLikeIdleAutoLogout(session?._promptTrackTail),
+                }));
               }
               // Use this connection's captured token so a late close from an
               // old transport can't stop a newer same-sessionId stream (#916).
