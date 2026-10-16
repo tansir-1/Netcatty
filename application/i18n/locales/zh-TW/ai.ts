@@ -1,6 +1,7 @@
 import type { Messages } from '../types';
 
 export const zhTWAiMessages: Messages = {
+  'ai.chat.attachmentContentUnavailable': '附件內容未保留在此裝置',
   // AI Settings
   'ai.agentSettings': 'Agent 設定',
   'ai.chat.preparing': '準備中…',
@@ -503,6 +504,10 @@ export const zhTWAiMessages: Messages = {
   'ai.chat.pinModel': '釘選模型',
   'ai.chat.unpinModel': '取消釘選',
   'ai.chat.loadingModels': '正在載入模型...',
+  'ai.chat.modelCatalogSourceLive': '即時目錄',
+  'ai.chat.modelCatalogSourceCached': '快取 · 上次成功 {time}',
+  'ai.chat.modelCatalogSourceCachedNoTime': '快取',
+  'ai.chat.modelCatalogSourcePresets': '內建預設清單',
   'ai.chat.noMatchingModels': '沒有符合的模型',
   'ai.chat.recent': '最近',
   'ai.chat.viewAll': '檢視全部',

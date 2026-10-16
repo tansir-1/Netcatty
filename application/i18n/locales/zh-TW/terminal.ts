@@ -63,6 +63,10 @@ export const zhTWTerminalMessages: Messages = {
   'history.action.run': '在終端執行',
   'history.action.saveAsSnippet': '儲存為程式碼片段',
   'history.action.delete': '從歷史記錄中刪除',
+  'history.action.clearAll': '清空全部歷史',
+  'history.clearAll.dialog.title': '清空全部指令歷史？',
+  'history.clearAll.dialog.desc': '這將永久刪除所有本機記錄的指令歷史及自動補全建議，且無法復原。',
+  'history.clearAll.dialog.confirm': '全部清空',
   // SFTP File Opener
   'sftp.context.copyPath': '複製檔案路徑',
   'sftp.context.openWith': '開啟方式...',
@@ -594,6 +598,7 @@ export const zhTWTerminalMessages: Messages = {
   'settings.shortcuts.binding.new-workspace': '新增工作區',
   'settings.shortcuts.binding.snippets': '開啟程式碼片段',
   'settings.shortcuts.binding.broadcast': '切換廣播模式',
+  'settings.shortcuts.binding.toggle-opacity': '切換視窗透明度',
   'settings.shortcuts.binding.toggle-side-panel': '切換側邊欄',
   'settings.shortcuts.binding.sftp-copy': '複製檔案',
   'settings.shortcuts.binding.sftp-cut': '剪下檔案',

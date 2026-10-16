@@ -42,6 +42,7 @@ import { resolveHostDefaultLocalShell } from '../../domain/localShellHost';
 import { resolveGroupDefaults, applyGroupDefaults } from '../../domain/groupConfig';
 import { upsertKnownHost } from '../../domain/knownHosts';
 import { materializeHostProxyProfile } from '../../domain/proxyProfiles';
+import { useVaultHostDeletion } from '../state/useVaultHostDeletion';
 import { buildSshDeepLinkConnectionHost, buildSshDeepLinkEphemeralHost, buildSshDeepLinkEphemeralHostFromSaved, buildSshDeepLinkHostDraft, findSshDeepLinkHost, parseSshDeepLink } from '../../domain/sshDeepLink';
 import { buildTelnetDeepLinkConnectionHost, buildTelnetDeepLinkEphemeralHostFromSaved, buildTelnetDeepLinkOpenHost, findTelnetDeepLinkHost, materializeTelnetDeepLinkMatchHost, parseTelnetDeepLink } from '../../domain/telnetDeepLink';
 import { buildJmsDeepLinkEphemeralHost, isSupportedJmsProtocol, parseJmsDeepLink } from '../../domain/jmsDeepLink';
@@ -151,6 +152,7 @@ export function AppSideEffects() {
     showSftpTab,
     shellOnlyTabNumberShortcuts,
     workspaceFocusStyle,
+    toggleWindowOpacity,
   } = settings;
 
   // Always publish terminal keyboard focus to the main process. When font zoom
@@ -1079,6 +1081,7 @@ export function AppSideEffects() {
       canUseGlobalBroadcast: canUseGlobalBroadcastRef.current,
       toggleScriptsSidePanelRef,
       toggleSidePanelRef,
+      toggleWindowOpacity,
       toggleWorkspaceViewMode,
       workspaces: workspacesRefForHotkeys.current,
     }), action, e);
@@ -1091,6 +1094,7 @@ export function AppSideEffects() {
     splitSessionWithCurrentShell,
     moveFocusInWorkspace,
     toggleBroadcast,
+    toggleWindowOpacity,
     toggleGlobalBroadcast,
     toggleWorkspaceViewMode,
     confirmIfBusyLocalTerminal,
@@ -1196,11 +1200,16 @@ export function AppSideEffects() {
     setDeleteHostConfirm({ hostId, name: target?.label || hostId });
   }, [hosts]);
 
-  const handleConfirmDeleteHost = useCallback(() => {
+  const deleteVaultHosts = useVaultHostDeletion(commitVaultGroupMutation);
+  const handleConfirmDeleteHost = useCallback(async () => {
     if (!deleteHostConfirm) return;
-    updateHosts(hosts.filter(h => h.id !== deleteHostConfirm.hostId));
-    setDeleteHostConfirm(null);
-  }, [deleteHostConfirm, hosts, updateHosts]);
+    try {
+      await deleteVaultHosts([deleteHostConfirm.hostId]);
+      setDeleteHostConfirm(null);
+    } catch {
+      toast.error(t('common.error'));
+    }
+  }, [deleteHostConfirm, deleteVaultHosts, t]);
 
   const handleCancelDeleteHost = useCallback(() => {
     setDeleteHostConfirm(null);

@@ -1,6 +1,7 @@
 import type { Messages } from '../types';
 
 export const esAiMessages: Messages = {
+  'ai.chat.attachmentContentUnavailable': 'Contenido no disponible en este dispositivo',
   // AI Settings
   'ai.agentSettings': 'Configuración del agente',
   'ai.chat.preparing': 'Preparando…',
@@ -504,6 +505,10 @@ export const esAiMessages: Messages = {
   'ai.chat.pinModel': 'Fijar modelo',
   'ai.chat.unpinModel': 'Quitar modelo fijado',
   'ai.chat.loadingModels': 'Cargando modelos...',
+  'ai.chat.modelCatalogSourceLive': 'Catálogo en vivo',
+  'ai.chat.modelCatalogSourceCached': 'En caché · último éxito {time}',
+  'ai.chat.modelCatalogSourceCachedNoTime': 'En caché',
+  'ai.chat.modelCatalogSourcePresets': 'Lista predeterminada integrada',
   'ai.chat.noMatchingModels': 'No hay modelos coincidentes',
   'ai.chat.recent': 'Recientes',
   'ai.chat.viewAll': 'Ver todo',

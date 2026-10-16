@@ -1,6 +1,7 @@
 import type { Messages } from '../types';
 
 export const ruAiMessages: Messages = {
+  'ai.chat.attachmentContentUnavailable': 'Содержимое недоступно на этом устройстве',
   'ai.chat.contextUsage': 'Контекст: {used} / {max} токенов',
   // AI Settings
   'ai.agentSettings': 'Настройки агента',
@@ -460,6 +461,10 @@ export const ruAiMessages: Messages = {
   'ai.chat.pinModel': 'Закрепить модель',
   'ai.chat.unpinModel': 'Открепить модель',
   'ai.chat.loadingModels': 'Загрузка моделей...',
+  'ai.chat.modelCatalogSourceLive': 'Актуальный список моделей',
+  'ai.chat.modelCatalogSourceCached': 'Кэш · обновлён {time}',
+  'ai.chat.modelCatalogSourceCachedNoTime': 'Кэш',
+  'ai.chat.modelCatalogSourcePresets': 'Встроенный список моделей',
   'ai.chat.noMatchingModels': 'Нет подходящих моделей',
   'ai.chat.recent': 'Недавние',
   'ai.chat.viewAll': 'Показать всё',
