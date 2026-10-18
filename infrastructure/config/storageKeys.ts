@@ -296,8 +296,6 @@ export const STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB = 'netcatty_local_
 export const STORAGE_KEY_WORKSPACE_FOCUS_SIDEBAR_WIDTH = 'netcatty_workspace_focus_sidebar_width';
 export const STORAGE_KEY_TERMINAL_HOST_TREE_WIDTH = 'netcatty_terminal_host_tree_width_v1';
 export const STORAGE_KEY_TERMINAL_HOST_TREE_COLLAPSED = 'netcatty_terminal_host_tree_collapsed_v1';
-/** Terminal scripts side panel library: 'list' vs 'stacked' view mode. */
-export const STORAGE_KEY_SCRIPTS_SIDE_PANEL_VIEW = 'netcatty:scripts:sidePanelView';
 export const STORAGE_KEY_TERMINAL_COMPOSE_BAR_OPEN = 'netcatty_terminal_compose_bar_open_v1';
 /** Opt-in "broadcast without password protection" switch (terminal compose bar, issue #3488). */
 export const STORAGE_KEY_TERMINAL_BROADCAST_PASSWORD_BYPASS = 'netcatty_terminal_broadcast_password_bypass_v1';
@@ -320,3 +318,9 @@ export const STORAGE_KEY_AVAILABLE_PLUGIN_SYNC_PROVIDERS = 'netcatty_available_p
 // Debug Flags (no _v1 suffix — developer-only, not persisted data)
 export const STORAGE_KEY_DEBUG_HOTKEYS = 'debug.hotkeys';
 export const STORAGE_KEY_DEBUG_UPDATE_DEMO = 'debug.updateDemo';
+
+// Portable monitor configuration. Runtime samples never use storage.
+export const STORAGE_KEY_MONITOR_PANELS = 'netcatty_monitor_panels_v1';
+export const STORAGE_KEY_MONITOR_TABLE_COLUMNS = 'netcatty_monitor_table_columns_v1';
+
+export const STORAGE_KEY_MONITOR_HIDDEN_COLUMNS = "netcatty_monitor_hidden_columns_v1";

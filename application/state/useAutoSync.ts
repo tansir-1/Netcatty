@@ -1,3 +1,5 @@
+import { readMonitorPanels } from './monitorPanelsStorage';
+import { STORAGE_KEY_MONITOR_PANELS } from '../../infrastructure/config/storageKeys';
 /**
  * useAutoSync - Auto-sync Hook for Cloud Sync
  * 
@@ -151,6 +153,7 @@ const isRestoreInProgress = (): boolean => {
 
 const getSyncPayloadDataHash = (payload: SyncPayload): string => {
   return JSON.stringify({
+    monitorPanels: payload.monitorPanels,
     hosts: sanitizeHostsForSync(payload.hosts),
     keys: payload.keys,
     identities: payload.identities,
@@ -261,7 +264,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
       const chatChanged = key === STORAGE_KEY_AI_SESSIONS
         && localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled === true;
       if (!SYNCABLE_SETTING_STORAGE_KEY_SET.has(key)
-        && key !== STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS && !chatChanged) return;
+        && key !== STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS && key !== STORAGE_KEY_MONITOR_PANELS && !chatChanged) return;
       setSyncableSettingsStorageVersion((v) => v + 1);
     };
 
@@ -283,6 +286,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
 
   const getSyncSnapshot = useCallback(() => {
     return {
+      monitorPanels: readMonitorPanels(),
       hosts: sanitizeHostsForSync(config.hosts),
       keys: config.keys,
       identities: config.identities,
@@ -599,7 +603,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     getDataHashRef.current = getDataHash;
   }, [getDataHash]);
 
-  const refreshPendingLocalSync = useCallback(async () => {
+  const refreshPendingLocalSync = useCallback(async (isCurrent = () => true) => {
     if (
       !enabled
       || convergentSyncPaused
@@ -614,6 +618,7 @@ export const useAutoSync = (config: AutoSyncConfig) => {
     }
     try {
       const currentHash = await getDataHashRef.current();
+      if (!isCurrent()) return;
       const hashDecision = resolveAutoSyncHashDecision({
         currentHash,
         lastSyncedHash: lastSyncedDataRef.current,
@@ -1144,13 +1149,27 @@ export const useAutoSync = (config: AutoSyncConfig) => {
 
   // Reflect unsynced local edits in the top-bar cloud indicator.
   useEffect(() => {
-    void refreshPendingLocalSync();
+    if (!enabled || convergentSyncPaused || !sync.hasAnyConnectedProvider || !sync.isUnlocked) {
+      manager.setPendingLocalSync(false);
+      return;
+    }
+    // Collecting the pending hash builds the same full payload as an upload.
+    // Let rapid edits settle before doing that work, even with auto-sync off.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void refreshPendingLocalSync(() => !cancelled);
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [
     refreshPendingLocalSync,
     getDataHash,
     sync.hasAnyConnectedProvider,
     sync.isUnlocked,
     sync.isSyncing,
+    convergentSyncPaused,
     config.settingsVersion,
     enabled,
     bookmarksVersion,
