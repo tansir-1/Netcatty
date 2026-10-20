@@ -352,7 +352,7 @@ export const zhCNTerminalMessages: Messages = {
     '在终端中按 Shift+Enter 时发送配置的文本，而不是普通回车。',
   'settings.terminal.behavior.shiftEnterNewlineText': '发送内容',
   'settings.terminal.behavior.shiftEnterNewlineText.desc':
-    '使用 \\n 表示换行，\\t 表示 Tab，\\e 表示 ESC，\\\\ 表示反斜杠。',
+    '使用 \\n 表示换行，\\t 表示 Tab，\\e 表示 ESC，\\\\ 表示反斜杠。默认 \\e\\r（ESC+回车，传统 Alt+Enter 编码），大多数 TUI CLI 会将其识别为换行。',
   'settings.terminal.behavior.shiftEnterForceText': '在 Win32 输入模式下也发送文本',
   'settings.terminal.behavior.shiftEnterForceText.desc':
     '本机 Windows ConPTY 会话协商 Win32 输入模式时，仍然发送上面的文本。Node/Bun 写的 CLI（Claude Code、CodeBuddy）读不到控制台输入记录里的修饰键，需要这个开关才能区分 Shift+Enter。',
@@ -454,6 +454,9 @@ export const zhCNTerminalMessages: Messages = {
   'settings.terminal.localShell.startDir.notFound': '目录不存在',
   'settings.terminal.localShell.startDir.isFile': '路径是文件，不是目录',
   'settings.terminal.section.connection': '连接',
+  'settings.terminal.connection.defaultProxy': '默认代理',
+  'settings.terminal.connection.defaultProxy.desc': '主机没有单独设置、也没有从分组继承代理时使用的已保存代理。选择“无”则直接连接。',
+  'settings.terminal.connection.defaultProxy.none': '无',
   'settings.terminal.connection.sshAutoReconnectEnabled': 'SSH 断线后自动重连',
   'settings.terminal.connection.sshAutoReconnectEnabled.desc': '打开后，已连上的 SSH 会话意外断开时会每 5 秒尝试重新连接，直到关闭标签页或连接恢复。',
   'settings.terminal.connection.keepaliveInterval': '会话保持间隔',
