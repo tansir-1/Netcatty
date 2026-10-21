@@ -59,7 +59,7 @@ import { MULTILINE_PASTE_CONFIRM_MIN_LINES_DEFAULT } from "../domain/terminalPas
 import { isPluginHostProtocol } from "../domain/pluginConnection";
 import { clearTerminalBootEpoch, setTerminalBootEpoch } from "../domain/terminalBootEpoch";
 import {
-  appendTerminalPromptSecurityTail,
+  foldTerminalPromptSecurityOutput,
   isConfirmedTerminalShellPrompt,
   isUntrustedTerminalInputPrompt,
 } from "../domain/terminalPromptSecurity";
@@ -163,7 +163,10 @@ import {
 import { clearKittyKeyboardBroadcastSession } from "./terminal/runtime/kittyKeyboardBroadcast";
 import { registerTerminalSensitiveInputReader } from "./terminal/runtime/terminalSensitiveInputRegistry";
 import { registerTerminalCommandInjectionReadyReader } from "./terminal/runtime/terminalCommandInjectionReadyRegistry";
-import { isIdleShellReadyForCommandInjection } from "../domain/terminalCommandInjectionReady";
+import {
+  isIdleShellReadyForCommandInjection,
+  isShellPromptReadyForInsertion,
+} from "../domain/terminalCommandInjectionReady";
 import { detectPrompt } from "./terminal/autocomplete/promptDetector";
 import type { SensitiveInputActiveRef } from "./terminal/autocomplete/terminalAutocompletePrompt";
 import {
@@ -449,6 +452,8 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   ), [sessionId]);
   useEffect(() => () => clearTerminalBroadcastUserInput(sessionId), [sessionId]);
   const sensitivePromptOutputTailRef = useRef("");
+  const heredocPromptOriginRef = useRef("");
+  const promptSecurityPendingCrRef = useRef(false);
   const [activeScriptRun, setActiveScriptRun] = useState<import('@/types/global/netcatty-bridge-script.d.ts').ScriptRun | undefined>(undefined);
   const dismissedScriptRunIdsRef = useRef(new Set<string>());
 
@@ -600,18 +605,21 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const onTerminalDataCaptureRef = useRef(onTerminalDataCapture);
   const onSessionExitRef = useRef(onSessionExit);
   const commandBufferRef = useRef<string>("");
-  useEffect(() => registerTerminalCommandInjectionReadyReader(sessionId, () => {
+  useEffect(() => registerTerminalCommandInjectionReadyReader(sessionId, (options) => {
     const term = termRef.current;
     if (!term) return false;
     const prompt = detectPrompt(term);
-    return isIdleShellReadyForCommandInjection({
+    const readiness = {
       sensitiveInputActive: passwordPromptActiveRef.current,
       hasLiveTerminal: true,
       alternateScreenActive: isTerminalAlternateScreenActive(term),
       isAtPrompt: prompt.isAtPrompt,
       userInputLength: prompt.userInput.length,
       pendingTypedInputLength: commandBufferRef.current.length,
-    });
+    };
+    return options?.allowDraft
+      ? isShellPromptReadyForInsertion(readiness)
+      : isIdleShellReadyForCommandInjection(readiness);
   }), [sessionId]);
   const promptLineBreakStateRef = useRef<PromptLineBreakState>(createPromptLineBreakState());
   const [hasMouseTracking, setHasMouseTracking] = useState(false);
@@ -2005,10 +2013,14 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     chunk: string,
     meta?: TerminalSessionDataMeta,
   ) => {
-    sensitivePromptOutputTailRef.current = appendTerminalPromptSecurityTail(
-      sensitivePromptOutputTailRef.current,
-      chunk,
-    );
+    const folded = foldTerminalPromptSecurityOutput({
+      origin: heredocPromptOriginRef.current,
+      current: sensitivePromptOutputTailRef.current,
+      pendingCr: promptSecurityPendingCrRef.current,
+    }, chunk);
+    heredocPromptOriginRef.current = folded.origin;
+    sensitivePromptOutputTailRef.current = folded.current;
+    promptSecurityPendingCrRef.current = folded.pendingCr;
     const promptSecurityOptions = {
       allowHostStyleGreaterThan: isNetworkDevice,
       alternateScreen: termRef.current
@@ -2024,17 +2036,19 @@ const TerminalComponent: React.FC<TerminalProps> = ({
         autocompleteCloseRef.current?.();
       } else {
         sensitivePromptOutputTailRef.current = "";
+        heredocPromptOriginRef.current = "";
+        promptSecurityPendingCrRef.current = false;
       }
       return;
     } else if (isUntrustedTerminalInputPrompt(
-      sensitivePromptOutputTailRef.current,
+      folded.promptText,
       promptSecurityOptions,
     )) {
       passwordPromptActiveRef.current = true;
       passwordPromptActiveRef.source = "heuristic";
       autocompleteCloseRef.current?.();
     } else if (isConfirmedTerminalShellPrompt(
-      sensitivePromptOutputTailRef.current,
+      folded.promptText,
       promptSecurityOptions,
     )) {
       passwordPromptActiveRef.current = false;
@@ -2350,6 +2364,8 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   }), []);
 
   const xTermRuntimeContextRef = useRef<Omit<CreateXTermRuntimeContext, "container" | "initiallyVisible"> | null>(null);
+  const archiveHostRef = useRef(host);
+  archiveHostRef.current = host;
   const pluginDecorationRulesRef = useRef<readonly PluginTerminalDecorationRule[]>(Object.freeze([]));
   const pluginDecorationRefreshRef = useRef<(reason: string) => void>(() => {});
 
@@ -4345,6 +4361,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
 
   xTermRuntimeContextRef.current = {
     host,
+    getHost: () => archiveHostRef.current,
     fontFamilyId,
     resolvedFontFamily,
     fontSize: effectiveFontSize,

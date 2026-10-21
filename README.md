@@ -10,6 +10,12 @@
 </p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/18391?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-18391" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/18391/daily?language=TypeScript" alt="binaricat/Netcatty | Trendshift" width="250" height="55"/>
+  </a>
+</p>
+
+<p align="center">
   A beautiful, feature-rich SSH workspace built with Electron, React, and xterm.js.<br/>
   🔥 Built-in AI Agent · Split terminals · Vault views · SFTP workflows · Custom themes — all in one.
 </p>
@@ -133,6 +139,7 @@ If you regularly work with a fleet of servers, Netcatty is built for speed and f
 - **Session management** — run multiple connections side-by-side
 - **Save current screen** — right-click a terminal to save the visible final text, without replaying keystrokes or overwritten output; scroll first to save an earlier screen.
 - **Inline images** — render Kitty graphics, SIXEL and iTerm inline images from remote programs
+- **Archive shortcuts** — on Linux sessions, Ctrl/Cmd+click a printed `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz` or `.zip` name to fill an extraction command with the archive's absolute path into the prompt (kept next to any typed text); press Enter to run it. Names relative to the current directory need directory tracking (OSC 7, see the toolbar's Configure directory tracking); absolute paths always work. Windows, WSL, and macOS sessions are excluded.
 
 ### 📁 SFTP + Built-in Editor
 - **File workflows** — drag & drop uploads/downloads

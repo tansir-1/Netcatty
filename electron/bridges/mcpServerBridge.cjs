@@ -63,6 +63,9 @@ const DISCOVERY_SELF_HEAL_INTERVAL_MS = 15000;
 
 // Track which sockets have completed authentication
 const authenticatedSockets = new WeakSet();
+const managedPrivacyScopes = new WeakMap();
+const aiPrivacyService = require("../shared/aiPrivacyService.cjs");
+const { createManagedPrivacyBoundary } = require("../shared/managedPrivacyBoundary.cjs");
 // Sockets authenticated with the External MCP token (or that used the reserved scope).
 const externalMcpSockets = new Set();
 const sessionApprovedExternalSockets = new WeakSet();
@@ -81,6 +84,19 @@ function markExternalMcpSocket(socket) {
     socket.once("end", cleanup);
     socket.once("error", cleanup);
   }
+}
+
+function attachExternalMcpClient(client) {
+  markExternalMcpSocket(client);
+  return () => {
+    if (!client || client.destroyed) return;
+    client.destroyed = true;
+    try {
+      client.emit?.("close");
+    } catch {
+      // Synthetic HTTP clients may not be emitters.
+    }
+  };
 }
 
 function issueExternalMcpAuthToken() {
@@ -1427,7 +1443,7 @@ async function handleMessage(socket, line) {
   }
 
   const { id, method, params } = msg;
-  debugLog("handleMessage", { id, method, params });
+  debugLog("handleMessage", { id, method });
   if (id == null || !method) return;
 
   // ── Authentication gate ──
@@ -1500,9 +1516,25 @@ async function handleMessage(socket, line) {
       );
     }
     notifyExternalMcpActivity(method, callParams);
-    const result = await dispatch(method, callParams, {
-      externalSocket: externalMcpSockets.has(socket) ? socket : null,
-    });
+    let result;
+    if (isExternalScope || externalMcpSockets.has(socket)) {
+      result = await dispatch(method, callParams, {
+        externalSocket: socket,
+        beforeExecute: aiPrivacyService.createPolicyGuard(),
+      });
+    } else {
+      const boundScope = managedPrivacyScopes.get(socket);
+      if (boundScope && boundScope !== callParams.chatSessionId) {
+        throw new Error("Managed agent connection cannot change its chat session.");
+      }
+      if (aiPrivacyService.isEnabled() && callParams.chatSessionId) {
+        managedPrivacyScopes.set(socket, callParams.chatSessionId);
+      }
+      result = await createManagedPrivacyBoundary(
+        (rpcMethod, rpcParams, context) => dispatch(rpcMethod, rpcParams, context),
+        aiPrivacyService,
+      )(method, callParams);
+    }
     const response = JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n";
     if (!socket.destroyed) socket.write(response);
   } catch (err) {
@@ -1776,7 +1808,7 @@ function buildTerminalToolGuidance(toolHints) {
   return "";
 }
 
-async function handleWorkerTerminalExec(params = {}) {
+async function handleWorkerTerminalExec(params = {}, beforeExecute) {
   const { sessionId, command } = params;
   if (!sessionId || !command) throw new Error("sessionId and command are required");
   if (typeof command !== "string" || !command.trim()) {
@@ -1824,7 +1856,7 @@ async function handleWorkerTerminalExec(params = {}) {
       sessionMeta: meta,
       enforceWallTimeout: true,
       commandBlocklist,
-    }, {});
+    }, typeof beforeExecute === "function" ? { beforeExecute } : {});
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
   } finally {
@@ -1833,7 +1865,7 @@ async function handleWorkerTerminalExec(params = {}) {
   }
 }
 
-async function handleWorkerJobStart(params = {}) {
+async function handleWorkerJobStart(params = {}, beforeExecute) {
   const { sessionId, command } = params;
   if (!sessionId || !command) throw new Error("sessionId and command are required");
   if (typeof command !== "string" || !command.trim()) {
@@ -1875,7 +1907,7 @@ async function handleWorkerJobStart(params = {}) {
       commandTimeoutMs,
       sessionMeta: meta,
       commandBlocklist,
-    }, {});
+    }, typeof beforeExecute === "function" ? { beforeExecute } : {});
     if (result?.ok && result.jobId) {
       if (pendingStart.cancelled || closingTerminalSessions.has(sessionId)) {
         await waitForWorkerCleanup(terminalWorkerManager.request("netcatty:ai:jobStop", {
@@ -2223,11 +2255,14 @@ async function dispatch(method, params, approvalContext = {}) {
     if (!handler) {
       throw new Error(`Unknown method: ${method}`);
     }
+    // Approval may have waited across a privacy-policy change. Check at execution,
+    // not only when the managed request entered the dispatcher.
+    approvalContext.beforeExecute?.();
     if (capability?.id === "terminal.execute" && params?.sessionId && !sessions?.get?.(params.sessionId)) {
-      return await handleWorkerTerminalExec(params);
+      return await handleWorkerTerminalExec(params, approvalContext.beforeExecute);
     }
     if (capability?.id === "terminal.start" && params?.sessionId && !sessions?.get?.(params.sessionId)) {
-      return await handleWorkerJobStart(params);
+      return await handleWorkerJobStart(params, approvalContext.beforeExecute);
     }
     if (capability?.id === "terminal.poll" && workerBackgroundJobs.has(params?.jobId)) {
       return await handleWorkerJobPoll(params);
@@ -2235,7 +2270,7 @@ async function dispatch(method, params, approvalContext = {}) {
     if (capability?.id === "terminal.stop" && workerBackgroundJobs.has(params?.jobId)) {
       return await handleWorkerJobStop(params);
     }
-    return await handler(params);
+    return await handler(params, approvalContext);
   } finally {
     if (activityStarted) {
       sessionIdleManager.endActivity(params?.chatSessionId, params.sessionId);
@@ -2549,6 +2584,7 @@ module.exports = {
   setExternalMcpHooks,
   disconnectExternalMcpClients,
   issueExternalMcpAuthToken,
+  attachExternalMcpClient,
   revokeExternalMcpAuthToken,
   getExternalMcpAuthToken,
   syncLiveSessionsToExternalScope,

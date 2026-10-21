@@ -177,6 +177,13 @@ export interface NetcattyAiBridge {
     mode?: 'temporary' | 'persistent';
     idleTimeoutMinutes?: number;
     sessionIdleTimeoutMinutes?: number;
+    redaction?: import("../../../../application/state/useExternalMcpToggleState").ExternalMcpRedactionSettings;
+    httpEnabled?: boolean;
+    httpPort?: number;
+    httpAllowCustomBind?: boolean;
+    httpListenAddress?: string;
+    httpClientHost?: string;
+    rotateHttpToken?: boolean;
   }) => Promise<Record<string, unknown>>;
   externalMcpGetUniversalSetupPrompt?: () => Promise<{
     ok: boolean;

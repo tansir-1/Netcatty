@@ -785,6 +785,7 @@ Vaults 标签保持扁平，不使用这块背景。
   'vault.hosts.moveSelected': '移动到分组 ({count})',
   'vault.hosts.moveSelected.description': '将选中的主机移动到现有分组，也可移出分组。选中的分组本身不会移动。',
   'vault.hosts.moveMultiple.success': '已将 {count} 个主机移动到 {group}',
+  'vault.hosts.dragSelectionCount': '{count} 个主机',
   'vault.hosts.moveToGroup.success': '已将 {host} 移动到 {group}',
   'vault.hosts.errors.nameRequired': '主机名称不能为空。',
   'vault.hosts.empty.title': '设置你的主机',
@@ -1139,6 +1140,10 @@ Vaults 标签保持扁平，不使用这块背景。
 
   // Quick Switcher
   'qs.search.placeholder': '搜索主机或标签页',
+  'qs.quickConnectTo': '快速连接到 {target}',
+  'qs.hosts': '主机',
+  'qs.tabs': '标签页',
+  'qs.newWorkspace': '新建工作区',
   'qs.jumpTo': '跳转到',
   'qs.localTerminal': '本地终端',
   'qs.localShells': '本地 Shell',

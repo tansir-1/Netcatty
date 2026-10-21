@@ -47,6 +47,7 @@ import { buildSshDeepLinkConnectionHost, buildSshDeepLinkEphemeralHost, buildSsh
 import { buildTelnetDeepLinkConnectionHost, buildTelnetDeepLinkEphemeralHostFromSaved, buildTelnetDeepLinkOpenHost, findTelnetDeepLinkHost, materializeTelnetDeepLinkMatchHost, parseTelnetDeepLink } from '../../domain/telnetDeepLink';
 import { buildJmsDeepLinkEphemeralHost, isSupportedJmsProtocol, parseJmsDeepLink } from '../../domain/jmsDeepLink';
 import { applyEphemeralHostDistroUpdate, applyEphemeralHostsUpdate, splitHostsUpdateByEphemeral } from '../../domain/ephemeralHosts';
+import { prepareConnectionHost, temporaryConnectionPrepareOptions } from '../../domain/legacyAlgorithms';
 import { resolveHostAuth } from '../../domain/sshAuth';
 import { isEncryptedCredentialPlaceholder, stripSyncPayloadEncryptedCredentials } from '../../domain/credentials';
 import {
@@ -1448,13 +1449,24 @@ export function AppSideEffects() {
     name,
   ), [createWorkspaceFromTargets, resolveEffectiveHost]);
 
+  // VaultView memo ignores onConnect identity, so this callback can stay
+  // closed over an older render. Temporary-connection toggles are read here,
+  // at connect time, so turning them on or off applies without a reload.
+  const temporaryConnectionSettingsRef = useRef(terminalSettings);
+  temporaryConnectionSettingsRef.current = terminalSettings;
+
   // Wrapper to connect to host with logging
   const handleConnectToHost = useCallback((host: Host, alreadyEffective = false, hidden = false) => {
-    if (host.ephemeral) {
+    const liveTerminalSettings = temporaryConnectionSettingsRef.current;
+    const connectionHost = prepareConnectionHost(
+      host,
+      temporaryConnectionPrepareOptions(liveTerminalSettings),
+    );
+    if (connectionHost.ephemeral) {
       setEphemeralHosts((previous) => {
-        const existingIndex = previous.findIndex((candidate) => candidate.id === host.id);
-        if (existingIndex < 0) return [...previous, host];
-        return previous.map((candidate, index) => index === existingIndex ? host : candidate);
+        const existingIndex = previous.findIndex((candidate) => candidate.id === connectionHost.id);
+        if (existingIndex < 0) return [...previous, connectionHost];
+        return previous.map((candidate, index) => index === existingIndex ? connectionHost : candidate);
       });
     }
     const effectiveHostResolver = alreadyEffective
@@ -1464,16 +1476,16 @@ export function AppSideEffects() {
       addConnectionLog,
       connectToHost,
       discoveredShells,
-      host,
+      host: connectionHost,
       identities,
       keys,
       resolveEffectiveHost: effectiveHostResolver,
       resolveHostAuth,
       resolveShellSetting,
       systemInfoRef,
-      terminalSettings,
-    }), host, hidden);
-  }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys, discoveredShells, terminalSettings]);
+      terminalSettings: liveTerminalSettings,
+    }), connectionHost, hidden);
+  }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys, discoveredShells]);
 
   const handleConnectToHostWithTabName = useCallback((host: Host, tabName?: string) => {
     const sessionId = handleConnectToHost(host);

@@ -447,11 +447,11 @@ function createPreloadApi(ctx) {
   tmuxAction: async (options) => {
     return ipcRenderer.invoke("netcatty:system:tmuxAction", options);
   },
-  listDockerContainers: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:system:listDockerContainers", { sessionId });
+  listDockerContainers: async (sessionId, runtime) => {
+    return ipcRenderer.invoke("netcatty:system:listDockerContainers", { sessionId, runtime });
   },
-  listDockerImages: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:system:listDockerImages", { sessionId });
+  listDockerImages: async (sessionId, runtime) => {
+    return ipcRenderer.invoke("netcatty:system:listDockerImages", { sessionId, runtime });
   },
   getDockerStats: async (options) => {
     return ipcRenderer.invoke("netcatty:system:dockerStats", options);
@@ -479,6 +479,9 @@ function createPreloadApi(ctx) {
   },
   dockerImageAction: async (options) => {
     return ipcRenderer.invoke("netcatty:system:dockerImageAction", options);
+  },
+  kubectl: async (options) => {
+    return ipcRenderer.invoke("netcatty:system:kubectl", options);
   },
   openTerminalPopup: async (payload) => {
     return ipcRenderer.invoke("netcatty:window:openTerminalPopup", payload);
@@ -1865,6 +1868,8 @@ function createPreloadApi(ctx) {
   credentialsAvailable: () => ipcRenderer.invoke("netcatty:credentials:available"),
   credentialsEncrypt: (plaintext) => ipcRenderer.invoke("netcatty:credentials:encrypt", plaintext),
   credentialsDecrypt: (value) => ipcRenderer.invoke("netcatty:credentials:decrypt", value),
+  previewTotp: (payload) => ipcRenderer.invoke("netcatty:totp:preview", payload),
+  scanTotpQrFromScreen: () => ipcRenderer.invoke("netcatty:totp:scan-screen"),
 
   // Auto-update
   checkForUpdate: () => ipcRenderer.invoke("netcatty:update:check"),
@@ -1992,6 +1997,9 @@ function createPreloadApi(ctx) {
     return ipcRenderer.invoke("netcatty:external-mcp:grok:add");
   },
   // MCP Server session metadata
+  aiPrivacyStatus: async () => ipcRenderer.invoke("netcatty:ai:privacy:status"),
+  aiPrivacyTransform: async (request) => ipcRenderer.invoke("netcatty:ai:privacy:transform", request),
+  aiPrivacyClearSession: async (chatSessionId) => ipcRenderer.invoke("netcatty:ai:privacy:clear", chatSessionId),
   aiMcpUpdateSessions: async (sessions, chatSessionId) => {
     return ipcRenderer.invoke("netcatty:ai:mcp:update-sessions", { sessions, chatSessionId });
   },

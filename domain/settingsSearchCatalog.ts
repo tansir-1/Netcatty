@@ -481,6 +481,22 @@ export const SETTINGS_SEARCH_CATALOG: readonly SettingsSearchEntry[] = [
     sectionKey: "settings.terminal.section.connection",
   },
   {
+    id: "terminal-temporary-legacy-algorithms",
+    tab: "terminal",
+    labelKey: "settings.terminal.connection.temporaryLegacyAlgorithms",
+    descriptionKey: "settings.terminal.connection.temporaryLegacyAlgorithms.desc",
+    sectionKey: "settings.terminal.section.connection",
+    keywords: ["legacy", "kex", "putty", "旧版算法", "演算法", "堡垒机"],
+  },
+  {
+    id: "terminal-temporary-network-device-mode",
+    tab: "terminal",
+    labelKey: "settings.terminal.connection.temporaryNetworkDeviceMode",
+    descriptionKey: "settings.terminal.connection.temporaryNetworkDeviceMode.desc",
+    sectionKey: "settings.terminal.section.connection",
+    keywords: ["network", "device", "switch", "router", "网络设备", "網路裝置"],
+  },
+  {
     id: "terminal-ssh-auto-reconnect",
     tab: "terminal",
     labelKey: "settings.terminal.connection.sshAutoReconnectEnabled",
@@ -721,6 +737,15 @@ export const SETTINGS_SEARCH_CATALOG: readonly SettingsSearchEntry[] = [
     aiSubTab: "tools",
     labelKey: "ai.externalMcp.title",
     keywords: ["mcp"],
+  },
+  {
+    id: "ai-external-mcp-http",
+    tab: "ai",
+    aiSubTab: "tools",
+    labelKey: "ai.externalMcp.http.title",
+    descriptionKey: "ai.externalMcp.http.description",
+    sectionKey: "ai.externalMcp.title",
+    keywords: ["http", "sse", "streamable", "wsl", "codex"],
   },
   {
     id: "ai-external-mcp-approval-alert",

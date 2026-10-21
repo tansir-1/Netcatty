@@ -787,6 +787,7 @@ Vaults 分頁維持扁平，不使用這塊背景。
   'vault.hosts.moveSelected': '移動到群組 ({count})',
   'vault.hosts.moveSelected.description': '將選取的主機移動到現有群組，也可移出群組。選取的群組本身不會移動。',
   'vault.hosts.moveMultiple.success': '已將 {count} 個主機移動到 {group}',
+  'vault.hosts.dragSelectionCount': '{count} 個主機',
   'vault.hosts.moveToGroup.success': '已將 {host} 移動到 {group}',
   'vault.hosts.errors.nameRequired': '主機名稱不能為空。',
   'vault.hosts.empty.title': '設定你的主機',
@@ -1141,6 +1142,10 @@ Vaults 分頁維持扁平，不使用這塊背景。
 
   // Quick Switcher
   'qs.search.placeholder': '搜尋主機或分頁',
+  'qs.quickConnectTo': '快速連線到 {target}',
+  'qs.hosts': '主機',
+  'qs.tabs': '分頁',
+  'qs.newWorkspace': '新增工作區',
   'qs.jumpTo': '跳轉到',
   'qs.localTerminal': '本機終端',
   'qs.localShells': '本機 Shell',
