@@ -508,6 +508,10 @@ function init(deps) {
 }
 
 function openTerminalOutputSession(sessionId, webContents) {
+  require("./rendererSessionLifetime.cjs").trackRendererSessionLifetime(
+    sessions, sessionId, webContents,
+    (event, payload) => require("./terminalBridge.cjs").closeSession(event, payload),
+  );
   terminalOutputChannel?.openSession?.(sessionId, webContents);
 }
 
@@ -1621,7 +1625,9 @@ function registerHandlers(ipcMain, options = {}) {
       });
     });
   } else {
-    ipcMain.handle("netcatty:start", startSSHSessionWrapper);
+    ipcMain.handle("netcatty:start", options.manageSessionLogRestart === true
+      ? sessionLogStreamManager.withSessionLogRestart(startSSHSessionWrapper)
+      : startSSHSessionWrapper);
     ipcMain.handle("netcatty:ssh:exec", execCommand);
     ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
     ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);

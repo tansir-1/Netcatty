@@ -1,6 +1,15 @@
 import type { Messages } from '../types';
 
 export const zhCNTerminalMessages: Messages = {
+  'terminal.toolbar.openSessionLog': '打开会话日志',
+  'terminal.toolbar.sessionLogActions': '会话日志操作',
+  'terminal.toolbar.sessionLog.menu': '会话日志',
+  'terminal.toolbar.sessionLog.open': '打开',
+  'terminal.toolbar.sessionLog.reveal': '在文件夹中显示',
+  'terminal.toolbar.sessionLog.chooseApplication': '打开方式…',
+  'terminal.toolbar.sessionLog.systemDefault': '用系统默认应用打开',
+  'terminal.toolbar.openSessionLogFailed': '无法打开会话日志。',
+
   'terminal.menu.saveScreen': '保存当前屏幕',
   'terminal.saveScreen.failed': '保存终端屏幕失败。',
   // 多行粘贴确认对话框（#3398）
@@ -612,6 +621,7 @@ export const zhCNTerminalMessages: Messages = {
   'settings.shortcuts.binding.broadcast': '切换广播模式',
   'settings.shortcuts.binding.toggle-opacity': '切换窗口透明度',
   'settings.shortcuts.binding.toggle-side-panel': '切换侧边栏',
+  'settings.shortcuts.binding.toggle-host-tree': '切换主机列表',
   'settings.shortcuts.binding.sftp-copy': '复制文件',
   'settings.shortcuts.binding.sftp-cut': '剪切文件',
   'settings.shortcuts.binding.sftp-paste': '粘贴文件',

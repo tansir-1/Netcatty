@@ -1,6 +1,15 @@
 import type { Messages } from '../types';
 
 export const esTerminalMessages: Messages = {
+  'terminal.toolbar.openSessionLog': 'Abrir registro de sesión',
+  'terminal.toolbar.sessionLogActions': 'Acciones del registro',
+  'terminal.toolbar.sessionLog.menu': 'Registro de sesión',
+  'terminal.toolbar.sessionLog.open': 'Abrir',
+  'terminal.toolbar.sessionLog.reveal': 'Mostrar en carpeta',
+  'terminal.toolbar.sessionLog.chooseApplication': 'Abrir con…',
+  'terminal.toolbar.sessionLog.systemDefault': 'Abrir con la aplicación predeterminada',
+  'terminal.toolbar.openSessionLogFailed': 'No se pudo abrir el registro.',
+
   'terminal.menu.saveScreen': 'Guardar pantalla actual',
   'terminal.saveScreen.failed': 'No se pudo guardar la pantalla del terminal.',
   // Diálogo de confirmación de pegado multilínea (#3398)
@@ -68,6 +77,8 @@ export const esTerminalMessages: Messages = {
   'terminal.composeBar.send': 'Enviar',
   'terminal.composeBar.close': 'Cerrar barra de redacción',
   'terminal.composeBar.broadcasting': 'Difundiendo a todas las sesiones',
+  'terminal.composeBar.sendToAll': 'Enviar a todas las sesiones',
+  'terminal.composeBar.sendToActive': 'Enviar solo a la sesión activa',
   'terminal.composeBar.broadcastAllowPassword': 'Difundir sin protección de contraseña',
   'terminal.composeBar.resize': 'Cambiar la altura de la barra de redacción',
   'terminal.composeBar.manageSnippets': 'Administrar snippets rápidos',

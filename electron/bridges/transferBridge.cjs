@@ -1596,7 +1596,10 @@ let sftpClients = null;
 // Retry is same-process — a relaunch with no fingerprint already restarts at 0.
 // Entries stay only while that task can still resume from the checkpoint.
 const localUploadAcknowledgedPrefix = new Map();
-const UPLOAD_PREFIX_SESSION_LOSS = /SFTP (channel closed|session lost)|ECONNRESET|EPIPE|Not connected|No response from server|Keepalive timeout|connection (lost|closed|reset)/i;
+// Keep identical to SESSION_LOSS_ERROR in application/state/sftp/retryFromCheckpoint.ts.
+// Both must accept every code or message isSftpChannelLossError treats as channel
+// loss, or a same-id Retry drops this digest and restarts at byte 0.
+const UPLOAD_PREFIX_SESSION_LOSS = /SFTP (channel closed|session lost)|ERR_SFTP_CHANNEL_CLOSED|ECONNRESET|ECONNABORTED|EPIPE|Not connected|No response from server|Keepalive timeout|socket hang up|client-socket|connection (lost|closed|reset)/i;
 
 function forgetLocalUploadAcknowledgedPrefix(transferId) {
   if (transferId) localUploadAcknowledgedPrefix.delete(String(transferId));
@@ -1641,9 +1644,20 @@ function localUploadAcknowledgedOffset(transferId) {
   return entry.digestOffset;
 }
 
-function localUploadPrefixFailureKeepsCheckpoint(transferId, message) {
-  return localUploadAcknowledgedOffset(transferId) > 0
-    && UPLOAD_PREFIX_SESSION_LOSS.test(String(message || ""));
+function isTransferChannelLossError(error) {
+  if (!error || typeof error !== "object") return false;
+  if (isSftpChannelLossError(error)) return true;
+  const cause = error.cause;
+  return Boolean(cause && typeof cause === "object" && isSftpChannelLossError(cause));
+}
+
+function localUploadPrefixFailureKeepsCheckpoint(transferId, error) {
+  if (!(localUploadAcknowledgedOffset(transferId) > 0)) return false;
+  // Prefer the bridge classifier (code, level, cause). The shared regex still
+  // covers string-only failures such as "Not connected" and "SFTP channel closed".
+  if (isTransferChannelLossError(error)) return true;
+  const message = typeof error === "string" ? error : (error?.message || String(error || ""));
+  return UPLOAD_PREFIX_SESSION_LOSS.test(message);
 }
 
 async function localUploadAcknowledgedPrefixMatches(transferId, sourcePath, checkpoint, sourceSize, options) {
@@ -2051,6 +2065,23 @@ function isStaleOrClosedSharedChannelError(error, sftp) {
   return /channel closed/i.test(String(error.message || ""));
 }
 
+// Test seam: shorten channel-open timeout / abandon wait. Production leaves this null.
+let isolatedSftpChannelOpenOptionsForTests = null;
+
+function isolatedChannelOpenOptions(signal) {
+  const options = { signal };
+  const overrides = isolatedSftpChannelOpenOptionsForTests;
+  if (!overrides || typeof overrides !== "object") return options;
+  if (overrides.timeoutMs !== undefined) options.timeoutMs = overrides.timeoutMs;
+  if (overrides.abandonWaitMs !== undefined) options.abandonWaitMs = overrides.abandonWaitMs;
+  return options;
+}
+
+function isPoisonedSftpChannelOpenError(error) {
+  const code = error?.code;
+  return code === "SFTP_CHANNEL_OPEN_TIMEOUT" || code === "SFTP_CHANNEL_OPEN_PENDING";
+}
+
 async function openIsolatedSftpChannel(client, signal = null) {
   // The dedicated one-channel login already holds its only session channel.
   // Opening another SFTP subsystem drops that login, so stay on the browse channel.
@@ -2058,7 +2089,7 @@ async function openIsolatedSftpChannel(client, signal = null) {
     return null;
   }
   const sshClient = client?.client;
-  return openBoundedSftpChannel(sshClient, { signal });
+  return openBoundedSftpChannel(sshClient, isolatedChannelOpenOptions(signal));
 }
 
 /**
@@ -2698,6 +2729,7 @@ async function uploadFile(
 
   // Prefer an isolated SFTP channel so cancellation cannot kill the browse session.
   let isolated = null;
+  let isolatedOpenError = null;
   const preferSharedChannel = Number(fileSize) > 0
     && Number(fileSize) <= SMALL_UPLOAD_SHARED_MAX_BYTES
     && typeof sftp?.open === "function"
@@ -2709,6 +2741,7 @@ async function uploadFile(
       );
     } catch (err) {
       rememberPipelineError(err);
+      isolatedOpenError = err;
       console.warn(
         "[transferBridge] Failed to open isolated SFTP channel for upload:",
         err.message || String(err),
@@ -2774,7 +2807,12 @@ async function uploadFile(
     }
   }
 
-  if (!isolated && !client.__netcattySudoMode && !preferSharedChannel) {
+  // A timed-out or still-pending isolated OPEN has already spent the channel
+  // deadline (or is waiting on an abandoned one). Reopening for fastPut only
+  // pays another timeout or an immediate PENDING on a lossy link. Fall through
+  // to the shared browse channel instead (#3155).
+  const skipIsolatedFastPutReopen = isPoisonedSftpChannelOpenError(isolatedOpenError);
+  if (!isolated && !skipIsolatedFastPutReopen && !client.__netcattySudoMode && !preferSharedChannel) {
     try {
       isolated = markDisposableUploadChannel(
         await openIsolatedSftpChannel(client, transfer?.signal),
@@ -6412,7 +6450,7 @@ async function startTransferNow(event, payload, onProgress) {
     }
     cleanupTransfer();
     const cancelled = /cancel/i.test(message);
-    if (cancelled || !localUploadPrefixFailureKeepsCheckpoint(transferId, message)) {
+    if (cancelled || !localUploadPrefixFailureKeepsCheckpoint(transferId, error)) {
       forgetLocalUploadAcknowledgedPrefix(transferId);
     }
     if (cancelled) {
@@ -8269,6 +8307,11 @@ module.exports = {
   },
   _setLocalPrefixHashStreamOverrideForTests: (override) => {
     localPrefixHashStreamOverrideForTests = override;
+  },
+  _setIsolatedSftpChannelOpenOptionsForTests: (options) => {
+    isolatedSftpChannelOpenOptionsForTests = options && typeof options === "object"
+      ? options
+      : null;
   },
   _hasLocalUploadAcknowledgedPrefixForTests: (transferId) => (
     localUploadAcknowledgedPrefix.has(String(transferId))
