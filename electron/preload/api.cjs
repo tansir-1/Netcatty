@@ -113,6 +113,7 @@ function createPreloadApi(ctx) {
     return () => ipcRenderer.removeListener("netcatty:plugins:catalog-changed", listener);
   },
   getPluginCatalogReadme: (id, selectionToken, sourceId) => ipcRenderer.invoke("netcatty:plugins:catalog-readme", { id, selectionToken, sourceId }),
+  getPluginCatalogReadmeImages: (id, selectionToken, sourceId) => ipcRenderer.invoke("netcatty:plugins:catalog-readme-images", { id, selectionToken, sourceId }),
   installCatalogPlugin: (id, selectionToken, sourceId, acceptedSourceId) => ipcRenderer.invoke("netcatty:plugins:catalog-install", { id, selectionToken, sourceId, acceptedSourceId }),
   setPluginAIHostReady: (ready) => ipcRenderer.invoke("netcatty:plugins:ai-host-ready", ready),
   setPluginAgentHostReady: (ready) => ipcRenderer.invoke("netcatty:plugins:agent-host-ready", ready),
@@ -315,33 +316,23 @@ function createPreloadApi(ctx) {
     ipcRenderer.on("netcatty:plugins:connection-closed", listener);
     return () => ipcRenderer.removeListener("netcatty:plugins:connection-closed", listener);
   },
-  openPluginView: (payload) => ipcRenderer.invoke("netcatty:plugins:open-view", payload),
-  closePluginView: (instanceId) => ipcRenderer.invoke("netcatty:plugins:close-view", { instanceId }),
-  focusPluginView: (payload) => ipcRenderer.invoke("netcatty:plugins:focus-view", payload),
-  setPluginViewBounds: (instanceId, bounds) => ipcRenderer.invoke("netcatty:plugins:set-view-bounds", { instanceId, bounds }),
-  setPluginViewVisibility: (instanceId, visible) => ipcRenderer.invoke("netcatty:plugins:set-view-visibility", {
-    instanceId,
-    visible: visible === true,
-  }),
-  postPluginViewMessage: (instanceId, message) => ipcRenderer.invoke("netcatty:plugins:view-message", { instanceId, message }),
+  getPluginViewResource: (payload) => ipcRenderer.invoke("netcatty:plugins:host-ui-resource", payload),
+  openHostDrawnPluginView: (payload) => ipcRenderer.invoke("netcatty:plugins:host-ui-open", payload),
+  closeHostDrawnPluginView: (instanceId) => ipcRenderer.invoke("netcatty:plugins:host-ui-close", { instanceId }),
+  sendHostDrawnPluginViewEvent: (instanceId, event) => ipcRenderer.invoke("netcatty:plugins:host-ui-event", { instanceId, event }),
+  onHostDrawnPluginViewUpdate: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("netcatty:plugins:host-ui-update", listener);
+    return () => ipcRenderer.removeListener("netcatty:plugins:host-ui-update", listener);
+  },
   onPluginContributionsChanged: (callback) => {
     pluginContributionsChangedListeners.add(callback);
     return () => pluginContributionsChangedListeners.delete(callback);
-  },
-  onPluginViewMessage: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("netcatty:plugins:view-message-posted", listener);
-    return () => ipcRenderer.removeListener("netcatty:plugins:view-message-posted", listener);
   },
   onPluginViewClosed: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("netcatty:plugins:view-closed", listener);
     return () => ipcRenderer.removeListener("netcatty:plugins:view-closed", listener);
-  },
-  onPluginViewFocused: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("netcatty:plugins:view-focused", listener);
-    return () => ipcRenderer.removeListener("netcatty:plugins:view-focused", listener);
   },
   getPluginScopeCatalog: () => ipcRenderer.invoke("netcatty:plugins:get-scope-catalog"),
   setPluginScopeCatalog: (catalog) => ipcRenderer.invoke("netcatty:plugins:set-scope-catalog", catalog),
@@ -1716,6 +1707,9 @@ function createPreloadApi(ctx) {
   // Temp directory management
   getTempDirInfo: () =>
     ipcRenderer.invoke("netcatty:tempdir:getInfo"),
+  chooseTempDir: () => ipcRenderer.invoke("netcatty:tempdir:choose"),
+  setCustomTempDir: (dir) => ipcRenderer.invoke("netcatty:tempdir:setCustom", dir),
+  resetCustomTempDir: () => ipcRenderer.invoke("netcatty:tempdir:resetCustom"),
   clearTempDir: () =>
     ipcRenderer.invoke("netcatty:tempdir:clear"),
   getTempDirPath: () =>

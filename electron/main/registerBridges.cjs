@@ -235,7 +235,7 @@ function createBridgeRegistrar(context) {
       resolveContributionIcon: (payload) => pluginHostService?.contributionIconService?.resolve(payload),
       themeService: pluginHostService?.themeService,
       logService: pluginHostService?.logService,
-      viewHost: pluginHostService?.viewHost,
+      hostDrawnViewHost: pluginHostService?.hostDrawnViewHost,
       env: process.env,
       isTrustedSender: createTrustedPluginBridgeSender({ devServerUrl: effectiveDevServerUrl }),
       broadcast: (channel, payload) => {
@@ -464,7 +464,9 @@ function createBridgeRegistrar(context) {
     });
   
     // Initialize temp directory (synchronously)
+    tempDirBridge.configureTempDirPreference?.(electronModule);
     tempDirBridge.ensureTempDir();
+    terminalWorkerManager?.setCustomTempDir(tempDirBridge.getCustomTempDir());
   
     // Register all IPC handlers
     sshBridge.registerHandlers(ipcMain, {
@@ -533,7 +535,7 @@ function createBridgeRegistrar(context) {
     onedriveAuthBridge.registerHandlers(ipcMain, electronModule);
     cloudSyncBridge.registerHandlers(ipcMain, electronModule);
     fileWatcherBridge.registerHandlers(ipcMain, { terminalWorkerManager });
-    tempDirBridge.registerHandlers(ipcMain, shell, electronModule);
+    tempDirBridge.registerHandlers(ipcMain, shell, electronModule, terminalWorkerManager);
     sessionLogsBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     compressUploadBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     globalShortcutBridge.registerHandlers(ipcMain);
