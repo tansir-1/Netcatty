@@ -18,6 +18,10 @@ if (process.env.ELECTRON_RUN_AS_NODE) {
   delete process.env.ELECTRON_RUN_AS_NODE;
 }
 
+// Opt-in startup timeline (NETCATTY_PERF_TRACE=1); a no-op otherwise.
+const perfTrace = require("./perfTrace.cjs");
+perfTrace.mark("main:entry");
+
 // Load crash log bridge early so process-level error handlers can use it
 const crashLogBridge = require("./bridges/crashLogBridge.cjs");
 const {
@@ -124,6 +128,10 @@ try {
         supportFetchAPI: true,
         corsEnabled: true,
         stream: true,
+        // Let V8 reuse compiled code for the renderer bundles across launches
+        // and windows (requires `standard`). Without it every window
+        // recompiles the multi-megabyte entry chunk from scratch.
+        codeCache: true,
       },
     },
     {
@@ -1321,7 +1329,9 @@ if (!gotLock) {
   });
 
   // Application lifecycle
+  perfTrace.mark("main:modules-loaded");
   app.whenReady().then(async () => {
+    perfTrace.mark("main:when-ready");
     registerAppProtocol();
     const initialSshDeepLinkPreference = applyInitialSshDeepLinkPreference({
       enabled: sshDeepLinkEnabled,

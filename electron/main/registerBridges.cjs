@@ -2,6 +2,7 @@
 
 let bridgesRegistered = false;
 let cloudSyncSessionPassword = null;
+const perfTrace = require("../perfTrace.cjs");
 const { readClipboardFiles, readClipboardImage, hasClipboardImage } = require("../bridges/clipboardFiles.cjs");
 const { registerSystemNotificationHandlers } = require("../bridges/systemNotification.cjs");
 const {
@@ -149,6 +150,7 @@ function createBridgeRegistrar(context) {
     let terminalWorkerManager = null;
     const { toElectronAccelerator } = require("../plugins/keybindings.cjs");
     const { startPluginHost } = require("../plugins/hostBootstrap.cjs");
+    perfTrace.mark("main:plugin-host:start");
     const pluginHostService = startPluginHost({
       env: process.env,
       createService: () => {
@@ -206,6 +208,7 @@ function createBridgeRegistrar(context) {
       },
       logger: console,
     });
+    perfTrace.mark("main:plugin-host:end");
     registerPluginBridge(ipcMain, {
       manager: pluginHostService?.manager,
       interactionService: pluginHostService?.interactionService,
@@ -982,8 +985,19 @@ function createBridgeRegistrar(context) {
     });
   
     // PTY child process list for busy-check before close
-    ipcMain.handle("netcatty:pty:childProcesses", async (_event, sessionId) => {
+    ipcMain.handle("netcatty:pty:childProcesses", async (event, sessionId) => {
       if (typeof sessionId !== "string") return [];
+      if (terminalWorkerManager) {
+        try {
+          const result = await terminalWorkerManager.request("netcatty:pty:childProcesses", { sessionId }, {
+            webContentsId: event?.sender?.id,
+          });
+          const children = Array.isArray(result) ? result : result?.children;
+          if (Array.isArray(children)) return children;
+        } catch {
+          // Fall back to main-owned sessions when the worker is unavailable.
+        }
+      }
       return ptyProcessTree.getChildProcesses(sessionId);
     });
   
