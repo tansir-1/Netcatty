@@ -170,6 +170,13 @@ function createPreloadApi(ctx) {
     ipcRenderer.on("netcatty:plugins:themes-changed", listener);
     return () => ipcRenderer.removeListener("netcatty:plugins:themes-changed", listener);
   },
+  onSystemThemeChanged: (callback) => {
+    const listener = (_event, payload) => {
+      if (typeof payload?.isDark === "boolean") callback({ isDark: payload.isDark });
+    };
+    ipcRenderer.on("netcatty:system-theme-changed", listener);
+    return () => ipcRenderer.removeListener("netcatty:system-theme-changed", listener);
+  },
   getPluginContributions: (options) => ipcRenderer.invoke("netcatty:plugins:contributions", options ?? {}),
   getPluginBrandIcon: (pluginId) => ipcRenderer.invoke("netcatty:plugins:brand-icon", { pluginId }),
   getPluginContributionIcon: (pluginId, icon) => ipcRenderer.invoke("netcatty:plugins:contribution-icon", { pluginId, icon }),
@@ -938,10 +945,10 @@ function createPreloadApi(ctx) {
     const result = await ipcRenderer.invoke("netcatty:sftp:openForSession", {
       ...(options || {}),
       sessionId,
-      expectedEndpoint: options,
+      expectedEndpoint: options?.reuseExactSessionOnly === true ? undefined : options,
     });
     if (
-      options?.requireExactSourceSession === true
+      (options?.requireExactSourceSession === true || options?.reuseExactSessionOnly === true)
       && result.sourceSessionId !== sessionId
     ) {
       if (result.sftpId) {
